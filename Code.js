@@ -6,8 +6,27 @@
 const TARGET_SHEET_ID = "1xHIBxGjKy61suqKb1ly4WeVlnIRX1O0owv3KVWhYFok";
 
 /**
+ * Run this function ONCE every time you change the TARGET_SHEET_ID above.
+ * It sets up the script to run automatically whenever the target sheet gets updated.
+ */
+function setupAutoRun() {
+    const ss = SpreadsheetApp.openById(TARGET_SHEET_ID);
+
+    // 1. Delete any old triggers so we don't get duplicate runs
+    const triggers = ScriptApp.getProjectTriggers();
+    triggers.forEach(trigger => ScriptApp.deleteTrigger(trigger));
+
+    // 2. Create a new trigger that watches the target spreadsheet for changes
+    ScriptApp.newTrigger('runDailyBalance')
+        .forSpreadsheet(ss)
+        .onChange()
+        .create();
+
+    Logger.log("✅ Auto-run successfully set up for: " + ss.getName());
+}
+
+/**
  * Main entry point — runs all reporting functions in the correct order.
- * Attach your time-driven trigger to THIS function.
  */
 function runDailyBalance() {
     const ss = SpreadsheetApp.openById(TARGET_SHEET_ID);
