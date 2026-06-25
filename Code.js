@@ -298,11 +298,12 @@ function updateSummaryAndCharts(ss) {
         summarySheet.getRange(3, dailyStartCol, dailyRows.length, 1).setNumberFormat("dddd, dd");
     }
 
-    // --- Charts (positioned after all data columns) ---
+    // --- Charts (positioned below the aggregate stats table) ---
     const allCharts = summarySheet.getCharts();
     allCharts.forEach(c => summarySheet.removeChart(c));
 
-    const chartCol = dailyStartCol + 3; // Charts start after daily stats data
+    // Charts start below aggregate table + daily stats, whichever is taller
+    const chartStartRow = Math.max(startRow + aggRows.length + 2, 3 + dailyRows.length + 2);
 
     // Chart 1: Daily Total Credit Trend (line)
     if (dailyRows.length > 0) {
@@ -317,9 +318,9 @@ function updateSummaryAndCharts(ss) {
             .setOption("colors", ["#1f77b4"])
             .setOption("legend", { position: "none" })
             .setOption("pointSize", 7)
-            .setPosition(2, chartCol, 0, 0)
-            .setOption("width", 1000)
-            .setOption("height", 400)
+            .setPosition(chartStartRow, startCol, 0, 0)
+            .setOption("width", 900)
+            .setOption("height", 350)
             .build();
         summarySheet.insertChart(dailyChart);
     }
@@ -330,8 +331,6 @@ function updateSummaryAndCharts(ss) {
     const colF = String.fromCharCode(64 + startCol);         // F (Driver)
     const colG = String.fromCharCode(64 + startCol + 1);     // G (Total Credit)
     const colH = String.fromCharCode(64 + startCol + 2);     // H (Total Trips)
-    const colI = String.fromCharCode(64 + startCol + 3);     // I (Total Cash)
-    const colJ = String.fromCharCode(64 + startCol + 4);     // J (Driver NET)
     const colK = String.fromCharCode(64 + startCol + 5);     // K (Avg Per Day)
 
     // Chart 2: Total Credit by Driver (bar)
@@ -341,7 +340,8 @@ function updateSummaryAndCharts(ss) {
         .setOption("title", "Total Credit by Driver")
         .setOption("titleTextStyle", { bold: true, fontSize: 24 })
         .setOption("colors", ["#1f77b4"]).setOption("legend", { position: "none" })
-        .setOption("vAxis", { title: "Credit" }).setPosition(23, chartCol, 0, 0).build();
+        .setOption("vAxis", { title: "Credit" })
+        .setPosition(chartStartRow + 20, startCol, 0, 0).build();
     summarySheet.insertChart(chart1);
 
     // Chart 3: Total Trips by Driver (bar)
@@ -351,7 +351,8 @@ function updateSummaryAndCharts(ss) {
         .setOption("title", "Total Trips by Driver")
         .setOption("titleTextStyle", { bold: true, fontSize: 24 })
         .setOption("colors", ["#8c564b"]).setOption("legend", { position: "none" })
-        .setOption("vAxis", { title: "Trips" }).setPosition(44, chartCol, 0, 0).build();
+        .setOption("vAxis", { title: "Trips" })
+        .setPosition(chartStartRow + 40, startCol, 0, 0).build();
     summarySheet.insertChart(chart2);
 
     // Chart 4: Average Per Day by Driver (bar)
@@ -361,18 +362,9 @@ function updateSummaryAndCharts(ss) {
         .setOption("title", "Average Credit Per Day")
         .setOption("titleTextStyle", { bold: true, fontSize: 24 })
         .setOption("colors", ["#d62728"]).setOption("legend", { position: "none" })
-        .setOption("vAxis", { title: "Daily Credit" }).setPosition(65, chartCol, 0, 0).build();
+        .setOption("vAxis", { title: "Daily Credit" })
+        .setPosition(chartStartRow + 60, startCol, 0, 0).build();
     summarySheet.insertChart(chart3);
-
-    // Chart 5: Driver NET by Driver (bar)
-    let chart4 = summarySheet.newChart().setChartType(Charts.ChartType.COLUMN)
-        .addRange(summarySheet.getRange(colF + dataStart + ":" + colF + lastRow))
-        .addRange(summarySheet.getRange(colJ + dataStart + ":" + colJ + lastRow))
-        .setOption("title", "Driver NET Payout")
-        .setOption("titleTextStyle", { bold: true, fontSize: 24 })
-        .setOption("colors", ["#2ca02c"]).setOption("legend", { position: "none" })
-        .setOption("vAxis", { title: "NET ($)" }).setPosition(86, chartCol, 0, 0).build();
-    summarySheet.insertChart(chart4);
 }
 
 
@@ -404,6 +396,26 @@ function generateWeeklySummary(ss) {
             const total = parseNumber(rawData[r][totalColIdx]) || 0;
             const net = parseNumber(rawData[r][netColIdx]) || 0;
             driverCashMap[name] = roundToTwo(total - net);
+        }
+    }
+
+    // --- Read Fare % from Settings sheet ---
+    let driverFareMap = {}; // driver -> fare as decimal (e.g. 0.9)
+    const settingsSheet = ss.getSheetByName("Settings");
+    if (settingsSheet) {
+        const settingsData = settingsSheet.getDataRange().getValues();
+        for (let i = 1; i < settingsData.length; i++) {
+            if (settingsData[i][0]) {
+                let fareVal = settingsData[i][1];
+                if (typeof fareVal === "string" && fareVal.includes("%")) {
+                    fareVal = parseFloat(fareVal) / 100;
+                } else if (typeof fareVal === "number") {
+                    fareVal = fareVal > 1 ? fareVal / 100 : fareVal;
+                } else {
+                    fareVal = 0.9; // default
+                }
+                driverFareMap[settingsData[i][0]] = fareVal;
+            }
         }
     }
 
@@ -534,7 +546,8 @@ function generateWeeklySummary(ss) {
             drivers.forEach(d => {
                 const info = weeklyData[weekKey][d];
                 const cash = driverCashMap[d] || 0;
-                const balance = roundToTwo(info.credit - cash);
+                const fare = driverFareMap[d] || 0.9; // default 90%
+                const balance = roundToTwo((info.credit * fare) - cash);
                 tableData.push([d, info.credit, cash, balance]);
             });
 
