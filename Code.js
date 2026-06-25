@@ -298,15 +298,13 @@ function updateSummaryAndCharts(ss) {
         summarySheet.getRange(3, dailyStartCol, dailyRows.length, 1).setNumberFormat("dddd, dd");
     }
 
-    // --- Charts (positioned below the aggregate stats table) ---
+    // --- Charts ---
     const allCharts = summarySheet.getCharts();
     allCharts.forEach(c => summarySheet.removeChart(c));
 
-    // Charts start below aggregate table + daily stats, whichever is taller
-    const chartStartRow = Math.max(startRow + aggRows.length + 2, 3 + dailyRows.length + 2);
-
-    // Chart 1: Daily Total Credit Trend (line)
+    // Chart 1: Daily Total Credit Trend (line) — positioned NEXT TO the daily credit table
     if (dailyRows.length > 0) {
+        const dailyChartCol = dailyStartCol + 3; // 1 gap after the 2-col daily table
         let dailyChart = summarySheet.newChart()
             .setChartType(Charts.ChartType.LINE)
             .addRange(summarySheet.getRange(3, dailyStartCol, dailyRows.length, 1))
@@ -318,7 +316,7 @@ function updateSummaryAndCharts(ss) {
             .setOption("colors", ["#1f77b4"])
             .setOption("legend", { position: "none" })
             .setOption("pointSize", 7)
-            .setPosition(chartStartRow, startCol, 0, 0)
+            .setPosition(2, dailyChartCol, 0, 0)
             .setOption("width", 900)
             .setOption("height", 350)
             .build();
@@ -333,6 +331,9 @@ function updateSummaryAndCharts(ss) {
     const colH = String.fromCharCode(64 + startCol + 2);     // H (Total Trips)
     const colK = String.fromCharCode(64 + startCol + 5);     // K (Avg Per Day)
 
+    // Charts 2-4: Bar charts starting at row 3, below the aggregate stats table
+    const barChartStartRow = startRow + aggRows.length + 2;
+
     // Chart 2: Total Credit by Driver (bar)
     let chart1 = summarySheet.newChart().setChartType(Charts.ChartType.COLUMN)
         .addRange(summarySheet.getRange(colF + dataStart + ":" + colF + lastRow))
@@ -341,7 +342,7 @@ function updateSummaryAndCharts(ss) {
         .setOption("titleTextStyle", { bold: true, fontSize: 24 })
         .setOption("colors", ["#1f77b4"]).setOption("legend", { position: "none" })
         .setOption("vAxis", { title: "Credit" })
-        .setPosition(chartStartRow + 20, startCol, 0, 0).build();
+        .setPosition(3, startCol, 0, 0).build();
     summarySheet.insertChart(chart1);
 
     // Chart 3: Total Trips by Driver (bar)
@@ -352,7 +353,7 @@ function updateSummaryAndCharts(ss) {
         .setOption("titleTextStyle", { bold: true, fontSize: 24 })
         .setOption("colors", ["#8c564b"]).setOption("legend", { position: "none" })
         .setOption("vAxis", { title: "Trips" })
-        .setPosition(chartStartRow + 40, startCol, 0, 0).build();
+        .setPosition(23, startCol, 0, 0).build();
     summarySheet.insertChart(chart2);
 
     // Chart 4: Average Per Day by Driver (bar)
@@ -363,7 +364,7 @@ function updateSummaryAndCharts(ss) {
         .setOption("titleTextStyle", { bold: true, fontSize: 24 })
         .setOption("colors", ["#d62728"]).setOption("legend", { position: "none" })
         .setOption("vAxis", { title: "Daily Credit" })
-        .setPosition(chartStartRow + 60, startCol, 0, 0).build();
+        .setPosition(43, startCol, 0, 0).build();
     summarySheet.insertChart(chart3);
 }
 
