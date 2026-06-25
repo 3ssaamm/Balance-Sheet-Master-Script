@@ -49,8 +49,8 @@ function runDailyBalance() {
 // SUMMARY BUILD — Reads "Raw Data" tab and builds the Summary sheet
 // =================================================================
 function updateSummaryAndCharts(ss) {
-    const summarySheet = ss.getSheetByName("Summary");
-    if (!summarySheet) throw new Error('No sheet named "Summary" was found.');
+    let summarySheet = ss.getSheetByName("Summary");
+    if (!summarySheet) summarySheet = ss.insertSheet("Summary");
 
     const rawSheet = ss.getSheetByName("Raw Data");
     if (!rawSheet) throw new Error('No sheet named "Raw Data" was found.');
@@ -62,8 +62,9 @@ function updateSummaryAndCharts(ss) {
         return;
     }
 
-    const headerRow = rawData[0]; // Driver | 01-06-26 | 02-06-26 | ... | Total | Count | Driver NET
-    const numCols = headerRow.length;
+    // Read headers as DISPLAY STRINGS so Google Sheets doesn't auto-convert DD-MM-YY dates
+    const headerStrings = rawSheet.getRange(1, 1, 1, rawSheet.getLastColumn()).getDisplayValues()[0];
+    const numCols = headerStrings.length;
 
     // --- Identify date columns vs summary columns ---
     // Last 3 columns are: Total, Count, Driver NET
@@ -72,10 +73,10 @@ function updateSummaryAndCharts(ss) {
     const countColIdx = numCols - 2;
     const netColIdx = numCols - 1;
 
-    // Parse date headers (DD-MM-YY format)
+    // Parse date headers (DD-MM-YY format, read as strings)
     const dateColumns = []; // { colIdx, date }
     for (let c = 1; c < totalColIdx; c++) {
-        const dateVal = parseDDMMYY(headerRow[c]);
+        const dateVal = parseDDMMYY(headerStrings[c]);
         if (dateVal) {
             dateColumns.push({ colIdx: c, date: dateVal });
         }
@@ -219,86 +220,53 @@ function updateSummaryAndCharts(ss) {
     }
 
     // =================================================================
-    // --- AUTO-SYNC "SETTINGS" SHEET ---
+    // --- AUTO-SYNC "SETTINGS" SHEET (Driver + Fare %) ---
     // =================================================================
     let settingsSheet = ss.getSheetByName("Settings");
     if (!settingsSheet) settingsSheet = ss.insertSheet("Settings");
 
     const settingsData = settingsSheet.getDataRange().getValues();
-    let existingSettings = {};
+    let existingFares = {}; // driver -> fare %
     for (let i = 1; i < settingsData.length; i++) {
         if (settingsData[i][0]) {
-            existingSettings[settingsData[i][0]] = {
-                system: settingsData[i][1],
-                startDate: settingsData[i][2] || "",
-                promoTaken: settingsData[i][3] || 0,
-                promoLedger: settingsData[i][4] || ""
-            };
+            existingFares[settingsData[i][0]] = settingsData[i][1];
         }
     }
 
-    // --- Aggregated stats table (columns M+) ---
+    // --- Aggregated stats table (column F, one gap after the 4-col main table) ---
     const aggHeader = ["Driver", "Total Credit", "Total Trips", "Total Cash", "Driver NET", "Avg Per Day"];
     const aggRows = [aggHeader];
 
-    const newSettingsRows = [["Driver", "System", "Start Date", "Promo Weeks Taken", "Promo Ledger"]];
+    const newSettingsRows = [["Driver", "Fare %"]];
 
     for (let driver in driverStats) {
         const s = driverStats[driver];
         aggRows.push([driver, s.totalCredit, s.totalTrips, s.totalCash, s.driverNet, s.avgPerDay]);
 
-        let dInfo = existingSettings[driver];
-        let systemStatus = dInfo ? dInfo.system : "";
-        let startDate = dInfo ? dInfo.startDate : "";
-        let promoTaken = dInfo ? dInfo.promoTaken : 0;
-        let promoLedger = dInfo ? dInfo.promoLedger : "";
-
-        // Auto-detect New Driver
-        if (!systemStatus || systemStatus.toString().trim() === "") {
-            systemStatus = "New Driver";
+        // Use existing fare if set, otherwise default to 90%
+        let fare = existingFares[driver];
+        if (fare === undefined || fare === null || fare === "") {
+            fare = "90%";
         }
-
-        // Auto-detect Start Date if blank
-        if (!startDate || startDate.toString().trim() === "") {
-            if (s.firstWorkDate) {
-                const m = (s.firstWorkDate.getMonth() + 1).toString().padStart(2, "0");
-                const d = s.firstWorkDate.getDate().toString().padStart(2, "0");
-                const y = s.firstWorkDate.getFullYear();
-                startDate = `${m}/${d}/${y}`;
-            }
-        } else if (startDate instanceof Date) {
-            const m = (startDate.getMonth() + 1).toString().padStart(2, "0");
-            const d = startDate.getDate().toString().padStart(2, "0");
-            const y = startDate.getFullYear();
-            startDate = `${m}/${d}/${y}`;
-        }
-
-        newSettingsRows.push([driver, systemStatus, startDate, promoTaken, promoLedger]);
+        newSettingsRows.push([driver, fare]);
     }
 
-    // --- MEMORY SAVER: Keep inactive drivers in Settings ---
-    for (let oldDriver in existingSettings) {
+    // --- Keep inactive drivers in Settings ---
+    for (let oldDriver in existingFares) {
         if (!driverStats[oldDriver]) {
-            let oldInfo = existingSettings[oldDriver];
-            newSettingsRows.push([
-                oldDriver,
-                oldInfo.system,
-                oldInfo.startDate,
-                oldInfo.promoTaken,
-                oldInfo.promoLedger
-            ]);
+            newSettingsRows.push([oldDriver, existingFares[oldDriver]]);
         }
     }
 
     settingsSheet.clear();
-    settingsSheet.getRange(1, 1, newSettingsRows.length, 5).setValues(newSettingsRows);
-    settingsSheet.getRange("A1:E1").setFontWeight("bold").setBackground("#d0e0e3");
-    settingsSheet.autoResizeColumns(1, 5);
+    settingsSheet.getRange(1, 1, newSettingsRows.length, 2).setValues(newSettingsRows);
+    settingsSheet.getRange("A1:B1").setFontWeight("bold").setBackground("#d0e0e3");
+    settingsSheet.autoResizeColumns(1, 2);
 
     // =================================================================
-    // --- Write aggregated stats to Summary (starting at column M) ---
+    // --- Write aggregated stats to Summary (column F = one gap after main table) ---
     // =================================================================
-    const startRow = 3, startCol = 13;
+    const startRow = 3, startCol = 6; // Column F (A-D = main table, E = gap)
     // Clear old aggregate area
     try { summarySheet.getRange(startRow, startCol, 50, 8).clearContent(); } catch (e) { }
     summarySheet.getRange(startRow, startCol, aggRows.length, aggRows[0].length).setValues(aggRows);
@@ -320,7 +288,7 @@ function updateSummaryAndCharts(ss) {
         .map(d => [d.date, roundToTwo(d.credit)]);
 
     const dailyHeader = ["Date", "Total Credit"];
-    const dailyStartCol = 22;
+    const dailyStartCol = startCol + aggRows[0].length + 1; // One gap after aggregate table
 
     summarySheet.getRange(2, dailyStartCol, 100, 5).clearContent();
     summarySheet.getRange(2, dailyStartCol, 1, dailyHeader.length).setValues([dailyHeader]).setFontWeight("bold");
@@ -330,9 +298,11 @@ function updateSummaryAndCharts(ss) {
         summarySheet.getRange(3, dailyStartCol, dailyRows.length, 1).setNumberFormat("dddd, dd");
     }
 
-    // --- Charts ---
+    // --- Charts (positioned after all data columns) ---
     const allCharts = summarySheet.getCharts();
     allCharts.forEach(c => summarySheet.removeChart(c));
+
+    const chartCol = dailyStartCol + 3; // Charts start after daily stats data
 
     // Chart 1: Daily Total Credit Trend (line)
     if (dailyRows.length > 0) {
@@ -347,7 +317,7 @@ function updateSummaryAndCharts(ss) {
             .setOption("colors", ["#1f77b4"])
             .setOption("legend", { position: "none" })
             .setOption("pointSize", 7)
-            .setPosition(2, 27, 0, 0)
+            .setPosition(2, chartCol, 0, 0)
             .setOption("width", 1000)
             .setOption("height", 400)
             .build();
@@ -356,45 +326,52 @@ function updateSummaryAndCharts(ss) {
 
     const lastRow = startRow + aggRows.length - 1;
     const dataStart = startRow + 1;
+    // Build column letters from startCol for chart ranges
+    const colF = String.fromCharCode(64 + startCol);         // F (Driver)
+    const colG = String.fromCharCode(64 + startCol + 1);     // G (Total Credit)
+    const colH = String.fromCharCode(64 + startCol + 2);     // H (Total Trips)
+    const colI = String.fromCharCode(64 + startCol + 3);     // I (Total Cash)
+    const colJ = String.fromCharCode(64 + startCol + 4);     // J (Driver NET)
+    const colK = String.fromCharCode(64 + startCol + 5);     // K (Avg Per Day)
 
     // Chart 2: Total Credit by Driver (bar)
     let chart1 = summarySheet.newChart().setChartType(Charts.ChartType.COLUMN)
-        .addRange(summarySheet.getRange("M" + dataStart + ":M" + lastRow))
-        .addRange(summarySheet.getRange("N" + dataStart + ":N" + lastRow))
+        .addRange(summarySheet.getRange(colF + dataStart + ":" + colF + lastRow))
+        .addRange(summarySheet.getRange(colG + dataStart + ":" + colG + lastRow))
         .setOption("title", "Total Credit by Driver")
         .setOption("titleTextStyle", { bold: true, fontSize: 24 })
         .setOption("colors", ["#1f77b4"]).setOption("legend", { position: "none" })
-        .setOption("vAxis", { title: "Credit" }).setPosition(2, 13, 0, 0).build();
+        .setOption("vAxis", { title: "Credit" }).setPosition(23, chartCol, 0, 0).build();
     summarySheet.insertChart(chart1);
 
     // Chart 3: Total Trips by Driver (bar)
     let chart2 = summarySheet.newChart().setChartType(Charts.ChartType.COLUMN)
-        .addRange(summarySheet.getRange("M" + dataStart + ":M" + lastRow))
-        .addRange(summarySheet.getRange("O" + dataStart + ":O" + lastRow))
+        .addRange(summarySheet.getRange(colF + dataStart + ":" + colF + lastRow))
+        .addRange(summarySheet.getRange(colH + dataStart + ":" + colH + lastRow))
         .setOption("title", "Total Trips by Driver")
         .setOption("titleTextStyle", { bold: true, fontSize: 24 })
         .setOption("colors", ["#8c564b"]).setOption("legend", { position: "none" })
-        .setOption("vAxis", { title: "Trips" }).setPosition(21, 13, 0, 0).build();
+        .setOption("vAxis", { title: "Trips" }).setPosition(44, chartCol, 0, 0).build();
     summarySheet.insertChart(chart2);
 
     // Chart 4: Average Per Day by Driver (bar)
     let chart3 = summarySheet.newChart().setChartType(Charts.ChartType.COLUMN)
-        .addRange(summarySheet.getRange("M" + dataStart + ":M" + lastRow))
-        .addRange(summarySheet.getRange("R" + dataStart + ":R" + lastRow))
+        .addRange(summarySheet.getRange(colF + dataStart + ":" + colF + lastRow))
+        .addRange(summarySheet.getRange(colK + dataStart + ":" + colK + lastRow))
         .setOption("title", "Average Credit Per Day")
         .setOption("titleTextStyle", { bold: true, fontSize: 24 })
         .setOption("colors", ["#d62728"]).setOption("legend", { position: "none" })
-        .setOption("vAxis", { title: "Daily Credit" }).setPosition(39, 13, 0, 0).build();
+        .setOption("vAxis", { title: "Daily Credit" }).setPosition(65, chartCol, 0, 0).build();
     summarySheet.insertChart(chart3);
 
     // Chart 5: Driver NET by Driver (bar)
     let chart4 = summarySheet.newChart().setChartType(Charts.ChartType.COLUMN)
-        .addRange(summarySheet.getRange("M" + dataStart + ":M" + lastRow))
-        .addRange(summarySheet.getRange("Q" + dataStart + ":Q" + lastRow))
+        .addRange(summarySheet.getRange(colF + dataStart + ":" + colF + lastRow))
+        .addRange(summarySheet.getRange(colJ + dataStart + ":" + colJ + lastRow))
         .setOption("title", "Driver NET Payout")
         .setOption("titleTextStyle", { bold: true, fontSize: 24 })
         .setOption("colors", ["#2ca02c"]).setOption("legend", { position: "none" })
-        .setOption("vAxis", { title: "NET ($)" }).setPosition(57, 13, 0, 0).build();
+        .setOption("vAxis", { title: "NET ($)" }).setPosition(86, chartCol, 0, 0).build();
     summarySheet.insertChart(chart4);
 }
 
@@ -816,17 +793,31 @@ function generateBonusReport(ss) {
  */
 function parseDDMMYY(value) {
     if (!value) return null;
-    if (value instanceof Date) return value;
+    // Always parse as string to avoid Google Sheets auto-date-conversion issues
     const str = String(value).trim();
-    const parts = str.split("-");
-    if (parts.length !== 3) return null;
-    const day = parseInt(parts[0], 10);
-    const month = parseInt(parts[1], 10) - 1; // zero-based
-    let year = parseInt(parts[2], 10);
-    if (year < 100) year += 2000; // 26 → 2026
-    if (isNaN(day) || isNaN(month) || isNaN(year)) return null;
-    const d = new Date(year, month, day);
-    return isNaN(d.getTime()) ? null : d;
+    // Handle DD-MM-YY format (e.g., "01-06-26")
+    const dashParts = str.split("-");
+    if (dashParts.length === 3) {
+        const day = parseInt(dashParts[0], 10);
+        const month = parseInt(dashParts[1], 10) - 1; // zero-based
+        let year = parseInt(dashParts[2], 10);
+        if (year < 100) year += 2000; // 26 → 2026
+        if (isNaN(day) || isNaN(month) || isNaN(year)) return null;
+        const d = new Date(year, month, day);
+        return isNaN(d.getTime()) ? null : d;
+    }
+    // Handle DD/MM/YYYY format (e.g., "01/06/2026") as fallback
+    const slashParts = str.split("/");
+    if (slashParts.length === 3) {
+        const day = parseInt(slashParts[0], 10);
+        const month = parseInt(slashParts[1], 10) - 1;
+        let year = parseInt(slashParts[2], 10);
+        if (year < 100) year += 2000;
+        if (isNaN(day) || isNaN(month) || isNaN(year)) return null;
+        const d = new Date(year, month, day);
+        return isNaN(d.getTime()) ? null : d;
+    }
+    return null;
 }
 
 function parseNumber(val) {
