@@ -88,7 +88,7 @@ function updateSummaryAndCharts(ss) {
     }
 
     // --- Build output rows: one row per driver per day (only days with credit > 0) ---
-    let outputRows = []; // [date, driver, credit]
+    let outputRows = []; // [date, driver, credit, cash, trips, total]
 
     for (let r = 2; r < rawData.length; r++) { // Skip header (0) and Total row (1)
         const driverName = rawData[r][0];
@@ -99,18 +99,41 @@ function updateSummaryAndCharts(ss) {
         const driverNet = parseNumber(rawData[r][netColIdx]) || 0;
         const driverCash = roundToTwo(driverTotal - driverNet); // Cash = Total - NET
 
+        // Collect daily credits to calculate proportional trips
+        let dailyCredits = [];
         dateColumns.forEach(dc => {
             const credit = parseNumber(rawData[r][dc.colIdx]) || 0;
             if (credit > 0) {
-                outputRows.push([
-                    dc.date,
-                    driverName,
-                    credit,
-                    driverCash,    // Monthly cash total (stored for aggregation)
-                    driverTrips,   // Monthly trip count (stored for aggregation)
-                    driverTotal    // Monthly total (stored for aggregation)
-                ]);
+                dailyCredits.push({ date: dc.date, credit: credit });
             }
+        });
+
+        // Calculate daily trips and cash proportionally based on credit
+        let assignedTrips = 0;
+        let assignedCash = 0;
+        dailyCredits.forEach((dc, idx) => {
+            let dailyTrips;
+            let dailyCash;
+            if (idx === dailyCredits.length - 1) {
+                // Last day gets remaining trips/cash to ensure exact total
+                dailyTrips = driverTrips - assignedTrips;
+                dailyCash = driverCash - assignedCash;
+            } else {
+                dailyTrips = driverTotal > 0 ? Math.round(driverTrips * (dc.credit / driverTotal)) : 0;
+                dailyCash = driverTotal > 0 ? (driverCash * (dc.credit / driverTotal)) : 0;
+            }
+            assignedTrips += dailyTrips;
+            assignedCash += dailyCash;
+
+            outputRows.push([
+                dc.date,
+                driverName,
+                dc.credit,
+                dailyCash,     // Proportional daily cash
+                dailyTrips,    // Estimated daily trip count
+                driverTotal,   // Monthly total credit (stored for aggregation)
+                driverCash     // Monthly total cash (stored for aggregation)
+            ]);
         });
     }
 
@@ -127,8 +150,36 @@ function updateSummaryAndCharts(ss) {
     });
 
     // --- Write Summary headers ---
-    const headers = ["Date", "Driver", "Credit", "Trips"];
+    const headers = ["Date", "Driver", "Credit", "Trips", "Cash", "Balance"];
     summarySheet.getRange(2, 1, 1, headers.length).setValues([headers]);
+
+    // --- Read fare settings for balance calculation ---
+    let settingsSheet = ss.getSheetByName("Settings");
+    if (!settingsSheet) settingsSheet = ss.insertSheet("Settings");
+    const settingsData = settingsSheet.getDataRange().getValues();
+    let existingFares = {}; // driver -> fare value
+    for (let i = 1; i < settingsData.length; i++) {
+        if (settingsData[i][0]) {
+            existingFares[settingsData[i][0]] = settingsData[i][1];
+        }
+    }
+
+    // Helper to get fare as decimal
+    function getFareDecimal(driver) {
+        let fareVal = existingFares[driver];
+        if (fareVal === undefined || fareVal === null || fareVal === "") return 0.9;
+        if (typeof fareVal === "string" && fareVal.includes("%")) return parseFloat(fareVal) / 100;
+        if (typeof fareVal === "number") return fareVal > 1 ? fareVal / 100 : fareVal;
+        return 0.9;
+    }
+
+    // Pre-cache the fare decimal for each driver to speed up loop
+    let driverFareCache = {};
+    outputRows.forEach(row => {
+        if (!driverFareCache[row[1]]) {
+            driverFareCache[row[1]] = getFareDecimal(row[1]);
+        }
+    });
 
     // --- Build the rows to write (with date grouping / merging) ---
     const rowsToWrite = [];
@@ -153,8 +204,21 @@ function updateSummaryAndCharts(ss) {
             currentGroupSize = 1;
         }
 
-        // Summary rows: Date, Driver, Credit, Trips (trips = 0 per row since we only have monthly total)
-        rowsToWrite.push([displayDate, row[1], row[2], ""]);
+        const fare = Number(driverFareCache[row[1]]) || 0.9;
+        const dailyCredit = Number(row[2]) || 0;
+        const dailyCash = Number(row[3]) || 0;
+        const trips = Number(row[4]) || 0;
+        const dailyBalance = Number(roundToTwo((dailyCredit * fare) - dailyCash)) || 0;
+
+        // Summary rows: Date, Driver, Credit, Trips, Cash, Balance
+        rowsToWrite.push([
+            displayDate,
+            row[1],
+            dailyCredit,
+            trips,
+            Number(roundToTwo(dailyCash)) || 0,
+            dailyBalance
+        ]);
     });
 
     if (currentGroupSize > 0) {
@@ -164,11 +228,11 @@ function updateSummaryAndCharts(ss) {
     // --- Clear old data and write new ---
     const maxRows = summarySheet.getMaxRows();
     if (maxRows > 2) {
-        summarySheet.getRange(3, 1, maxRows - 2, 4).clearContent();
+        summarySheet.getRange(3, 1, maxRows - 2, 6).clearContent();
         try { summarySheet.getRange(3, 1, maxRows - 2, 1).breakApart(); } catch (e) { }
     }
 
-    const dataRange = summarySheet.getRange(3, 1, rowsToWrite.length, 4);
+    const dataRange = summarySheet.getRange(3, 1, rowsToWrite.length, 6);
     dataRange.setValues(rowsToWrite);
     dataRange.setBorder(false, false, false, false, false, false);
     dataRange.setBorder(true, true, true, true, true, true, "black", SpreadsheetApp.BorderStyle.SOLID);
@@ -176,7 +240,7 @@ function updateSummaryAndCharts(ss) {
 
     // --- Apply day block borders and merge date cells ---
     dayBlocks.forEach(block => {
-        summarySheet.getRange(block.row, 1, block.count, 4)
+        summarySheet.getRange(block.row, 1, block.count, 6)
             .setBorder(true, null, true, null, null, null, "black", SpreadsheetApp.BorderStyle.SOLID_THICK);
         if (block.count > 1) {
             summarySheet.getRange(block.row, 1, block.count, 1).mergeVertically();
@@ -222,18 +286,9 @@ function updateSummaryAndCharts(ss) {
     // =================================================================
     // --- AUTO-SYNC "SETTINGS" SHEET (Driver + Fare %) ---
     // =================================================================
-    let settingsSheet = ss.getSheetByName("Settings");
-    if (!settingsSheet) settingsSheet = ss.insertSheet("Settings");
+    // (settingsSheet and existingFares already read above for balance calc)
 
-    const settingsData = settingsSheet.getDataRange().getValues();
-    let existingFares = {}; // driver -> fare %
-    for (let i = 1; i < settingsData.length; i++) {
-        if (settingsData[i][0]) {
-            existingFares[settingsData[i][0]] = settingsData[i][1];
-        }
-    }
-
-    // --- Aggregated stats table (column F, one gap after the 4-col main table) ---
+    // --- Aggregated stats table (column H, one gap after the 6-col main table) ---
     const aggHeader = ["Driver", "Total Credit", "Total Trips", "Total Cash", "Driver NET", "Avg Per Day"];
     const aggRows = [aggHeader];
 
@@ -243,7 +298,6 @@ function updateSummaryAndCharts(ss) {
         const s = driverStats[driver];
         aggRows.push([driver, s.totalCredit, s.totalTrips, s.totalCash, s.driverNet, s.avgPerDay]);
 
-        // Use existing fare if set, otherwise default to 90%
         let fare = existingFares[driver];
         if (fare === undefined || fare === null || fare === "") {
             fare = "90%";
@@ -264,11 +318,12 @@ function updateSummaryAndCharts(ss) {
     settingsSheet.autoResizeColumns(1, 2);
 
     // =================================================================
-    // --- Write aggregated stats to Summary (column F = one gap after main table) ---
+    // --- Write aggregated stats to Summary (column H = one gap after 6-col main table) ---
     // =================================================================
-    const startRow = 3, startCol = 6; // Column F (A-D = main table, E = gap)
+    const startRow = 3, startCol = 8; // Column H (A-F = main table, G = gap)
     // Clear old aggregate area
-    try { summarySheet.getRange(startRow, startCol, 50, 8).clearContent(); } catch (e) { }
+    try { summarySheet.getRange(startRow, startCol, 50, 10).clearContent(); } catch (e) { }
+
     summarySheet.getRange(startRow, startCol, aggRows.length, aggRows[0].length).setValues(aggRows);
 
     // --- Daily stats for chart (aggregate all drivers per day) ---
@@ -278,19 +333,21 @@ function updateSummaryAndCharts(ss) {
         if (!dateVal) return;
         const dateKey = dateVal.getTime();
         if (!dailyStats[dateKey]) {
-            dailyStats[dateKey] = { date: dateVal, credit: 0 };
+            dailyStats[dateKey] = { date: dateVal, credit: 0, trips: 0, cash: 0 };
         }
         dailyStats[dateKey].credit += (r[2] || 0);
+        dailyStats[dateKey].trips += (r[4] || 0);
+        dailyStats[dateKey].cash += (r[3] || 0);
     });
 
     const dailyRows = Object.values(dailyStats)
         .sort((a, b) => a.date - b.date)
-        .map(d => [d.date, roundToTwo(d.credit)]);
+        .map(d => [d.date, roundToTwo(d.credit), d.trips, roundToTwo(d.cash)]);
 
-    const dailyHeader = ["Date", "Total Credit"];
+    const dailyHeader = ["Date", "Total Credit", "Trips", "Cash"];
     const dailyStartCol = startCol + aggRows[0].length + 1; // One gap after aggregate table
 
-    summarySheet.getRange(2, dailyStartCol, 100, 5).clearContent();
+    summarySheet.getRange(2, dailyStartCol, 100, 6).clearContent();
     summarySheet.getRange(2, dailyStartCol, 1, dailyHeader.length).setValues([dailyHeader]).setFontWeight("bold");
 
     if (dailyRows.length > 0) {
@@ -304,7 +361,7 @@ function updateSummaryAndCharts(ss) {
 
     // Chart 1: Daily Total Credit Trend (line) — positioned NEXT TO the daily credit table
     if (dailyRows.length > 0) {
-        const dailyChartCol = dailyStartCol + 3; // 1 gap after the 2-col daily table
+        const dailyChartCol = dailyStartCol + 6; // Shifted right to accommodate the 4-column daily table
         let dailyChart = summarySheet.newChart()
             .setChartType(Charts.ChartType.LINE)
             .addRange(summarySheet.getRange(3, dailyStartCol, dailyRows.length, 1))
@@ -481,7 +538,7 @@ function generateWeeklySummary(ss) {
 
     // --- Process Data ---
     const weeklyData = {};
-    const dateIdx = 0, driverIdx = 1, creditIdx = 2;
+    const dateIdx = 0, driverIdx = 1, creditIdx = 2, tripsIdx = 3;
 
     allRows.forEach((row) => {
         if (!Array.isArray(row) || !row[dateIdx] || !row[driverIdx]) return;
@@ -490,6 +547,7 @@ function generateWeeklySummary(ss) {
 
         const driver = row[driverIdx];
         const credit = Number(row[creditIdx]) || 0;
+        const trips = Number(row[tripsIdx]) || 0;
 
         const weekStart = getMonday(date);
         const weekEnd = new Date(weekStart);
@@ -498,10 +556,11 @@ function generateWeeklySummary(ss) {
 
         if (!weeklyData[weekKey]) weeklyData[weekKey] = {};
         if (!weeklyData[weekKey][driver]) {
-            weeklyData[weekKey][driver] = { credit: 0 };
+            weeklyData[weekKey][driver] = { credit: 0, trips: 0 };
         }
 
         weeklyData[weekKey][driver].credit += credit;
+        weeklyData[weekKey][driver].trips += trips;
     });
 
     // --- Write Output ---
@@ -524,7 +583,7 @@ function generateWeeklySummary(ss) {
             const weekBlock = weeklyData[weekKey];
             const startRow = currentRow;
 
-            const titleRange = weeklySheet.getRange(currentRow, 1, 1, 3).merge();
+            const titleRange = weeklySheet.getRange(currentRow, 1, 1, 5).merge();
             titleRange.setValue(`WEEK ${displayedWeekCounter} (${weekKey})`)
                 .setFontWeight("bold")
                 .setFontSize(11)
@@ -532,8 +591,8 @@ function generateWeeklySummary(ss) {
 
             currentRow++;
 
-            const headerRange = weeklySheet.getRange(currentRow, 1, 1, 4);
-            headerRange.setValues([["Driver", "Total Credit", "Total Cash", "Balance"]])
+            const headerRange = weeklySheet.getRange(currentRow, 1, 1, 5);
+            headerRange.setValues([["Driver", "Total Credit", "Trips", "Total Cash", "Balance"]])
                 .setFontWeight("bold")
                 .setBackground("#3c78d8")
                 .setFontColor("white")
@@ -549,40 +608,57 @@ function generateWeeklySummary(ss) {
                 const cash = driverCashMap[d] || 0;
                 const fare = driverFareMap[d] || 0.9; // default 90%
                 const balance = roundToTwo((info.credit * fare) - cash);
-                tableData.push([d, info.credit, cash, balance]);
+                tableData.push([d, info.credit, info.trips, cash, balance]);
             });
 
             // Write Main Table
-            const dataRange = weeklySheet.getRange(currentRow, 1, tableData.length, 4);
+            const dataRange = weeklySheet.getRange(currentRow, 1, tableData.length, 5);
             dataRange.setValues(tableData);
             dataRange.setBorder(true, true, true, true, true, true, "black", SpreadsheetApp.BorderStyle.SOLID);
 
-            weeklySheet.getRange(currentRow, 2, tableData.length, 3).setNumberFormat("$#,##0.00");
+            weeklySheet.getRange(currentRow, 2, tableData.length, 1).setNumberFormat("$#,##0.00");
+            weeklySheet.getRange(currentRow, 4, tableData.length, 2).setNumberFormat("$#,##0.00");
 
             const totalCredit = tableData.reduce((a, b) => a + b[1], 0);
-            const totalCash = tableData.reduce((a, b) => a + b[2], 0);
-            const totalBalance = tableData.reduce((a, b) => a + b[3], 0);
+            const totalTrips = tableData.reduce((a, b) => a + b[2], 0);
+            const totalCash = tableData.reduce((a, b) => a + b[3], 0);
+            const totalBalance = tableData.reduce((a, b) => a + b[4], 0);
 
-            const totalRowRange = weeklySheet.getRange(currentRow + tableData.length, 1, 1, 4);
-            totalRowRange.setValues([["TOTAL", totalCredit, totalCash, totalBalance]])
+            const totalRowRange = weeklySheet.getRange(currentRow + tableData.length, 1, 1, 5);
+            totalRowRange.setValues([["TOTAL", totalCredit, totalTrips, totalCash, totalBalance]])
                 .setFontWeight("bold")
                 .setBackground("#eeeeee")
                 .setBorder(true, true, true, true, true, true);
 
-            weeklySheet.getRange(currentRow + tableData.length, 2, 1, 3).setNumberFormat("$#,##0.00");
+            weeklySheet.getRange(currentRow + tableData.length, 2, 1, 1).setNumberFormat("$#,##0.00");
+            weeklySheet.getRange(currentRow + tableData.length, 4, 1, 2).setNumberFormat("$#,##0.00");
 
             const tableEnd = currentRow + tableData.length;
 
-            // Chart: Total Credit by Driver
-            const chart = weeklySheet.newChart().asColumnChart()
+            // Chart 1: Total Credit by Driver
+            const chart1 = weeklySheet.newChart().asColumnChart()
                 .setPosition(startRow - 1, 7, 0, 0)
                 .addRange(weeklySheet.getRange(currentRow, 1, tableData.length, 2))
                 .setOption("title", `WEEK ${displayedWeekCounter} - Total Credit`)
+                .setOption("colors", ["#1f77b4"])
                 .setOption("legend", { position: "none" })
                 .setOption("hAxis", { title: "Driver" })
                 .setOption("vAxis", { title: "Total Credit" })
                 .build();
-            weeklySheet.insertChart(chart);
+            weeklySheet.insertChart(chart1);
+
+            // Chart 2: Trips by Driver
+            const chart2 = weeklySheet.newChart().asColumnChart()
+                .setPosition(startRow - 1, 13, 0, 0) // Place at column M
+                .addRange(weeklySheet.getRange(currentRow, 1, tableData.length, 1)) // Driver Names
+                .addRange(weeklySheet.getRange(currentRow, 3, tableData.length, 1)) // Trips
+                .setOption("title", `WEEK ${displayedWeekCounter} - Trips`)
+                .setOption("colors", ["#8c564b"]) // Distinct brown color
+                .setOption("legend", { position: "none" })
+                .setOption("hAxis", { title: "Driver" })
+                .setOption("vAxis", { title: "Trips" })
+                .build();
+            weeklySheet.insertChart(chart2);
 
             currentRow = Math.max(tableEnd + 2, startRow + 22);
         }
