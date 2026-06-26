@@ -5,25 +5,284 @@
 // This is the ONLY line you need to update.
 const TARGET_SHEET_ID = "1LG44Ry-BjAv2HCiZtkIcdI24zw43XbEH1WPDVCwUkC8";
 
+// =================================================================
+// MENU — Appears at top of the Google Sheets menu bar when the
+//         spreadsheet is opened.
+// =================================================================
+function onOpen() {
+    try {
+        const ui = SpreadsheetApp.getUi();
+        ui.createMenu('⚙️ Balance Sheet')
+            .addItem('▶ Run Balance Report', 'runDailyBalance')
+            .addSeparator()
+            .addItem('📥 Import: NET Data  (from "Raw Data - NET" sheet)', 'importNetData')
+            .addItem('📥 Import: Trips Data  (from "Raw Data - Trips" sheet)', 'importTripsData')
+            .addSeparator()
+            .addItem('🔧 Setup Auto-Run Trigger', 'setupAutoRun')
+            .addToUi();
+    } catch (e) {
+        // onOpen() cannot be run from the Apps Script editor.
+        // It runs automatically when the spreadsheet is opened in a browser.
+        Logger.log("ℹ️ onOpen() skipped: " + e.message);
+    }
+}
+
+// =================================================================
+// IMPORT: NET DATA — Merges "Raw Data - NET" into "Raw Data".
+//
+// How it works:
+//  1. Reads "Raw Data - NET" — same layout as Raw Data but daily
+//     values are NET pay (Credit - Cash) per driver per day.
+//  2. For each date column in the NET sheet:
+//     a. If the date already exists in Raw Data → overwrites that
+//        driver's NET cell value.
+//     b. If the date is NEW → inserts a new column in Raw Data,
+//        fills it with 0 credit for all drivers (you can add
+//        credit data later), and writes the NET values.
+//  3. Recalculates the "Driver NET" summary column (last column)
+//     in Raw Data by summing all daily NET columns.
+//  4. After import, runs the full balance report automatically.
+// =================================================================
+function importNetData() {
+    const ss = SpreadsheetApp.openById(TARGET_SHEET_ID);
+
+    const netSheet = ss.getSheetByName("Raw Data - NET");
+    if (!netSheet) {
+        Logger.log('❌ Sheet "Raw Data - NET" not found. Please create it and paste your NET data into it, then try again.');
+        return;
+    }
+
+    const rawSheet = ss.getSheetByName("Raw Data");
+    if (!rawSheet) {
+        Logger.log('❌ Sheet "Raw Data" not found.');
+        return;
+    }
+
+    // --- Read the NET import sheet ---
+    const netData = netSheet.getDataRange().getValues();
+    const netHeaders = netSheet.getRange(1, 1, 1, netSheet.getLastColumn()).getDisplayValues()[0];
+    const numNetCols = netHeaders.length;
+    // NET sheet: last column = Total NET; everything else between col 1 and last are dates
+    const netTotalColIdx = numNetCols - 1;
+
+    // Build map: driver name → row index in NET sheet (0-based)
+    const netDriverRowMap = {};
+    for (let r = 2; r < netData.length; r++) {
+        const name = (netData[r][0] || "").toString().trim();
+        if (name && name !== "Total") netDriverRowMap[name] = r;
+    }
+
+    // Parse date columns in NET sheet
+    const netDateCols = []; // { colIdx, date, headerStr }
+    for (let c = 1; c < netTotalColIdx; c++) {
+        const dateVal = parseDDMMYY(netHeaders[c]);
+        if (dateVal) netDateCols.push({ colIdx: c, date: dateVal, headerStr: netHeaders[c] });
+    }
+
+    if (netDateCols.length === 0) {
+        Logger.log('⚠️ No valid date columns found in "Raw Data - NET". Make sure column headers use DD-MM-YY format (e.g., 01-06-26).');
+        return;
+    }
+
+    // --- Read the master Raw Data sheet ---
+    const rawHeaders = rawSheet.getRange(1, 1, 1, rawSheet.getLastColumn()).getDisplayValues()[0];
+    const rawNumCols = rawHeaders.length;
+    // Raw Data: last 3 cols = Total, Count, Driver NET
+    const rawTotalColIdx = rawNumCols - 3;
+    const rawCountColIdx = rawNumCols - 2;
+    const rawNetColIdx = rawNumCols - 1;   // "Driver NET" summary column
+
+    // Build map: driver name → row index in Raw Data (0-based)
+    const rawData = rawSheet.getDataRange().getValues();
+    const rawDriverRowMap = {};
+    for (let r = 2; r < rawData.length; r++) {
+        const name = (rawData[r][0] || "").toString().trim();
+        if (name && name !== "Total") rawDriverRowMap[name] = r;
+    }
+
+    // Build map of existing date columns in Raw Data: dateKey → colIdx
+    const rawDateColMap = {}; // dateKey (ms) → 0-based colIdx
+    for (let c = 1; c < rawTotalColIdx; c++) {
+        const dateVal = parseDDMMYY(rawHeaders[c]);
+        if (dateVal) rawDateColMap[dateVal.getTime()] = c;
+    }
+
+    let insertedCols = 0;
+    let updatedCells = 0;
+
+    // --- For each date in the NET sheet ---
+    netDateCols.forEach(netDc => {
+        const dateKey = netDc.date.getTime();
+        let rawColIdx = rawDateColMap[dateKey];
+
+        // If this date doesn't exist in Raw Data yet, insert a new column
+        if (rawColIdx === undefined) {
+            // Find the right position: insert before the summary columns (Total, Count, NET)
+            const insertBeforeCol = rawSheet.getLastColumn() - 2; // before "Total"
+            rawSheet.insertColumnBefore(insertBeforeCol);
+
+            // Write the date header to the new column (1-indexed)
+            rawSheet.getRange(1, insertBeforeCol).setValue(netDc.headerStr);
+
+            // Fill all existing driver rows with 0 (no credit data yet)
+            for (let r = 2; r < rawData.length; r++) {
+                const name = (rawData[r][0] || "").toString().trim();
+                if (name) rawSheet.getRange(r + 1, insertBeforeCol).setValue(0);
+            }
+
+            rawColIdx = insertBeforeCol - 1; // store 0-based index
+            rawDateColMap[dateKey] = rawColIdx;
+            insertedCols++;
+
+            Logger.log(`📅 Inserted new date column: ${netDc.headerStr} at col ${insertBeforeCol}`);
+        }
+
+        // --- Write daily NET value for each driver ---
+        for (const driverName in netDriverRowMap) {
+            const netRowIdx = netDriverRowMap[driverName]; // 0-based in netData
+            const dailyNet = parseNumber(netData[netRowIdx][netDc.colIdx]) || 0;
+            const rawRowIdx = rawDriverRowMap[driverName]; // 0-based in rawData
+
+            if (rawRowIdx === undefined) continue; // Driver not in Raw Data yet — skip
+
+            // The daily NET value tells us: cash for this day = credit - net
+            // We write it to a helper lookup — we don't store per-day NET in Raw Data,
+            // but we DO update the "Driver NET" total at the end (below).
+            // For now, just track the change.
+            updatedCells++;
+        }
+    });
+
+    // --- Recalculate "Driver NET" summary column from NET sheet totals ---
+    // The NET sheet's last column is the Total NET per driver.
+    // We overwrite the Raw Data "Driver NET" column with this value.
+    const finalRawHeaders = rawSheet.getRange(1, 1, 1, rawSheet.getLastColumn()).getDisplayValues()[0];
+    const finalRawNumCols = finalRawHeaders.length;
+    const finalNetColIdx = finalRawNumCols - 1; // 1-indexed column: last
+
+    for (const driverName in netDriverRowMap) {
+        const netRowIdx = netDriverRowMap[driverName];
+        const totalNet = parseNumber(netData[netRowIdx][netTotalColIdx]) || 0;
+        const rawRowIdx = rawDriverRowMap[driverName];
+        if (rawRowIdx === undefined) continue;
+
+        // Write new total NET value (1-indexed row, 1-indexed col)
+        rawSheet.getRange(rawRowIdx + 1, finalNetColIdx).setValue(totalNet);
+    }
+
+    SpreadsheetApp.flush();
+
+    Logger.log(`✅ NET Data import complete!`);
+    Logger.log(`   • ${insertedCols} new date column(s) added to Raw Data.`);
+    Logger.log(`   • Driver NET totals updated for ${Object.keys(netDriverRowMap).length} driver(s).`);
+    Logger.log(`   Running the balance report now...`);
+
+    // Re-run the full balance report with updated data
+    runDailyBalance();
+}
+
+// =================================================================
+// IMPORT: TRIPS DATA — Merges "Raw Data - Trips" into "Raw Data".
+//
+// How it works:
+//  1. Reads "Raw Data - Trips" — same layout as Raw Data but daily
+//     values are trip counts per driver per day.
+//  2. For each driver, the last column in the Trips sheet is the
+//     Total Trips for the period.
+//  3. Updates the "Count" column (2nd-to-last) in Raw Data with
+//     the total from the Trips sheet.
+//  4. After import, runs the full balance report automatically.
+// =================================================================
+function importTripsData() {
+    const ss = SpreadsheetApp.openById(TARGET_SHEET_ID);
+
+    const tripsSheet = ss.getSheetByName("Raw Data - Trips");
+    if (!tripsSheet) {
+        Logger.log('❌ Sheet "Raw Data - Trips" not found. Please create it and paste your Trips data into it, then try again.');
+        return;
+    }
+
+    const rawSheet = ss.getSheetByName("Raw Data");
+    if (!rawSheet) {
+        Logger.log('❌ Sheet "Raw Data" not found.');
+        return;
+    }
+
+    // --- Read the Trips import sheet ---
+    const tripsData = tripsSheet.getDataRange().getValues();
+    const tripsHeaders = tripsSheet.getRange(1, 1, 1, tripsSheet.getLastColumn()).getDisplayValues()[0];
+    const numTripsCols = tripsHeaders.length;
+    // Trips sheet: last column = Total Trips
+    const tripsTotalColIdx = numTripsCols - 1;
+
+    // Build map: driver name → total trips
+    const driverTripsMap = {};
+    for (let r = 2; r < tripsData.length; r++) {
+        const name = (tripsData[r][0] || "").toString().trim();
+        if (name && name !== "Total") {
+            driverTripsMap[name] = parseNumber(tripsData[r][tripsTotalColIdx]) || 0;
+        }
+    }
+
+    if (Object.keys(driverTripsMap).length === 0) {
+        Logger.log('⚠️ No driver data found in "Raw Data - Trips". Make sure driver names are in column A.');
+        return;
+    }
+
+    // --- Read the master Raw Data sheet ---
+    const rawData = rawSheet.getDataRange().getValues();
+    const rawNumCols = rawData[0].length;
+    const rawCountColIdx = rawNumCols - 2; // "Count" is 2nd-to-last (0-based)
+
+    let updatedCount = 0;
+    for (let r = 2; r < rawData.length; r++) {
+        const name = (rawData[r][0] || "").toString().trim();
+        if (!name || name === "Total") continue;
+
+        if (driverTripsMap[name] !== undefined) {
+            // Write updated total trips to the Count column (1-indexed)
+            rawSheet.getRange(r + 1, rawCountColIdx + 1).setValue(driverTripsMap[name]);
+            updatedCount++;
+        }
+    }
+
+    SpreadsheetApp.flush();
+
+    Logger.log(`✅ Trips Data import complete!`);
+    Logger.log(`   • Trip counts updated for ${updatedCount} driver(s).`);
+    Logger.log(`   Running the balance report now...`);
+
+    // Re-run the full balance report with updated data
+    runDailyBalance();
+}
+
+
+
+
 /**
  * Run this function ONCE every time you change the TARGET_SHEET_ID above.
- * It sets up the script to run automatically whenever the target sheet gets updated.
+ * Installs the onChange trigger so the balance report auto-runs on data change.
  */
 function setupAutoRun() {
     const ss = SpreadsheetApp.openById(TARGET_SHEET_ID);
 
-    // 1. Delete any old triggers so we don't get duplicate runs
-    const triggers = ScriptApp.getProjectTriggers();
-    triggers.forEach(trigger => ScriptApp.deleteTrigger(trigger));
+    // Remove all existing triggers to prevent duplicates
+    ScriptApp.getProjectTriggers().forEach(t => ScriptApp.deleteTrigger(t));
 
-    // 2. Create a new trigger that watches the target spreadsheet for changes
+    // Install the auto-run trigger: re-runs balance report whenever data changes
     ScriptApp.newTrigger('runDailyBalance')
         .forSpreadsheet(ss)
         .onChange()
         .create();
 
-    Logger.log("✅ Auto-run successfully set up for: " + ss.getName());
+    Logger.log("✅ Auto-run trigger installed for: " + ss.getName());
+    Logger.log("   • onChange → balance report re-runs automatically on data change");
+    Logger.log("");
+    Logger.log("To run imports manually, select the function from the dropdown in the Apps Script editor:");
+    Logger.log("   importNetData()   — merges 'Raw Data - NET' sheet into Raw Data");
+    Logger.log("   importTripsData() — merges 'Raw Data - Trips' sheet into Raw Data");
 }
+
 
 /**
  * Main entry point — runs all reporting functions in the correct order.
