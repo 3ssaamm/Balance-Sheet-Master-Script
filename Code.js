@@ -48,136 +48,111 @@ function importNetData() {
 
     const netSheet = ss.getSheetByName("Raw Data - NET");
     if (!netSheet) {
-        Logger.log('❌ Sheet "Raw Data - NET" not found. Please create it and paste your NET data into it, then try again.');
+        Logger.log('❌ Sheet "Raw Data - NET" not found. Create it, paste your NET data, then try again.');
         return;
     }
-
     const rawSheet = ss.getSheetByName("Raw Data");
-    if (!rawSheet) {
-        Logger.log('❌ Sheet "Raw Data" not found.');
-        return;
-    }
+    if (!rawSheet) { Logger.log('❌ Sheet "Raw Data" not found.'); return; }
 
-    // --- Read the NET import sheet ---
-    const netData = netSheet.getDataRange().getValues();
+    // --- Read the NET sheet (same 3-col summary structure as Raw Data) ---
+    const netData    = netSheet.getDataRange().getValues();
     const netHeaders = netSheet.getRange(1, 1, 1, netSheet.getLastColumn()).getDisplayValues()[0];
     const numNetCols = netHeaders.length;
-    // NET sheet: last column = Total NET; everything else between col 1 and last are dates
-    const netTotalColIdx = numNetCols - 1;
 
-    // Build map: driver name → row index in NET sheet (0-based)
-    const netDriverRowMap = {};
-    for (let r = 2; r < netData.length; r++) {
-        const name = (netData[r][0] || "").toString().trim();
-        if (name && name !== "Total") netDriverRowMap[name] = r;
-    }
+    // The NET sheet has the same trailing 3 summary columns as Raw Data:
+    //   n-3 = Total NET  |  n-2 = Count  |  n-1 = Driver NET
+    // We want "Driver NET" (n-1) as the definitive monthly NET per driver.
+    // First try to find the column by header label; fall back to n-1.
+    const netDriverNetColIdx = findColByLabel(netHeaders, ['driver net', 'net'], numNetCols - 1);
+    Logger.log(`NET sheet: using column index ${netDriverNetColIdx} ("${netHeaders[netDriverNetColIdx]}") as Driver NET source.`);
 
-    // Parse date columns in NET sheet
-    const netDateCols = []; // { colIdx, date, headerStr }
-    for (let c = 1; c < netTotalColIdx; c++) {
+    // Date columns: everything before the first non-date summary column
+    const netDateCols = [];
+    for (let c = 1; c < numNetCols - 3; c++) {   // stop 3 before end (same as Raw Data)
         const dateVal = parseDDMMYY(netHeaders[c]);
         if (dateVal) netDateCols.push({ colIdx: c, date: dateVal, headerStr: netHeaders[c] });
     }
-
+    // Also try the last 3 cols in case the sheet has fewer summary cols
     if (netDateCols.length === 0) {
-        Logger.log('⚠️ No valid date columns found in "Raw Data - NET". Make sure column headers use DD-MM-YY format (e.g., 01-06-26).');
+        for (let c = 1; c < numNetCols - 1; c++) {
+            const dateVal = parseDDMMYY(netHeaders[c]);
+            if (dateVal) netDateCols.push({ colIdx: c, date: dateVal, headerStr: netHeaders[c] });
+        }
+    }
+    if (netDateCols.length === 0) {
+        Logger.log('⚠️ No valid date columns found in "Raw Data - NET". Column headers must be DD-MM-YY (e.g., 01-06-26).');
         return;
     }
 
-    // --- Read the master Raw Data sheet ---
+    // --- Build driver → row maps ---
+    const netDriverRowMap = {};
+    for (let r = 2; r < netData.length; r++) {
+        const name = (netData[r][0] || '').toString().trim();
+        if (name && name !== 'Total') netDriverRowMap[name] = r;
+    }
+
     const rawHeaders = rawSheet.getRange(1, 1, 1, rawSheet.getLastColumn()).getDisplayValues()[0];
     const rawNumCols = rawHeaders.length;
-    // Raw Data: last 3 cols = Total, Count, Driver NET
-    const rawTotalColIdx = rawNumCols - 3;
-    const rawCountColIdx = rawNumCols - 2;
-    const rawNetColIdx = rawNumCols - 1;   // "Driver NET" summary column
+    const rawTotalColIdx = rawNumCols - 3;   // 0-based
+    const rawNetColIdx   = rawNumCols - 1;   // 0-based ("Driver NET" in Raw Data)
 
-    // Build map: driver name → row index in Raw Data (0-based)
     const rawData = rawSheet.getDataRange().getValues();
     const rawDriverRowMap = {};
     for (let r = 2; r < rawData.length; r++) {
-        const name = (rawData[r][0] || "").toString().trim();
-        if (name && name !== "Total") rawDriverRowMap[name] = r;
+        const name = (rawData[r][0] || '').toString().trim();
+        if (name && name !== 'Total') rawDriverRowMap[name] = r;
     }
 
-    // Build map of existing date columns in Raw Data: dateKey → colIdx
-    const rawDateColMap = {}; // dateKey (ms) → 0-based colIdx
+    // Build date-column map for Raw Data
+    const rawDateColMap = {};
     for (let c = 1; c < rawTotalColIdx; c++) {
-        const dateVal = parseDDMMYY(rawHeaders[c]);
-        if (dateVal) rawDateColMap[dateVal.getTime()] = c;
+        const d = parseDDMMYY(rawHeaders[c]);
+        if (d) rawDateColMap[d.getTime()] = c;
     }
 
     let insertedCols = 0;
-    let updatedCells = 0;
 
-    // --- For each date in the NET sheet ---
+    // --- Insert any missing date columns into Raw Data ---
     netDateCols.forEach(netDc => {
         const dateKey = netDc.date.getTime();
-        let rawColIdx = rawDateColMap[dateKey];
-
-        // If this date doesn't exist in Raw Data yet, insert a new column
-        if (rawColIdx === undefined) {
-            // Find the right position: insert before the summary columns (Total, Count, NET)
-            const insertBeforeCol = rawSheet.getLastColumn() - 2; // before "Total"
-            rawSheet.insertColumnBefore(insertBeforeCol);
-
-            // Write the date header to the new column (1-indexed)
-            rawSheet.getRange(1, insertBeforeCol).setValue(netDc.headerStr);
-
-            // Fill all existing driver rows with 0 (no credit data yet)
+        if (rawDateColMap[dateKey] === undefined) {
+            const insertAt = rawSheet.getLastColumn() - 2; // before summary cols
+            rawSheet.insertColumnBefore(insertAt);
+            rawSheet.getRange(1, insertAt).setValue(netDc.headerStr);
+            // Fill credit = 0 for all driver rows (credit unknown from NET alone)
             for (let r = 2; r < rawData.length; r++) {
-                const name = (rawData[r][0] || "").toString().trim();
-                if (name) rawSheet.getRange(r + 1, insertBeforeCol).setValue(0);
+                const name = (rawData[r][0] || '').toString().trim();
+                if (name) rawSheet.getRange(r + 1, insertAt).setValue(0);
             }
-
-            rawColIdx = insertBeforeCol - 1; // store 0-based index
-            rawDateColMap[dateKey] = rawColIdx;
+            rawDateColMap[dateKey] = insertAt - 1;
             insertedCols++;
-
-            Logger.log(`📅 Inserted new date column: ${netDc.headerStr} at col ${insertBeforeCol}`);
-        }
-
-        // --- Write daily NET value for each driver ---
-        for (const driverName in netDriverRowMap) {
-            const netRowIdx = netDriverRowMap[driverName]; // 0-based in netData
-            const dailyNet = parseNumber(netData[netRowIdx][netDc.colIdx]) || 0;
-            const rawRowIdx = rawDriverRowMap[driverName]; // 0-based in rawData
-
-            if (rawRowIdx === undefined) continue; // Driver not in Raw Data yet — skip
-
-            // The daily NET value tells us: cash for this day = credit - net
-            // We write it to a helper lookup — we don't store per-day NET in Raw Data,
-            // but we DO update the "Driver NET" total at the end (below).
-            // For now, just track the change.
-            updatedCells++;
+            Logger.log(`📅 Inserted missing date column: ${netDc.headerStr}`);
         }
     });
 
-    // --- Recalculate "Driver NET" summary column from NET sheet totals ---
-    // The NET sheet's last column is the Total NET per driver.
-    // We overwrite the Raw Data "Driver NET" column with this value.
-    const finalRawHeaders = rawSheet.getRange(1, 1, 1, rawSheet.getLastColumn()).getDisplayValues()[0];
-    const finalRawNumCols = finalRawHeaders.length;
-    const finalNetColIdx = finalRawNumCols - 1; // 1-indexed column: last
+    // --- Update "Driver NET" column in Raw Data with total from NET sheet ---
+    // Re-read headers after possible column insertions
+    const finalRawHeaders  = rawSheet.getRange(1, 1, 1, rawSheet.getLastColumn()).getDisplayValues()[0];
+    const finalRawNetColIdx = finalRawHeaders.length - 1; // last col = Driver NET (1-indexed: +1)
 
+    let updatedDrivers = 0;
     for (const driverName in netDriverRowMap) {
         const netRowIdx = netDriverRowMap[driverName];
-        const totalNet = parseNumber(netData[netRowIdx][netTotalColIdx]) || 0;
+        const totalNet  = parseNumber(netData[netRowIdx][netDriverNetColIdx]) || 0;
         const rawRowIdx = rawDriverRowMap[driverName];
-        if (rawRowIdx === undefined) continue;
-
-        // Write new total NET value (1-indexed row, 1-indexed col)
-        rawSheet.getRange(rawRowIdx + 1, finalNetColIdx).setValue(totalNet);
+        if (rawRowIdx === undefined) {
+            Logger.log(`⚠️ Driver "${driverName}" found in NET sheet but not in Raw Data — skipped.`);
+            continue;
+        }
+        rawSheet.getRange(rawRowIdx + 1, finalRawNetColIdx + 1).setValue(totalNet);
+        updatedDrivers++;
     }
 
     SpreadsheetApp.flush();
-
     Logger.log(`✅ NET Data import complete!`);
     Logger.log(`   • ${insertedCols} new date column(s) added to Raw Data.`);
-    Logger.log(`   • Driver NET totals updated for ${Object.keys(netDriverRowMap).length} driver(s).`);
-    Logger.log(`   Running the balance report now...`);
-
-    // Re-run the full balance report with updated data
+    Logger.log(`   • Driver NET updated for ${updatedDrivers} driver(s).`);
+    Logger.log(`   Running balance report...`);
     runDailyBalance();
 }
 
@@ -198,29 +173,29 @@ function importTripsData() {
 
     const tripsSheet = ss.getSheetByName("Raw Data - Trips");
     if (!tripsSheet) {
-        Logger.log('❌ Sheet "Raw Data - Trips" not found. Please create it and paste your Trips data into it, then try again.');
+        Logger.log('❌ Sheet "Raw Data - Trips" not found. Create it, paste your Trips data, then try again.');
         return;
     }
-
     const rawSheet = ss.getSheetByName("Raw Data");
-    if (!rawSheet) {
-        Logger.log('❌ Sheet "Raw Data" not found.');
-        return;
-    }
+    if (!rawSheet) { Logger.log('❌ Sheet "Raw Data" not found.'); return; }
 
-    // --- Read the Trips import sheet ---
-    const tripsData = tripsSheet.getDataRange().getValues();
+    // --- Read the Trips sheet (same 3-col summary structure as Raw Data) ---
+    const tripsData    = tripsSheet.getDataRange().getValues();
     const tripsHeaders = tripsSheet.getRange(1, 1, 1, tripsSheet.getLastColumn()).getDisplayValues()[0];
     const numTripsCols = tripsHeaders.length;
-    // Trips sheet: last column = Total Trips
-    const tripsTotalColIdx = numTripsCols - 1;
 
-    // Build map: driver name → total trips
+    // The Trips sheet has the SAME trailing 3 summary columns as Raw Data:
+    //   n-3 = Total (sum trips)  |  n-2 = Count (trips)  |  n-1 = Driver NET (irrelevant)
+    // We want the COUNT column (n-2). Use header scanning to confirm; fall back to n-2.
+    const tripsCountColIdx = findColByLabel(tripsHeaders, ['count', 'trip', 'trips', 'total'], numTripsCols - 2);
+    Logger.log(`Trips sheet: using column index ${tripsCountColIdx} ("${tripsHeaders[tripsCountColIdx]}") as trip count source.`);
+
+    // Build map: driver name → total trips (from the Count column of the Trips sheet)
     const driverTripsMap = {};
     for (let r = 2; r < tripsData.length; r++) {
-        const name = (tripsData[r][0] || "").toString().trim();
-        if (name && name !== "Total") {
-            driverTripsMap[name] = parseNumber(tripsData[r][tripsTotalColIdx]) || 0;
+        const name = (tripsData[r][0] || '').toString().trim();
+        if (name && name !== 'Total') {
+            driverTripsMap[name] = parseNumber(tripsData[r][tripsCountColIdx]) || 0;
         }
     }
 
@@ -229,31 +204,44 @@ function importTripsData() {
         return;
     }
 
-    // --- Read the master Raw Data sheet ---
-    const rawData = rawSheet.getDataRange().getValues();
+    // Log what we found so the user can sanity-check
+    Logger.log(`Found trips for ${Object.keys(driverTripsMap).length} driver(s):`);
+    for (const d in driverTripsMap) Logger.log(`   ${d}: ${driverTripsMap[d]} trips`);
+
+    // --- Update the Count column in Raw Data ---
+    const rawData    = rawSheet.getDataRange().getValues();
     const rawNumCols = rawData[0].length;
-    const rawCountColIdx = rawNumCols - 2; // "Count" is 2nd-to-last (0-based)
+    const rawCountCol1Idx = rawNumCols - 2; // 0-based; Count is 2nd-to-last in Raw Data
 
     let updatedCount = 0;
     for (let r = 2; r < rawData.length; r++) {
-        const name = (rawData[r][0] || "").toString().trim();
-        if (!name || name === "Total") continue;
-
+        const name = (rawData[r][0] || '').toString().trim();
+        if (!name || name === 'Total') continue;
         if (driverTripsMap[name] !== undefined) {
-            // Write updated total trips to the Count column (1-indexed)
-            rawSheet.getRange(r + 1, rawCountColIdx + 1).setValue(driverTripsMap[name]);
+            rawSheet.getRange(r + 1, rawCountCol1Idx + 1).setValue(driverTripsMap[name]); // 1-indexed
             updatedCount++;
         }
     }
 
     SpreadsheetApp.flush();
-
-    Logger.log(`✅ Trips Data import complete!`);
-    Logger.log(`   • Trip counts updated for ${updatedCount} driver(s).`);
-    Logger.log(`   Running the balance report now...`);
-
-    // Re-run the full balance report with updated data
+    Logger.log(`✅ Trips Data import complete! Updated ${updatedCount} driver(s).`);
+    Logger.log(`   Running balance report...`);
     runDailyBalance();
+}
+
+/**
+ * Helper: scans a header row array for the first column whose label matches
+ * one of the given keywords (case-insensitive). Returns that column's 0-based
+ * index. Falls back to `defaultIdx` if nothing matches.
+ */
+function findColByLabel(headers, keywords, defaultIdx) {
+    for (let c = headers.length - 1; c >= 0; c--) {   // scan from right (summary cols first)
+        const h = (headers[c] || '').toString().toLowerCase().trim();
+        for (const kw of keywords) {
+            if (h.includes(kw)) return c;
+        }
+    }
+    return defaultIdx;
 }
 
 
