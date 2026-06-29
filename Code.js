@@ -330,9 +330,45 @@ function updateSummaryAndCharts(ss) {
         return map;
     }
 
+    // --- Helper to load No Show data (list format: Date, Driver, Cash) ---
+    function loadNoShowMap(sheetName) {
+        const sheet = ss.getSheetByName(sheetName);
+        const map = {}; // driverName -> { dateKey -> { cash: X, count: Y } }
+        if (!sheet) return map;
+        
+        const data = sheet.getDataRange().getValues();
+        if (data.length < 2) return map;
+        
+        const headers = data[0].map(h => (h || '').toString().toLowerCase().trim());
+        let dateCol = headers.indexOf('date');
+        let driverCol = headers.findIndex(h => h.includes('driver') || h.includes('name'));
+        let cashCol = headers.findIndex(h => h.includes('cash') || h.includes('amount'));
+
+        // Fallbacks if headers aren't perfectly named
+        if (dateCol === -1) dateCol = 0;
+        if (driverCol === -1) driverCol = 1;
+        if (cashCol === -1) cashCol = 2;
+
+        for (let r = 1; r < data.length; r++) {
+            const dateVal = parseDDMMYY(data[r][dateCol]);
+            const driver = (data[r][driverCol] || '').toString().trim();
+            const cash = parseNumber(data[r][cashCol]);
+
+            if (dateVal && driver && cash !== null) {
+                if (!map[driver]) map[driver] = {};
+                const dKey = dateVal.getTime();
+                if (!map[driver][dKey]) map[driver][dKey] = { cash: 0, count: 0 };
+                map[driver][dKey].cash += cash; // sum cash for deduction
+                map[driver][dKey].count += 1;   // count trips for display
+            }
+        }
+        return map;
+    }
+
     // Load auxiliary daily maps (driverName -> { timestamp -> value })
     const tripsDataMap = loadAuxMap("Raw Data - Trips");
     const netDataMap = loadAuxMap("Raw Data - NET");
+    const noShowMap = loadNoShowMap("No Show");
 
     // --- Read the entire Raw Data sheet ---
     const rawData = rawSheet.getDataRange().getValues();
@@ -376,7 +412,14 @@ function updateSummaryAndCharts(ss) {
         const driverTotal = parseNumber(rawData[r][totalColIdx]) || 0;
         const driverTrips = parseNumber(rawData[r][countColIdx]) || 0;
         const driverNet = parseNumber(rawData[r][netColIdx]) || 0;
-        const driverCash = roundToTwo(driverTotal - driverNet); // Cash = Total - NET
+        let driverCash = roundToTwo(driverTotal - driverNet); // Base Cash = Total - NET
+
+        // Deduct ALL No Show CASH for this driver from their monthly total cash
+        let totalNoShowCashForDriver = 0;
+        if (noShowMap[driverName]) {
+            Object.values(noShowMap[driverName]).forEach(val => totalNoShowCashForDriver += val.cash);
+        }
+        driverCash = roundToTwo(driverCash - totalNoShowCashForDriver);
 
         // Collect all active days (days with credit, trips, or cash)
         let activeDays = [];
@@ -389,9 +432,10 @@ function updateSummaryAndCharts(ss) {
             
             const exactTrips = hasExactTrips ? tripsDataMap[driverName][dateKey] : 0;
             const exactNet = hasExactNet ? netDataMap[driverName][dateKey] : 0;
+            const hasNoShow = noShowMap[driverName] && noShowMap[driverName][dateKey] !== undefined;
 
-            // Include day if there's credit, trips, or non-zero net (implying cash)
-            if (credit > 0 || exactTrips > 0 || exactNet !== 0) {
+            // Include day if there's credit, trips, non-zero net (implying cash), or a No Show adjustment
+            if (credit > 0 || exactTrips > 0 || exactNet !== 0 || hasNoShow) {
                 activeDays.push({ date: dc.date, dateKey: dateKey, credit: credit });
             }
         });
@@ -413,7 +457,12 @@ function updateSummaryAndCharts(ss) {
             // Cash
             if (netDataMap[driverName] && netDataMap[driverName][day.dateKey] !== undefined) {
                 const dailyNet = netDataMap[driverName][day.dateKey];
-                sumExactCash += (day.credit - dailyNet);
+                let exactDailyCash = day.credit - dailyNet;
+                // Deduct No Show CASH if any
+                if (noShowMap[driverName] && noShowMap[driverName][day.dateKey]) {
+                    exactDailyCash -= noShowMap[driverName][day.dateKey].cash;
+                }
+                sumExactCash += exactDailyCash;
             } else {
                 missingCashDays.push(day);
             }
@@ -441,10 +490,18 @@ function updateSummaryAndCharts(ss) {
             if (netDataMap[driverName] && netDataMap[driverName][day.dateKey] !== undefined) {
                 const dailyNet = netDataMap[driverName][day.dateKey];
                 dailyCash = day.credit - dailyNet; // Exact match
+                if (noShowMap[driverName] && noShowMap[driverName][day.dateKey]) {
+                    dailyCash -= noShowMap[driverName][day.dateKey].cash;
+                }
             } else if (missingCashDays.length === 1) {
                 dailyCash = remainingCash; // 1 missing day -> gets the remainder exactly
             } else {
                 dailyCash = 0; // >1 missing day -> leave blank/0 until user uploads NET data
+            }
+
+            let dailyNoShowCount = 0;
+            if (noShowMap[driverName] && noShowMap[driverName][day.dateKey]) {
+                dailyNoShowCount = noShowMap[driverName][day.dateKey].count;
             }
 
             outputRows.push([
@@ -454,7 +511,8 @@ function updateSummaryAndCharts(ss) {
                 dailyCash,
                 dailyTrips,
                 driverTotal,
-                driverCash
+                driverCash,
+                dailyNoShowCount
             ]);
         });
     }
@@ -472,7 +530,7 @@ function updateSummaryAndCharts(ss) {
     });
 
     // --- Write Summary headers ---
-    const headers = ["Date", "Driver", "Credit", "Trips", "Cash", "Balance"];
+    const headers = ["Date", "Driver", "Credit", "Trips", "Cash", "No Show", "Balance"];
     summarySheet.getRange(2, 1, 1, headers.length).setValues([headers]);
 
     // --- Read fare settings for balance calculation ---
@@ -530,15 +588,17 @@ function updateSummaryAndCharts(ss) {
         const dailyCredit = Number(row[2]) || 0;
         const dailyCash = Number(row[3]) || 0;
         const trips = Number(row[4]) || 0;
+        const dailyNoShow = Number(row[7]) || 0;
         const dailyBalance = Number(roundToTwo((dailyCredit * fare) - dailyCash)) || 0;
 
-        // Summary rows: Date, Driver, Credit, Trips, Cash, Balance
+        // Summary rows: Date, Driver, Credit, Trips, Cash, No Show, Balance
         rowsToWrite.push([
             displayDate,
             row[1],
             dailyCredit,
             trips,
             Number(roundToTwo(dailyCash)) || 0,
+            dailyNoShow,
             dailyBalance
         ]);
     });
@@ -550,11 +610,11 @@ function updateSummaryAndCharts(ss) {
     // --- Clear old data and write new ---
     const maxRows = summarySheet.getMaxRows();
     if (maxRows > 2) {
-        summarySheet.getRange(3, 1, maxRows - 2, 6).clearContent();
+        summarySheet.getRange(3, 1, maxRows - 2, 7).clearContent();
         try { summarySheet.getRange(3, 1, maxRows - 2, 1).breakApart(); } catch (e) { }
     }
 
-    const dataRange = summarySheet.getRange(3, 1, rowsToWrite.length, 6);
+    const dataRange = summarySheet.getRange(3, 1, rowsToWrite.length, 7);
     dataRange.setValues(rowsToWrite);
     dataRange.setBorder(false, false, false, false, false, false);
     dataRange.setBorder(true, true, true, true, true, true, "black", SpreadsheetApp.BorderStyle.SOLID);
@@ -562,7 +622,7 @@ function updateSummaryAndCharts(ss) {
 
     // --- Apply day block borders and merge date cells ---
     dayBlocks.forEach(block => {
-        summarySheet.getRange(block.row, 1, block.count, 6)
+        summarySheet.getRange(block.row, 1, block.count, 7)
             .setBorder(true, null, true, null, null, null, "black", SpreadsheetApp.BorderStyle.SOLID_THICK);
         if (block.count > 1) {
             summarySheet.getRange(block.row, 1, block.count, 1).mergeVertically();
@@ -579,7 +639,18 @@ function updateSummaryAndCharts(ss) {
         const driverTotal = parseNumber(rawData[r][totalColIdx]) || 0;
         const driverTrips = parseNumber(rawData[r][countColIdx]) || 0;
         const driverNet = parseNumber(rawData[r][netColIdx]) || 0;
-        const driverCash = roundToTwo(driverTotal - driverNet);
+        let driverCash = roundToTwo(driverTotal - driverNet);
+
+        // Deduct ALL No Show CASH for this driver from their monthly total cash
+        let totalNoShowCashForDriver = 0;
+        let totalNoShowCountForDriver = 0;
+        if (noShowMap[driverName]) {
+            Object.values(noShowMap[driverName]).forEach(val => {
+                totalNoShowCashForDriver += val.cash;
+                totalNoShowCountForDriver += val.count;
+            });
+        }
+        driverCash = roundToTwo(driverCash - totalNoShowCashForDriver);
 
         if (driverTotal <= 0) continue;
 
@@ -598,6 +669,7 @@ function updateSummaryAndCharts(ss) {
             totalCredit: roundToTwo(driverTotal),
             totalTrips: driverTrips,
             totalCash: driverCash,
+            totalNoShow: totalNoShowCountForDriver,
             driverNet: roundToTwo(driverNet),
             workingDays: workingDays,
             avgPerDay: workingDays > 0 ? roundToTwo(driverTotal / workingDays) : 0,
@@ -610,15 +682,15 @@ function updateSummaryAndCharts(ss) {
     // =================================================================
     // (settingsSheet and existingFares already read above for balance calc)
 
-    // --- Aggregated stats table (column H, one gap after the 6-col main table) ---
-    const aggHeader = ["Driver", "Total Credit", "Total Trips", "Total Cash", "Driver NET", "Avg Per Day"];
+    // --- Aggregated stats table (column I, one gap after the 7-col main table) ---
+    const aggHeader = ["Driver", "Total Credit", "Total Trips", "Total Cash", "No Show", "Driver NET", "Avg Per Day"];
     const aggRows = [aggHeader];
 
     const newSettingsRows = [["Driver", "Fare %"]];
 
     for (let driver in driverStats) {
         const s = driverStats[driver];
-        aggRows.push([driver, s.totalCredit, s.totalTrips, s.totalCash, s.driverNet, s.avgPerDay]);
+        aggRows.push([driver, s.totalCredit, s.totalTrips, s.totalCash, s.totalNoShow, s.driverNet, s.avgPerDay]);
 
         let fare = existingFares[driver];
         if (fare === undefined || fare === null || fare === "") {
@@ -640,9 +712,9 @@ function updateSummaryAndCharts(ss) {
     settingsSheet.autoResizeColumns(1, 2);
 
     // =================================================================
-    // --- Write aggregated stats to Summary (column H = one gap after 6-col main table) ---
+    // --- Write aggregated stats to Summary (column I = one gap after 7-col main table) ---
     // =================================================================
-    const startRow = 3, startCol = 8; // Column H (A-F = main table, G = gap)
+    const startRow = 3, startCol = 9; // Column I (A-G = main table, H = gap)
     // Clear old aggregate area
     try { summarySheet.getRange(startRow, startCol, 50, 10).clearContent(); } catch (e) { }
 
@@ -655,21 +727,22 @@ function updateSummaryAndCharts(ss) {
         if (!dateVal) return;
         const dateKey = dateVal.getTime();
         if (!dailyStats[dateKey]) {
-            dailyStats[dateKey] = { date: dateVal, credit: 0, trips: 0, cash: 0 };
+            dailyStats[dateKey] = { date: dateVal, credit: 0, trips: 0, cash: 0, noShow: 0 };
         }
         dailyStats[dateKey].credit += (r[2] || 0);
         dailyStats[dateKey].trips += (r[4] || 0);
         dailyStats[dateKey].cash += (r[3] || 0);
+        dailyStats[dateKey].noShow += (r[7] || 0); // r[7] is No Show
     });
 
     const dailyRows = Object.values(dailyStats)
         .sort((a, b) => a.date - b.date)
-        .map(d => [d.date, roundToTwo(d.credit), d.trips, roundToTwo(d.cash)]);
+        .map(d => [d.date, roundToTwo(d.credit), d.trips, roundToTwo(d.cash), d.noShow]);
 
-    const dailyHeader = ["Date", "Total Credit", "Trips", "Cash"];
+    const dailyHeader = ["Date", "Total Credit", "Trips", "Cash", "No Show"];
     const dailyStartCol = startCol + aggRows[0].length + 1; // One gap after aggregate table
 
-    summarySheet.getRange(2, dailyStartCol, 100, 6).clearContent();
+    summarySheet.getRange(2, dailyStartCol, 100, 7).clearContent();
     summarySheet.getRange(2, dailyStartCol, 1, dailyHeader.length).setValues([dailyHeader]).setFontWeight("bold");
 
     if (dailyRows.length > 0) {
@@ -683,7 +756,7 @@ function updateSummaryAndCharts(ss) {
 
     // Chart 1: Daily Total Credit Trend (line) — positioned NEXT TO the daily credit table
     if (dailyRows.length > 0) {
-        const dailyChartCol = dailyStartCol + 6; // Shifted right to accommodate the 4-column daily table
+        const dailyChartCol = dailyStartCol + 6; // Shifted right to accommodate the 5-column daily table
         let dailyChart = summarySheet.newChart()
             .setChartType(Charts.ChartType.LINE)
             .addRange(summarySheet.getRange(3, dailyStartCol, dailyRows.length, 1))
@@ -705,10 +778,10 @@ function updateSummaryAndCharts(ss) {
     const lastRow = startRow + aggRows.length - 1;
     const dataStart = startRow + 1;
     // Build column letters from startCol for chart ranges
-    const colF = String.fromCharCode(64 + startCol);         // F (Driver)
-    const colG = String.fromCharCode(64 + startCol + 1);     // G (Total Credit)
-    const colH = String.fromCharCode(64 + startCol + 2);     // H (Total Trips)
-    const colK = String.fromCharCode(64 + startCol + 5);     // K (Avg Per Day)
+    const colF = String.fromCharCode(64 + startCol);         // I (Driver)
+    const colG = String.fromCharCode(64 + startCol + 1);     // J (Total Credit)
+    const colH = String.fromCharCode(64 + startCol + 2);     // K (Total Trips)
+    const colK = String.fromCharCode(64 + startCol + 6);     // O (Avg Per Day) - 6 columns offset
 
     // Charts 2-4: Bar charts starting at row 3, below the aggregate stats table
     const barChartStartRow = startRow + aggRows.length + 2;
@@ -721,6 +794,7 @@ function updateSummaryAndCharts(ss) {
         .setOption("titleTextStyle", { bold: true, fontSize: 24 })
         .setOption("colors", ["#1f77b4"]).setOption("legend", { position: "none" })
         .setOption("vAxis", { title: "Credit" })
+        .setOption("width", 720)
         .setPosition(3, startCol, 0, 0).build();
     summarySheet.insertChart(chart1);
 
@@ -732,6 +806,7 @@ function updateSummaryAndCharts(ss) {
         .setOption("titleTextStyle", { bold: true, fontSize: 24 })
         .setOption("colors", ["#8c564b"]).setOption("legend", { position: "none" })
         .setOption("vAxis", { title: "Trips" })
+        .setOption("width", 720)
         .setPosition(23, startCol, 0, 0).build();
     summarySheet.insertChart(chart2);
 
@@ -743,6 +818,7 @@ function updateSummaryAndCharts(ss) {
         .setOption("titleTextStyle", { bold: true, fontSize: 24 })
         .setOption("colors", ["#d62728"]).setOption("legend", { position: "none" })
         .setOption("vAxis", { title: "Daily Credit" })
+        .setOption("width", 720)
         .setPosition(43, startCol, 0, 0).build();
     summarySheet.insertChart(chart3);
 }
@@ -1205,8 +1281,14 @@ function generateBonusReport(ss) {
  */
 function parseDDMMYY(value) {
     if (!value) return null;
-    // Always parse as string to avoid Google Sheets auto-date-conversion issues
+    
+    // Handle native Google Sheets Date objects directly
+    if (value instanceof Date) {
+        return new Date(value.getFullYear(), value.getMonth(), value.getDate());
+    }
+
     const str = String(value).trim();
+    
     // Handle DD-MM-YY format (e.g., "01-06-26")
     const dashParts = str.split("-");
     if (dashParts.length === 3) {
@@ -1218,7 +1300,8 @@ function parseDDMMYY(value) {
         const d = new Date(year, month, day);
         return isNaN(d.getTime()) ? null : d;
     }
-    // Handle DD/MM/YYYY format (e.g., "01/06/2026") as fallback
+    
+    // Handle DD/MM/YYYY format (e.g., "01/06/2026")
     const slashParts = str.split("/");
     if (slashParts.length === 3) {
         const day = parseInt(slashParts[0], 10);
@@ -1229,6 +1312,13 @@ function parseDDMMYY(value) {
         const d = new Date(year, month, day);
         return isNaN(d.getTime()) ? null : d;
     }
+    
+    // Final fallback: try standard JS Date parser for strings like "Thursday, June 25, 2026"
+    const fallback = new Date(str);
+    if (!isNaN(fallback.getTime())) {
+        return new Date(fallback.getFullYear(), fallback.getMonth(), fallback.getDate());
+    }
+
     return null;
 }
 
