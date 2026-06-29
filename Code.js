@@ -781,10 +781,8 @@ function updateSummaryAndCharts(ss) {
     const colF = String.fromCharCode(64 + startCol);         // I (Driver)
     const colG = String.fromCharCode(64 + startCol + 1);     // J (Total Credit)
     const colH = String.fromCharCode(64 + startCol + 2);     // K (Total Trips)
+    const colNoShow = String.fromCharCode(64 + startCol + 4); // M (No Show)
     const colK = String.fromCharCode(64 + startCol + 6);     // O (Avg Per Day) - 6 columns offset
-
-    // Charts 2-4: Bar charts starting at row 3, below the aggregate stats table
-    const barChartStartRow = startRow + aggRows.length + 2;
 
     // Chart 2: Total Credit by Driver (bar)
     let chart1 = summarySheet.newChart().setChartType(Charts.ChartType.COLUMN)
@@ -795,6 +793,7 @@ function updateSummaryAndCharts(ss) {
         .setOption("colors", ["#1f77b4"]).setOption("legend", { position: "none" })
         .setOption("vAxis", { title: "Credit" })
         .setOption("width", 720)
+        .setOption("height", 450)
         .setPosition(3, startCol, 0, 0).build();
     summarySheet.insertChart(chart1);
 
@@ -807,10 +806,24 @@ function updateSummaryAndCharts(ss) {
         .setOption("colors", ["#8c564b"]).setOption("legend", { position: "none" })
         .setOption("vAxis", { title: "Trips" })
         .setOption("width", 720)
-        .setPosition(23, startCol, 0, 0).build();
+        .setOption("height", 450)
+        .setPosition(27, startCol, 0, 0).build();
     summarySheet.insertChart(chart2);
 
-    // Chart 4: Average Per Day by Driver (bar)
+    // Chart 4: No Show by Driver (bar)
+    let chartNoShow = summarySheet.newChart().setChartType(Charts.ChartType.COLUMN)
+        .addRange(summarySheet.getRange(colF + dataStart + ":" + colF + lastRow))
+        .addRange(summarySheet.getRange(colNoShow + dataStart + ":" + colNoShow + lastRow))
+        .setOption("title", "No Show Trips by Driver")
+        .setOption("titleTextStyle", { bold: true, fontSize: 24 })
+        .setOption("colors", ["#2ca02c"]).setOption("legend", { position: "none" })
+        .setOption("vAxis", { title: "No Show Trips" })
+        .setOption("width", 720)
+        .setOption("height", 450)
+        .setPosition(51, startCol, 0, 0).build();
+    summarySheet.insertChart(chartNoShow);
+
+    // Chart 5: Average Per Day by Driver (bar)
     let chart3 = summarySheet.newChart().setChartType(Charts.ChartType.COLUMN)
         .addRange(summarySheet.getRange(colF + dataStart + ":" + colF + lastRow))
         .addRange(summarySheet.getRange(colK + dataStart + ":" + colK + lastRow))
@@ -819,7 +832,8 @@ function updateSummaryAndCharts(ss) {
         .setOption("colors", ["#d62728"]).setOption("legend", { position: "none" })
         .setOption("vAxis", { title: "Daily Credit" })
         .setOption("width", 720)
-        .setPosition(43, startCol, 0, 0).build();
+        .setOption("height", 450)
+        .setPosition(75, startCol, 0, 0).build();
     summarySheet.insertChart(chart3);
 }
 
