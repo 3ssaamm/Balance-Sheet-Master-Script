@@ -330,45 +330,11 @@ function updateSummaryAndCharts(ss) {
         return map;
     }
 
-    // --- Helper to load No Show data (list format: Date, Driver, Cash) ---
-    function loadNoShowMap(sheetName) {
-        const sheet = ss.getSheetByName(sheetName);
-        const map = {}; // driverName -> { dateKey -> { cash: X, count: Y } }
-        if (!sheet) return map;
-        
-        const data = sheet.getDataRange().getValues();
-        if (data.length < 2) return map;
-        
-        const headers = data[0].map(h => (h || '').toString().toLowerCase().trim());
-        let dateCol = headers.indexOf('date');
-        let driverCol = headers.findIndex(h => h.includes('driver') || h.includes('name'));
-        let cashCol = headers.findIndex(h => h.includes('cash') || h.includes('amount'));
-
-        // Fallbacks if headers aren't perfectly named
-        if (dateCol === -1) dateCol = 0;
-        if (driverCol === -1) driverCol = 1;
-        if (cashCol === -1) cashCol = 2;
-
-        for (let r = 1; r < data.length; r++) {
-            const dateVal = parseDDMMYY(data[r][dateCol]);
-            const driver = (data[r][driverCol] || '').toString().trim();
-            const cash = parseNumber(data[r][cashCol]);
-
-            if (dateVal && driver && cash !== null) {
-                if (!map[driver]) map[driver] = {};
-                const dKey = dateVal.getTime();
-                if (!map[driver][dKey]) map[driver][dKey] = { cash: 0, count: 0 };
-                map[driver][dKey].cash += cash; // sum cash for deduction
-                map[driver][dKey].count += 1;   // count trips for display
-            }
-        }
-        return map;
-    }
 
     // Load auxiliary daily maps (driverName -> { timestamp -> value })
     const tripsDataMap = loadAuxMap("Raw Data - Trips");
     const netDataMap = loadAuxMap("Raw Data - NET");
-    const noShowMap = loadNoShowMap("No Show");
+    const noShowMap = loadNoShowMap(ss, "No Show");
 
     // --- Read the entire Raw Data sheet ---
     const rawData = rawSheet.getDataRange().getValues();
@@ -409,23 +375,23 @@ function updateSummaryAndCharts(ss) {
         const driverName = rawData[r][0];
         if (!driverName || driverName.toString().trim() === "" || driverName === "Total") continue;
 
-        const driverTotal = parseNumber(rawData[r][totalColIdx]) || 0;
-        const driverTrips = parseNumber(rawData[r][countColIdx]) || 0;
-        const driverNet = parseNumber(rawData[r][netColIdx]) || 0;
-        let driverCash = roundToTwo(driverTotal - driverNet); // Base Cash = Total - NET
-
-        // Deduct ALL No Show CASH for this driver from their monthly total cash
+        const rawDriverTotal = parseNumber(rawData[r][totalColIdx]) || 0;
+        
         let totalNoShowCashForDriver = 0;
         if (noShowMap[driverName]) {
             Object.values(noShowMap[driverName]).forEach(val => totalNoShowCashForDriver += val.cash);
         }
-        driverCash = roundToTwo(driverCash - totalNoShowCashForDriver);
+        
+        const driverTotal = roundToTwo(rawDriverTotal - totalNoShowCashForDriver);
+        const driverTrips = parseNumber(rawData[r][countColIdx]) || 0;
+        const driverNet = parseNumber(rawData[r][netColIdx]) || 0;
+        let driverCash = roundToTwo(driverTotal - driverNet); // Base Cash = Total - NET
 
         // Collect all active days (days with credit, trips, or cash)
         let activeDays = [];
         dateColumns.forEach(dc => {
             const dateKey = dc.date.getTime();
-            const credit = parseNumber(rawData[r][dc.colIdx]) || 0;
+            let credit = parseNumber(rawData[r][dc.colIdx]) || 0;
             
             const hasExactTrips = tripsDataMap[driverName] && tripsDataMap[driverName][dateKey] !== undefined;
             const hasExactNet = netDataMap[driverName] && netDataMap[driverName][dateKey] !== undefined;
@@ -433,6 +399,10 @@ function updateSummaryAndCharts(ss) {
             const exactTrips = hasExactTrips ? tripsDataMap[driverName][dateKey] : 0;
             const exactNet = hasExactNet ? netDataMap[driverName][dateKey] : 0;
             const hasNoShow = noShowMap[driverName] && noShowMap[driverName][dateKey] !== undefined;
+
+            if (hasNoShow) {
+                credit = roundToTwo(credit - noShowMap[driverName][dateKey].cash);
+            }
 
             // Include day if there's credit, trips, non-zero net (implying cash), or a No Show adjustment
             if (credit > 0 || exactTrips > 0 || exactNet !== 0 || hasNoShow) {
@@ -457,11 +427,7 @@ function updateSummaryAndCharts(ss) {
             // Cash
             if (netDataMap[driverName] && netDataMap[driverName][day.dateKey] !== undefined) {
                 const dailyNet = netDataMap[driverName][day.dateKey];
-                let exactDailyCash = day.credit - dailyNet;
-                // Deduct No Show CASH if any
-                if (noShowMap[driverName] && noShowMap[driverName][day.dateKey]) {
-                    exactDailyCash -= noShowMap[driverName][day.dateKey].cash;
-                }
+                let exactDailyCash = roundToTwo(day.credit - dailyNet);
                 sumExactCash += exactDailyCash;
             } else {
                 missingCashDays.push(day);
@@ -489,10 +455,7 @@ function updateSummaryAndCharts(ss) {
             // CASH LOGIC
             if (netDataMap[driverName] && netDataMap[driverName][day.dateKey] !== undefined) {
                 const dailyNet = netDataMap[driverName][day.dateKey];
-                dailyCash = day.credit - dailyNet; // Exact match
-                if (noShowMap[driverName] && noShowMap[driverName][day.dateKey]) {
-                    dailyCash -= noShowMap[driverName][day.dateKey].cash;
-                }
+                dailyCash = roundToTwo(day.credit - dailyNet); // Exact match
             } else if (missingCashDays.length === 1) {
                 dailyCash = remainingCash; // 1 missing day -> gets the remainder exactly
             } else {
@@ -852,22 +815,7 @@ function generateWeeklySummary(ss) {
     weeklySheet.getCharts().forEach(c => weeklySheet.removeChart(c));
     weeklySheet.getRange("A1").setValue("WEEKLY SUMMARY").setFontWeight("bold").setFontSize(14);
 
-    // --- Read Raw Data to get per-driver monthly cash ---
-    const rawSheet = ss.getSheetByName("Raw Data");
-    let driverCashMap = {}; // driver -> total monthly cash
-    if (rawSheet) {
-        const rawData = rawSheet.getDataRange().getValues();
-        const numCols = rawData[0].length;
-        const totalColIdx = numCols - 3;
-        const netColIdx = numCols - 1;
-        for (let r = 2; r < rawData.length; r++) {
-            const name = rawData[r][0];
-            if (!name || name === "Total") continue;
-            const total = parseNumber(rawData[r][totalColIdx]) || 0;
-            const net = parseNumber(rawData[r][netColIdx]) || 0;
-            driverCashMap[name] = roundToTwo(total - net);
-        }
-    }
+
 
     // --- Read Fare % from Settings sheet ---
     let driverFareMap = {}; // driver -> fare as decimal (e.g. 0.9)
@@ -893,7 +841,7 @@ function generateWeeklySummary(ss) {
     const lastRowCurrent = summarySheet.getLastRow();
     let allRows = [];
     if (lastRowCurrent >= 3) {
-        const rawRows = summarySheet.getRange("A3:D" + lastRowCurrent).getValues();
+        const rawRows = summarySheet.getRange("A3:E" + lastRowCurrent).getValues();
         let lastSeenDate = null;
         allRows = rawRows.map(r => {
             if (r[0] && r[0] !== "") lastSeenDate = r[0];
@@ -930,7 +878,7 @@ function generateWeeklySummary(ss) {
                 const prevSummarySheet = prevSpreadsheet.getSheetByName("Summary");
                 if (prevSummarySheet && prevSummarySheet.getLastRow() >= 3) {
                     const oldLastCol = prevSummarySheet.getLastColumn();
-                    const readCols = oldLastCol >= 4 ? 4 : oldLastCol;
+                    const readCols = oldLastCol >= 5 ? 5 : oldLastCol;
                     const prevAllData = prevSummarySheet.getRange(3, 1, prevSummarySheet.getLastRow() - 2, readCols).getValues();
 
                     let prevLastSeen = null;
@@ -950,7 +898,7 @@ function generateWeeklySummary(ss) {
 
     // --- Process Data ---
     const weeklyData = {};
-    const dateIdx = 0, driverIdx = 1, creditIdx = 2, tripsIdx = 3;
+    const dateIdx = 0, driverIdx = 1, creditIdx = 2, tripsIdx = 3, cashIdx = 4;
 
     allRows.forEach((row) => {
         if (!Array.isArray(row) || !row[dateIdx] || !row[driverIdx]) return;
@@ -960,6 +908,7 @@ function generateWeeklySummary(ss) {
         const driver = row[driverIdx];
         const credit = Number(row[creditIdx]) || 0;
         const trips = Number(row[tripsIdx]) || 0;
+        const cash = Number(row[cashIdx]) || 0;
 
         const weekStart = getMonday(date);
         const weekEnd = new Date(weekStart);
@@ -968,11 +917,12 @@ function generateWeeklySummary(ss) {
 
         if (!weeklyData[weekKey]) weeklyData[weekKey] = {};
         if (!weeklyData[weekKey][driver]) {
-            weeklyData[weekKey][driver] = { credit: 0, trips: 0 };
+            weeklyData[weekKey][driver] = { credit: 0, trips: 0, cash: 0 };
         }
 
         weeklyData[weekKey][driver].credit += credit;
         weeklyData[weekKey][driver].trips += trips;
+        weeklyData[weekKey][driver].cash += cash;
     });
 
     // --- Write Output ---
@@ -1017,7 +967,7 @@ function generateWeeklySummary(ss) {
 
             drivers.forEach(d => {
                 const info = weeklyData[weekKey][d];
-                const cash = driverCashMap[d] || 0;
+                const cash = info.cash;
                 const fare = driverFareMap[d] || 0.9; // default 90%
                 const balance = roundToTwo((info.credit * fare) - cash);
                 tableData.push([d, info.credit, info.trips, cash, balance]);
@@ -1288,6 +1238,43 @@ function generateBonusReport(ss) {
 // =================================================================
 // SHARED HELPERS
 // =================================================================
+
+/**
+ * Loads No Show data (Date, Driver, Cash) from the No Show sheet.
+ * Returns: { driverName -> { dateKey -> { cash: X, count: Y } } }
+ */
+function loadNoShowMap(ss, sheetName) {
+    const sheet = ss.getSheetByName(sheetName);
+    const map = {};
+    if (!sheet) return map;
+    
+    const data = sheet.getDataRange().getValues();
+    if (data.length < 2) return map;
+    
+    const headers = data[0].map(h => (h || '').toString().toLowerCase().trim());
+    let dateCol = headers.indexOf('date');
+    let driverCol = headers.findIndex(h => h.includes('driver') || h.includes('name'));
+    let cashCol = headers.findIndex(h => h.includes('cash') || h.includes('amount'));
+
+    if (dateCol === -1) dateCol = 0;
+    if (driverCol === -1) driverCol = 1;
+    if (cashCol === -1) cashCol = 2;
+
+    for (let r = 1; r < data.length; r++) {
+        const dateVal = parseDDMMYY(data[r][dateCol]);
+        const driver = (data[r][driverCol] || '').toString().trim();
+        const cash = parseNumber(data[r][cashCol]);
+
+        if (dateVal && driver && cash !== null) {
+            if (!map[driver]) map[driver] = {};
+            const dKey = dateVal.getTime();
+            if (!map[driver][dKey]) map[driver][dKey] = { cash: 0, count: 0 };
+            map[driver][dKey].cash += cash; // sum cash for deduction
+            map[driver][dKey].count += 1;   // count trips for display
+        }
+    }
+    return map;
+}
 
 /**
  * Parses DD-MM-YY date format from Raw Data headers.
