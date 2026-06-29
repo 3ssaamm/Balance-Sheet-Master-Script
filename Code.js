@@ -289,6 +289,9 @@ function runDailyBalance() {
 
     // 4. Generate the final Bonus report.
     generateBonusReport(ss);
+
+    // 5. Generate Angel's specific progressive report.
+    generateAngelReport(ss);
 }
 
 
@@ -1322,6 +1325,309 @@ function parseDDMMYY(value) {
 
     return null;
 }
+
+// =================================================================
+// ANGEL'S PROGRESSIVE REPORT
+// =================================================================
+function generateAngelReport(ss) {
+  if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
+  const summarySheet = ss.getSheetByName("Summary");
+  const targetDriver = "Angel";
+  const reportSheetName = "Angel Summary";
+  
+  if (!summarySheet) return;
+
+  // 1. --- Detect Month and Year ---
+  const ssName = ss.getName();
+  const monthMatch = ssName.match(/^(January|February|March|April|May|June|July|August|September|October|November|December)/i);
+  const currentMonthName = monthMatch ? monthMatch[1] : null;
+
+  if (!currentMonthName) return;
+
+  const lastRow = summarySheet.getLastRow();
+  let currentYear = new Date().getFullYear();
+  if (lastRow >= 3) {
+    const firstDateVal = summarySheet.getRange("A3").getValue();
+    if (firstDateVal instanceof Date) {
+      currentYear = firstDateVal.getFullYear();
+    }
+  }
+
+  const firstOfMonth = new Date(Date.parse(`${currentMonthName} 1, ${currentYear}`));
+  if (isNaN(firstOfMonth.getTime())) return;
+  const endDate = new Date(currentYear, firstOfMonth.getMonth() + 1, 0); 
+  const reportStartDate = getMonday(firstOfMonth);
+
+  // 2. --- Initialize Data Map ---
+  let angelDataMap = {}; 
+
+  function mapRowToAngelData(row) {
+    if (row[1] === targetDriver && row[0] instanceof Date) {
+      let dateKey = row[0].toDateString(); 
+      angelDataMap[dateKey] = {
+        credit: Number(row[2]) || 0,
+        trips: Number(row[3]) || 0,
+        cash: Number(row[4]) || 0,
+        noShow: Number(row[5]) || 0
+      };
+    }
+  }
+
+  // 3. --- Fetch Previous Month Data (Crossover Week) ---
+  if (reportStartDate < firstOfMonth) {
+    try {
+      const prevMonthDate = new Date(firstOfMonth);
+      prevMonthDate.setMonth(firstOfMonth.getMonth() - 1);
+      const prevMonthName = prevMonthDate.toLocaleString('en-US', { month: 'long' });
+      const prevFileName = `${prevMonthName} - Drivers Daily Balance`;
+
+      const files = DriveApp.getFilesByName(prevFileName);
+      if (files.hasNext()) {
+        const prevFile = files.next();
+        const prevSpreadsheet = SpreadsheetApp.openById(prevFile.getId());
+        const prevSummarySheet = prevSpreadsheet.getSheetByName("Summary");
+
+        if (prevSummarySheet && prevSummarySheet.getLastRow() >= 3) {
+          const prevData = prevSummarySheet.getRange(3, 1, prevSummarySheet.getLastRow() - 2, 11).getValues();
+          
+          let prevLastSeenDate = null;
+          prevData.forEach(row => {
+            if (row[0] && row[0] !== "") prevLastSeenDate = row[0];
+            else row[0] = prevLastSeenDate;
+
+            const d = parseDate(row[0]);
+            if (d && d >= reportStartDate) {
+               row[0] = d; 
+               mapRowToAngelData(row);
+            }
+          });
+        }
+      }
+    } catch (e) { }
+  }
+
+  // 4. --- Fetch Current Month Data ---
+  if (lastRow >= 3) {
+    const currentData = summarySheet.getRange(3, 1, lastRow - 2, 11).getValues();
+    
+    let currentLastSeenDate = null;
+    currentData.forEach(row => {
+        if (row[0] && row[0] !== "") currentLastSeenDate = row[0];
+        else row[0] = currentLastSeenDate;
+
+        if (row[0]) { 
+            const d = parseDate(row[0]);
+            if(d) {
+                row[0] = d;
+                mapRowToAngelData(row);
+            }
+        }
+    });
+  }
+
+  // 5. --- Build the Report Rows ---
+  let reportRows = [];
+  let chartDataRows =[]; 
+  let weekCounter = 1;
+  
+  let weeklyCredit = 0, weeklyNoShow = 0, weeklyTrips = 0, weeklyCash = 0;
+  let weeklyGrossBal = 0, weeklyFee = 0, weeklyNet = 0;
+  
+  let grandCredit = 0, grandNoShow = 0, grandTrips = 0, grandCash = 0;
+  let grandGrossBal = 0, grandFee = 0, grandNet = 0;
+
+  let weekTotalRows =[];
+
+  const threshold = 1000;
+  const baseRate = 0.80;
+  const topRate = 0.90;
+  const transferFeeRate = 0.03;
+
+  for (let d = new Date(reportStartDate); d <= endDate; d.setDate(d.getDate() + 1)) {
+    const dateKey = d.toDateString();
+    const dayData = angelDataMap[dateKey] || { credit: 0, cash: 0, noShow: 0, trips: 0 };
+
+    const todayCredit = dayData.credit;
+    const todayCash = dayData.cash;
+    let todayGrossPayout = 0;
+    let appliedRate = 0;
+
+    if (todayCredit > 0) {
+      if (weeklyCredit >= threshold) {
+        todayGrossPayout = todayCredit * topRate;
+      } 
+      else if ((weeklyCredit + todayCredit) <= threshold) {
+        todayGrossPayout = todayCredit * baseRate;
+      } 
+      else {
+        const creditAtBaseRate = threshold - weeklyCredit; 
+        const creditAtTopRate = todayCredit - creditAtBaseRate; 
+        todayGrossPayout = (creditAtBaseRate * baseRate) + (creditAtTopRate * topRate);
+      }
+      appliedRate = todayGrossPayout / todayCredit;
+    }
+
+    weeklyCredit += todayCredit;
+    const grossBalance = todayGrossPayout - todayCash;
+    const fee = grossBalance > 0 ? (grossBalance * transferFeeRate) : 0;
+    const netPayout = grossBalance - fee;
+    
+    reportRows.push([
+      new Date(d),           
+      todayCredit,
+      weeklyCredit, 
+      appliedRate,
+      dayData.noShow,
+      dayData.trips,
+      todayCash,
+      grossBalance,
+      fee,
+      netPayout 
+    ]);
+
+    chartDataRows.push([new Date(d), todayCredit]);
+
+    weeklyNoShow += dayData.noShow;
+    weeklyTrips += dayData.trips;
+    weeklyCash += todayCash;
+    weeklyGrossBal += grossBalance; 
+    weeklyFee += fee;
+    weeklyNet += netPayout;
+
+    const isSunday = d.getDay() === 0;
+    const isLastDayOfReport = d.toDateString() === endDate.toDateString();
+
+    if (isSunday || isLastDayOfReport) {
+      grandCredit += weeklyCredit;
+      grandNoShow += weeklyNoShow;
+      grandTrips += weeklyTrips;
+      grandCash += weeklyCash;
+      grandGrossBal += weeklyGrossBal;
+      grandFee += weeklyFee;
+      grandNet += weeklyNet;
+
+      let weekLabel = `Week ${weekCounter} Total`;
+      let rowColor = "#e6f4ea";
+      if (weeklyCredit > threshold) rowColor = "#fff2cc";
+
+      let weeklyEffectiveRate = weeklyCredit > 0 ? ((weeklyGrossBal + weeklyCash) / weeklyCredit) : 0;;
+
+      reportRows.push([
+        weekLabel, 
+        weeklyCredit, 
+        "",                   
+        weeklyEffectiveRate,  
+        weeklyNoShow, 
+        weeklyTrips, 
+        weeklyCash, 
+        weeklyGrossBal,
+        weeklyFee,
+        weeklyNet
+      ]);
+      
+      weekTotalRows.push({
+        index: reportRows.length + 1,
+        color: rowColor 
+      });
+
+      weeklyCredit = 0; weeklyNoShow = 0; weeklyTrips = 0; weeklyCash = 0; 
+      weeklyGrossBal = 0; weeklyFee = 0; weeklyNet = 0;
+      
+      if (!isLastDayOfReport) {
+        weekCounter++;
+        reportRows.push(["", "", "", "", "", "", "", "", "", ""]);
+      }
+    }
+  }
+
+  reportRows.push(["", "", "", "", "", "", "", "", "", ""]); 
+  const grandRate = grandCredit > 0 ? ((grandGrossBal + grandCash) / grandCredit) : 0;
+  reportRows.push([
+    "GRAND TOTAL", grandCredit, "", grandRate, grandNoShow, grandTrips, grandCash, grandGrossBal, grandFee, grandNet
+  ]);
+  const grandTotalRowIndex = reportRows.length + 1;
+
+  let reportSheet = ss.getSheetByName(reportSheetName);
+  if (!reportSheet) {
+    reportSheet = ss.insertSheet(reportSheetName);
+  } else {
+    reportSheet.clear();
+    const charts = reportSheet.getCharts();
+    charts.forEach(c => reportSheet.removeChart(c));
+    try { reportSheet.showColumns(1, 20); } catch(e) {}
+  }
+
+  const headers = [["Date", "Daily Credit", "Weekly Cum.", "Applied Rate", "No Show", "Trips", "Cash", "Gross Bal.", "Fee (3%)", "Net Payout"]];
+  
+  reportSheet.getRange("A1:J1").setValues(headers)
+    .setFontWeight("bold")
+    .setFontSize(11)
+    .setHorizontalAlignment("center")
+    .setBackground("#f3f3f3")
+    .setBorder(true, true, true, true, true, true, "black", SpreadsheetApp.BorderStyle.SOLID);
+
+  if (reportRows.length > 0) {
+    const range = reportSheet.getRange(2, 1, reportRows.length, 10);
+    range.setValues(reportRows);
+    
+    reportSheet.getRange(2, 1, reportRows.length, 1).setNumberFormat("dddd, dd"); 
+    reportSheet.getRange(2, 2, reportRows.length, 2).setNumberFormat("$#,##0.00"); 
+    reportSheet.getRange(2, 4, reportRows.length, 1).setNumberFormat("0.0%"); 
+    reportSheet.getRange(2, 5, reportRows.length, 1).setNumberFormat("0"); 
+    reportSheet.getRange(2, 6, reportRows.length, 1).setNumberFormat("0");   
+    reportSheet.getRange(2, 7, reportRows.length, 4).setNumberFormat("$#,##0.00"); 
+
+    range.setHorizontalAlignment("center");
+    
+    weekTotalRows.forEach(item => {
+      const rowRange = reportSheet.getRange(item.index, 1, 1, 10);
+      rowRange.setFontWeight("bold");
+      rowRange.setBackground(item.color); 
+      rowRange.setBorder(true, true, true, true, true, true, "black", SpreadsheetApp.BorderStyle.SOLID);
+      reportSheet.getRange(item.index, 1).setHorizontalAlignment("center"); 
+    });
+
+    const grandRowRange = reportSheet.getRange(grandTotalRowIndex, 1, 1, 10);
+    grandRowRange.setFontWeight("bold");
+    grandRowRange.setFontSize(12);
+    grandRowRange.setBackground("#d9d2e9"); 
+    grandRowRange.setBorder(true, true, true, true, true, true, "black", SpreadsheetApp.BorderStyle.SOLID);
+
+    reportSheet.autoResizeColumns(1, 10);
+    for (let i = 1; i <= 10; i++) {
+      let currentWidth = reportSheet.getColumnWidth(i);
+      reportSheet.setColumnWidth(i, currentWidth + 15);
+    }
+    if (reportSheet.getColumnWidth(1) < 120) reportSheet.setColumnWidth(1, 120);
+
+    if (chartDataRows.length > 0) {
+      const chartDataRange = reportSheet.getRange(2, 12, chartDataRows.length, 2);
+      chartDataRange.setValues(chartDataRows);
+      reportSheet.getRange(2, 12, chartDataRows.length, 1).setNumberFormat("dddd, dd"); 
+      reportSheet.getRange(2, 13, chartDataRows.length, 1).setNumberFormat("$#,##0");  
+      reportSheet.hideColumns(12, 2); 
+    }
+
+    let angelChart = reportSheet.newChart()
+      .setChartType(Charts.ChartType.LINE)
+      .addRange(reportSheet.getRange(2, 12, chartDataRows.length, 1)) 
+      .addRange(reportSheet.getRange(2, 13, chartDataRows.length, 1)) 
+      .setPosition(2, 12, 0, 0) 
+      .setOption("title", "Angel's Daily Credit Progress")
+      .setOption("titleTextStyle", { bold: true, fontSize: 18 })
+      .setOption("vAxis", { title: "Daily Credit Earned", format: '$#,##0' }) 
+      .setOption("hAxis", { title: "Date", format: 'dddd, dd' }) 
+      .setOption("colors",["#1f77b4"])
+      .setOption("legend", { position: "none" })
+      .setOption("pointSize", 5)
+      .setOption("width", 800)  
+      .setOption("height", 400) 
+      .build();
+
+    reportSheet.insertChart(angelChart);
+  }
+}
+
 
 function parseNumber(val) {
     if (val === "" || val === null || val === undefined) return null;
