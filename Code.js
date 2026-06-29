@@ -302,6 +302,38 @@ function updateSummaryAndCharts(ss) {
     const rawSheet = ss.getSheetByName("Raw Data");
     if (!rawSheet) throw new Error('No sheet named "Raw Data" was found.');
 
+    // --- Helper to load exact daily data from auxiliary sheets ---
+    function loadAuxMap(sheetName) {
+        const auxSheet = ss.getSheetByName(sheetName);
+        if (!auxSheet) return {};
+        const data = auxSheet.getDataRange().getValues();
+        if (data.length < 2) return {};
+        const headers = auxSheet.getRange(1, 1, 1, auxSheet.getLastColumn()).getDisplayValues()[0];
+        
+        const dateCols = {};
+        for (let c = 1; c < headers.length; c++) {
+            const d = parseDDMMYY(headers[c]);
+            if (d) dateCols[c] = d.getTime();
+        }
+        
+        const map = {};
+        for (let r = 2; r < data.length; r++) {
+            const driver = (data[r][0] || "").toString().trim();
+            if (driver && driver !== "Total") {
+                map[driver] = {};
+                for (const c in dateCols) {
+                    const val = parseNumber(data[r][c]);
+                    if (val !== null && !isNaN(val)) map[driver][dateCols[c]] = val;
+                }
+            }
+        }
+        return map;
+    }
+
+    // Load auxiliary daily maps (driverName -> { timestamp -> value })
+    const tripsDataMap = loadAuxMap("Raw Data - Trips");
+    const netDataMap = loadAuxMap("Raw Data - NET");
+
     // --- Read the entire Raw Data sheet ---
     const rawData = rawSheet.getDataRange().getValues();
     if (rawData.length < 3) {
@@ -346,40 +378,83 @@ function updateSummaryAndCharts(ss) {
         const driverNet = parseNumber(rawData[r][netColIdx]) || 0;
         const driverCash = roundToTwo(driverTotal - driverNet); // Cash = Total - NET
 
-        // Collect daily credits to calculate proportional trips
-        let dailyCredits = [];
+        // Collect all active days (days with credit, trips, or cash)
+        let activeDays = [];
         dateColumns.forEach(dc => {
+            const dateKey = dc.date.getTime();
             const credit = parseNumber(rawData[r][dc.colIdx]) || 0;
-            if (credit > 0) {
-                dailyCredits.push({ date: dc.date, credit: credit });
+            
+            const hasExactTrips = tripsDataMap[driverName] && tripsDataMap[driverName][dateKey] !== undefined;
+            const hasExactNet = netDataMap[driverName] && netDataMap[driverName][dateKey] !== undefined;
+            
+            const exactTrips = hasExactTrips ? tripsDataMap[driverName][dateKey] : 0;
+            const exactNet = hasExactNet ? netDataMap[driverName][dateKey] : 0;
+
+            // Include day if there's credit, trips, or non-zero net (implying cash)
+            if (credit > 0 || exactTrips > 0 || exactNet !== 0) {
+                activeDays.push({ date: dc.date, dateKey: dateKey, credit: credit });
             }
         });
 
-        // Calculate daily trips and cash proportionally based on credit
-        let assignedTrips = 0;
-        let assignedCash = 0;
-        dailyCredits.forEach((dc, idx) => {
-            let dailyTrips;
-            let dailyCash;
-            if (idx === dailyCredits.length - 1) {
-                // Last day gets remaining trips/cash to ensure exact total
-                dailyTrips = driverTrips - assignedTrips;
-                dailyCash = driverCash - assignedCash;
+        // Calculate exact sums for trips and cash
+        let sumExactTrips = 0;
+        let sumExactCash = 0;
+        let missingTripDays = [];
+        let missingCashDays = [];
+
+        activeDays.forEach(day => {
+            // Trips
+            if (tripsDataMap[driverName] && tripsDataMap[driverName][day.dateKey] !== undefined) {
+                sumExactTrips += tripsDataMap[driverName][day.dateKey];
             } else {
-                dailyTrips = driverTotal > 0 ? Math.round(driverTrips * (dc.credit / driverTotal)) : 0;
-                dailyCash = driverTotal > 0 ? (driverCash * (dc.credit / driverTotal)) : 0;
+                missingTripDays.push(day);
             }
-            assignedTrips += dailyTrips;
-            assignedCash += dailyCash;
+
+            // Cash
+            if (netDataMap[driverName] && netDataMap[driverName][day.dateKey] !== undefined) {
+                const dailyNet = netDataMap[driverName][day.dateKey];
+                sumExactCash += (day.credit - dailyNet);
+            } else {
+                missingCashDays.push(day);
+            }
+        });
+
+        // Remainder available for missing days
+        const remainingTrips = driverTrips - sumExactTrips;
+        const remainingCash = driverCash - sumExactCash;
+
+        // Build output rows
+        activeDays.forEach(day => {
+            let dailyTrips = 0;
+            let dailyCash = 0;
+
+            // TRIPS LOGIC
+            if (tripsDataMap[driverName] && tripsDataMap[driverName][day.dateKey] !== undefined) {
+                dailyTrips = tripsDataMap[driverName][day.dateKey]; // Exact match
+            } else if (missingTripDays.length === 1) {
+                dailyTrips = remainingTrips; // 1 missing day -> gets the remainder exactly
+            } else {
+                dailyTrips = 0; // >1 missing day -> leave blank/0 until user uploads Trips data
+            }
+
+            // CASH LOGIC
+            if (netDataMap[driverName] && netDataMap[driverName][day.dateKey] !== undefined) {
+                const dailyNet = netDataMap[driverName][day.dateKey];
+                dailyCash = day.credit - dailyNet; // Exact match
+            } else if (missingCashDays.length === 1) {
+                dailyCash = remainingCash; // 1 missing day -> gets the remainder exactly
+            } else {
+                dailyCash = 0; // >1 missing day -> leave blank/0 until user uploads NET data
+            }
 
             outputRows.push([
-                dc.date,
+                day.date,
                 driverName,
-                dc.credit,
-                dailyCash,     // Proportional daily cash
-                dailyTrips,    // Estimated daily trip count
-                driverTotal,   // Monthly total credit (stored for aggregation)
-                driverCash     // Monthly total cash (stored for aggregation)
+                day.credit,
+                dailyCash,
+                dailyTrips,
+                driverTotal,
+                driverCash
             ]);
         });
     }
