@@ -513,6 +513,7 @@ function updateSummaryAndCharts(ss) {
     // Helper to get fare as decimal
     function getFareDecimal(driver) {
         let fareVal = existingFares[driver];
+        if (String(fareVal).trim() === "80%-90%") return "80%-90%";
         if (fareVal === undefined || fareVal === null || fareVal === "") return 0.9;
         if (typeof fareVal === "string" && fareVal.includes("%")) return parseFloat(fareVal) / 100;
         if (typeof fareVal === "number") return fareVal > 1 ? fareVal / 100 : fareVal;
@@ -534,6 +535,8 @@ function updateSummaryAndCharts(ss) {
     let currentStartRow = 3;
     let currentGroupSize = 0;
 
+    let progressiveTrackers = {}; // { driver -> { weekStart: 0, weeklyCredit: 0 } }
+
     outputRows.forEach((row, index) => {
         const currentDateString = row[0] ? row[0].toDateString() : "";
         let displayDate = row[0];
@@ -550,12 +553,42 @@ function updateSummaryAndCharts(ss) {
             currentGroupSize = 1;
         }
 
-        const fare = Number(driverFareCache[row[1]]) || 0.9;
+        const fare = driverFareCache[row[1]];
         const dailyCredit = Number(row[2]) || 0;
         const dailyCash = Number(row[3]) || 0;
         const trips = Number(row[4]) || 0;
         const dailyNoShow = Number(row[7]) || 0;
-        const dailyBalance = Number(roundToTwo((dailyCredit * fare) - dailyCash)) || 0;
+
+        let dailyBalance = 0;
+        if (fare === "80%-90%") {
+            let driver = row[1];
+            let d = new Date(row[0]);
+            let weekStart = getMonday(d).getTime();
+            
+            if (!progressiveTrackers[driver]) progressiveTrackers[driver] = { weekStart: 0, weeklyCredit: 0 };
+            if (progressiveTrackers[driver].weekStart !== weekStart) {
+                progressiveTrackers[driver] = { weekStart: weekStart, weeklyCredit: 0 };
+            }
+
+            let todayGrossPayout = 0;
+            if (dailyCredit > 0) {
+                let currentWeekCredit = progressiveTrackers[driver].weeklyCredit;
+                if (currentWeekCredit >= 1000) {
+                    todayGrossPayout = dailyCredit * 0.90;
+                } else if ((currentWeekCredit + dailyCredit) <= 1000) {
+                    todayGrossPayout = dailyCredit * 0.80;
+                } else {
+                    const creditAtBaseRate = 1000 - currentWeekCredit;
+                    const creditAtTopRate = dailyCredit - creditAtBaseRate;
+                    todayGrossPayout = (creditAtBaseRate * 0.80) + (creditAtTopRate * 0.90);
+                }
+            }
+            progressiveTrackers[driver].weeklyCredit += dailyCredit;
+            dailyBalance = Number(roundToTwo(todayGrossPayout - dailyCash)) || 0;
+        } else {
+            const numericFare = Number(fare) || 0.9;
+            dailyBalance = Number(roundToTwo((dailyCredit * numericFare) - dailyCash)) || 0;
+        }
 
         // Summary rows: Date, Driver, Credit, Trips, Cash, No Show, Balance
         rowsToWrite.push([
@@ -828,14 +861,15 @@ function generateWeeklySummary(ss) {
         for (let i = 1; i < settingsData.length; i++) {
             if (settingsData[i][0]) {
                 let fareVal = settingsData[i][1];
-                if (typeof fareVal === "string" && fareVal.includes("%")) {
-                    fareVal = parseFloat(fareVal) / 100;
+                let parsedFare = 0.9;
+                if (String(fareVal).trim() === "80%-90%") {
+                    parsedFare = "80%-90%";
+                } else if (typeof fareVal === "string" && fareVal.includes("%")) {
+                    parsedFare = parseFloat(fareVal) / 100;
                 } else if (typeof fareVal === "number") {
-                    fareVal = fareVal > 1 ? fareVal / 100 : fareVal;
-                } else {
-                    fareVal = 0.9; // default
+                    parsedFare = fareVal > 1 ? fareVal / 100 : fareVal;
                 }
-                driverFareMap[settingsData[i][0]] = fareVal;
+                driverFareMap[settingsData[i][0]] = parsedFare;
             }
         }
     }
@@ -971,8 +1005,21 @@ function generateWeeklySummary(ss) {
             drivers.forEach(d => {
                 const info = weeklyData[weekKey][d];
                 const cash = info.cash;
-                const fare = driverFareMap[d] || 0.9; // default 90%
-                const balance = roundToTwo((info.credit * fare) - cash);
+                const fare = driverFareMap[d] !== undefined ? driverFareMap[d] : 0.9; 
+                
+                let grossPayout = 0;
+                if (fare === "80%-90%") {
+                    if (info.credit <= 1000) {
+                        grossPayout = info.credit * 0.80;
+                    } else {
+                        grossPayout = (1000 * 0.80) + ((info.credit - 1000) * 0.90);
+                    }
+                } else {
+                    const numericFare = Number(fare) || 0.9;
+                    grossPayout = info.credit * numericFare;
+                }
+                
+                const balance = roundToTwo(grossPayout - cash);
                 tableData.push([d, info.credit, info.trips, cash, balance]);
             });
 
@@ -1362,7 +1409,8 @@ function generateAngelReport(ss) {
   let angelDataMap = {}; 
 
   function mapRowToAngelData(row) {
-    if (row[1] === targetDriver && row[0] instanceof Date) {
+    const driverName = String(row[1] || "");
+    if (driverName.includes(targetDriver) && row[0] instanceof Date) {
       let dateKey = row[0].toDateString(); 
       angelDataMap[dateKey] = {
         credit: Number(row[2]) || 0,
