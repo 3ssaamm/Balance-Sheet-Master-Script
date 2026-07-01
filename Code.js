@@ -918,10 +918,15 @@ function generateWeeklySummary(ss) {
                     const readCols = oldLastCol >= 5 ? 5 : oldLastCol;
                     const prevAllData = prevSummarySheet.getRange(3, 1, prevSummarySheet.getLastRow() - 2, readCols).getValues();
 
+                    const currentDrivers = Array.from(new Set(allRows.map(r => r[1]).filter(n => n)));
                     let prevLastSeen = null;
                     const crossoverRows = prevAllData.map(row => {
                         if (row[0] && row[0] !== "") prevLastSeen = row[0];
                         else row[0] = prevLastSeen;
+                        
+                        if (row[1]) {
+                            row[1] = matchOldDriverName(row[1], currentDrivers);
+                        }
                         return row;
                     }).filter(row => {
                         const d = parseDate(row[0]);
@@ -1151,10 +1156,15 @@ function generateBonusReport(ss) {
                     const readCols = oldLastCol >= 4 ? 4 : oldLastCol;
                     const prevAllData = prevSummarySheet.getRange(3, 1, prevSummarySheet.getLastRow() - 2, readCols).getValues();
 
+                    const currentDrivers = Array.from(new Set(allRows.map(r => r[1]).filter(n => n)));
                     let prevLastSeen = null;
                     const crossoverRows = prevAllData.map(row => {
                         if (row[0] && row[0] !== "") prevLastSeen = row[0];
                         else row[0] = prevLastSeen;
+                        
+                        if (row[1]) {
+                            row[1] = matchOldDriverName(row[1], currentDrivers);
+                        }
                         return row;
                     }).filter(row => {
                         const d = parseDate(row[0]);
@@ -1288,6 +1298,42 @@ function generateBonusReport(ss) {
 // =================================================================
 // SHARED HELPERS
 // =================================================================
+
+/**
+ * Tries to map an old driver name (e.g. "Ablaye Diop") to a new driver name (e.g. "Ablaye").
+ * Handles first name matching while avoiding conflicting last names.
+ */
+function matchOldDriverName(oldName, newNames) {
+    if (!oldName) return oldName;
+    const oldStr = oldName.toString().trim();
+    if (newNames.includes(oldStr)) return oldStr; // exact match
+
+    const oldParts = oldStr.split(" ");
+    const oldFirst = oldParts[0].toLowerCase();
+    const oldLast = oldParts.length > 1 ? oldParts.slice(1).join(" ").toLowerCase() : "";
+
+    // Find all new names with the same first name
+    const matches = newNames.filter(n => {
+        const nParts = n.toString().trim().split(" ");
+        return nParts[0].toLowerCase() === oldFirst;
+    });
+
+    if (matches.length === 1) {
+        const nParts = matches[0].toString().trim().split(" ");
+        const nLast = nParts.length > 1 ? nParts.slice(1).join(" ").toLowerCase() : "";
+        // If one has a last name and the other does too, they must not conflict.
+        if (oldLast && nLast) {
+            // E.g. "Diop" vs "Smith" -> conflict. "Diop" vs "Di" -> ok.
+            if (!oldLast.startsWith(nLast) && !nLast.startsWith(oldLast)) {
+                return oldStr; // conflicting last names, don't match
+            }
+        }
+        return matches[0];
+    }
+    
+    // If multiple matches or no matches, return original
+    return oldStr;
+}
 
 /**
  * Loads No Show data (Date, Driver, Cash) from the No Show sheet.
