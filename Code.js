@@ -413,7 +413,7 @@ function updateSummaryAndCharts(ss) {
             }
         });
 
-        // Calculate exact sums for trips and cash
+        // Calculate exact sums for trips and cash from per-day aux sheets
         let sumExactTrips = 0;
         let sumExactCash = 0;
         let missingTripDays = [];
@@ -437,9 +437,16 @@ function updateSummaryAndCharts(ss) {
             }
         });
 
-        // Remainder available for missing days
-        const remainingTrips = driverTrips - sumExactTrips;
+        // Remainder = cumulative total (from Raw Data) minus what's already covered
+        // by exact per-day aux data.
+        const remainingTrips = Math.max(0, driverTrips - sumExactTrips);
         const remainingCash = driverCash - sumExactCash;
+
+        // The LAST (most recent) day that lacks exact aux data gets the full remainder.
+        // Logic: total - known_days = new_day  (e.g. Day2 = total_trips - Day1_trips)
+        // Earlier days without aux data get 0 — their data isn't in the system yet.
+        const lastMissingTripDay  = missingTripDays.length  > 0 ? missingTripDays[missingTripDays.length   - 1] : null;
+        const lastMissingCashDay  = missingCashDays.length  > 0 ? missingCashDays[missingCashDays.length   - 1] : null;
 
         // Build output rows
         activeDays.forEach(day => {
@@ -448,21 +455,29 @@ function updateSummaryAndCharts(ss) {
 
             // TRIPS LOGIC
             if (tripsDataMap[driverName] && tripsDataMap[driverName][day.dateKey] !== undefined) {
-                dailyTrips = tripsDataMap[driverName][day.dateKey]; // Exact match
-            } else if (missingTripDays.length === 1) {
-                dailyTrips = remainingTrips; // 1 missing day -> gets the remainder exactly
+                // Exact per-day data from Trips sheet
+                dailyTrips = tripsDataMap[driverName][day.dateKey];
+            } else if (lastMissingTripDay && day.dateKey === lastMissingTripDay.dateKey && remainingTrips > 0) {
+                // This is the most recent day without exact data — it gets the remainder:
+                // new_day_trips = total_trips - sum_of_all_known_previous_days
+                dailyTrips = remainingTrips;
             } else {
-                dailyTrips = 0; // >1 missing day -> leave blank/0 until user uploads Trips data
+                // Older day with no aux data — leave 0 (data not yet in the system)
+                dailyTrips = 0;
             }
 
             // CASH LOGIC
             if (netDataMap[driverName] && netDataMap[driverName][day.dateKey] !== undefined) {
+                // Exact per-day NET data from NET sheet
                 const dailyNet = netDataMap[driverName][day.dateKey];
-                dailyCash = roundToTwo(day.credit - dailyNet); // Exact match
-            } else if (missingCashDays.length === 1) {
-                dailyCash = remainingCash; // 1 missing day -> gets the remainder exactly
+                dailyCash = roundToTwo(day.credit - dailyNet);
+            } else if (lastMissingCashDay && day.dateKey === lastMissingCashDay.dateKey && remainingCash > 0) {
+                // This is the most recent day without exact data — it gets the remainder:
+                // new_day_cash = total_cash - sum_of_all_known_previous_days_cash
+                dailyCash = remainingCash;
             } else {
-                dailyCash = 0; // >1 missing day -> leave blank/0 until user uploads NET data
+                // Older day with no aux data — leave 0
+                dailyCash = 0;
             }
 
             let dailyNoShowCount = 0;
