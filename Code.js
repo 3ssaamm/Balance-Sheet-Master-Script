@@ -371,6 +371,29 @@ function updateSummaryAndCharts(ss) {
         return;
     }
 
+    // --- Read existing Summary data BEFORE clearing it ---
+    // This acts as a memory of previously-calculated trips/cash values.
+    // When a new day is added to Raw Data, older days keep their correct values
+    // and the new day gets: total - sum_of_all_known_previous_days.
+    const existingSummaryMap = {}; // { driver -> { dateKey -> { trips, cash } } }
+    const existingLastRow = summarySheet.getLastRow();
+    if (existingLastRow >= 3) {
+        const existingRows = summarySheet.getRange(3, 1, existingLastRow - 2, 5).getValues();
+        let prevSummaryDate = null;
+        existingRows.forEach(row => {
+            if (row[0] instanceof Date) prevSummaryDate = row[0];
+            const dateVal = prevSummaryDate;
+            const driver = (row[1] || '').toString().trim();
+            if (!dateVal || !driver) return;
+            const trips = parseNumber(row[3]);
+            const cash  = parseNumber(row[4]);
+            if (trips === null && cash === null) return;
+            const dk = new Date(dateVal.getFullYear(), dateVal.getMonth(), dateVal.getDate()).getTime();
+            if (!existingSummaryMap[driver]) existingSummaryMap[driver] = {};
+            existingSummaryMap[driver][dk] = { trips: trips || 0, cash: cash || 0 };
+        });
+    }
+
     // --- Build output rows: one row per driver per day (only days with credit > 0) ---
     let outputRows = []; // [date, driver, credit, cash, trips, total]
 
@@ -413,70 +436,77 @@ function updateSummaryAndCharts(ss) {
             }
         });
 
-        // Calculate exact sums for trips and cash from per-day aux sheets
+        // Calculate exact sums for trips and cash.
+        // Priority: 1) per-day aux sheet data  2) previously-computed Summary values
+        // Anything not covered by either goes into the "missing" list.
         let sumExactTrips = 0;
         let sumExactCash = 0;
         let missingTripDays = [];
         let missingCashDays = [];
 
         activeDays.forEach(day => {
-            // Trips
+            // TRIPS
             if (tripsDataMap[driverName] && tripsDataMap[driverName][day.dateKey] !== undefined) {
+                // Aux sheet has per-day data — most accurate source
                 sumExactTrips += tripsDataMap[driverName][day.dateKey];
+            } else if (existingSummaryMap[driverName] && existingSummaryMap[driverName][day.dateKey] !== undefined) {
+                // Summary has a previously-calculated value — use it as known baseline
+                sumExactTrips += existingSummaryMap[driverName][day.dateKey].trips;
             } else {
                 missingTripDays.push(day);
             }
 
-            // Cash
+            // CASH
             if (netDataMap[driverName] && netDataMap[driverName][day.dateKey] !== undefined) {
                 const dailyNet = netDataMap[driverName][day.dateKey];
-                let exactDailyCash = roundToTwo(day.credit - dailyNet);
-                sumExactCash += exactDailyCash;
+                sumExactCash += roundToTwo(day.credit - dailyNet);
+            } else if (existingSummaryMap[driverName] && existingSummaryMap[driverName][day.dateKey] !== undefined) {
+                sumExactCash += existingSummaryMap[driverName][day.dateKey].cash;
             } else {
                 missingCashDays.push(day);
             }
         });
 
-        // Remainder = cumulative total (from Raw Data) minus what's already covered
-        // by exact per-day aux data.
+        // Remainder = cumulative total − everything already accounted for.
+        // The LAST missing day gets this remainder:
+        //   new_day = total − Day1 − Day2 − ... (all known days)
         const remainingTrips = Math.max(0, driverTrips - sumExactTrips);
-        const remainingCash = driverCash - sumExactCash;
+        const remainingCash  = driverCash - sumExactCash;
 
-        // The LAST (most recent) day that lacks exact aux data gets the full remainder.
-        // Logic: total - known_days = new_day  (e.g. Day2 = total_trips - Day1_trips)
-        // Earlier days without aux data get 0 — their data isn't in the system yet.
-        const lastMissingTripDay  = missingTripDays.length  > 0 ? missingTripDays[missingTripDays.length   - 1] : null;
-        const lastMissingCashDay  = missingCashDays.length  > 0 ? missingCashDays[missingCashDays.length   - 1] : null;
+        const lastMissingTripDay = missingTripDays.length > 0 ? missingTripDays[missingTripDays.length - 1] : null;
+        const lastMissingCashDay = missingCashDays.length > 0 ? missingCashDays[missingCashDays.length - 1] : null;
 
         // Build output rows
         activeDays.forEach(day => {
             let dailyTrips = 0;
-            let dailyCash = 0;
+            let dailyCash  = 0;
 
-            // TRIPS LOGIC
+            // TRIPS LOGIC (priority order)
             if (tripsDataMap[driverName] && tripsDataMap[driverName][day.dateKey] !== undefined) {
-                // Exact per-day data from Trips sheet
+                // 1. Exact per-day data from Trips aux sheet
                 dailyTrips = tripsDataMap[driverName][day.dateKey];
+            } else if (existingSummaryMap[driverName] && existingSummaryMap[driverName][day.dateKey] !== undefined) {
+                // 2. Previously-calculated value stored in Summary (preserves Day 1 when Day 2 is added)
+                dailyTrips = existingSummaryMap[driverName][day.dateKey].trips;
             } else if (lastMissingTripDay && day.dateKey === lastMissingTripDay.dateKey && remainingTrips > 0) {
-                // This is the most recent day without exact data — it gets the remainder:
-                // new_day_trips = total_trips - sum_of_all_known_previous_days
+                // 3. Last unknown day gets the remainder: new_day = total − all_known_days
                 dailyTrips = remainingTrips;
             } else {
-                // Older day with no aux data — leave 0 (data not yet in the system)
                 dailyTrips = 0;
             }
 
-            // CASH LOGIC
+            // CASH LOGIC (priority order)
             if (netDataMap[driverName] && netDataMap[driverName][day.dateKey] !== undefined) {
-                // Exact per-day NET data from NET sheet
+                // 1. Exact per-day NET data from NET aux sheet
                 const dailyNet = netDataMap[driverName][day.dateKey];
                 dailyCash = roundToTwo(day.credit - dailyNet);
+            } else if (existingSummaryMap[driverName] && existingSummaryMap[driverName][day.dateKey] !== undefined) {
+                // 2. Previously-calculated value stored in Summary
+                dailyCash = existingSummaryMap[driverName][day.dateKey].cash;
             } else if (lastMissingCashDay && day.dateKey === lastMissingCashDay.dateKey && remainingCash > 0) {
-                // This is the most recent day without exact data — it gets the remainder:
-                // new_day_cash = total_cash - sum_of_all_known_previous_days_cash
+                // 3. Last unknown day gets the remainder
                 dailyCash = remainingCash;
             } else {
-                // Older day with no aux data — leave 0
                 dailyCash = 0;
             }
 
