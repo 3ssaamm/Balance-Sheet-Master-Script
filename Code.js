@@ -386,7 +386,7 @@ function updateSummaryAndCharts(ss) {
             const driver = (row[1] || '').toString().trim();
             if (!dateVal || !driver) return;
             const trips = parseNumber(row[3]);
-            const cash  = parseNumber(row[4]);
+            const cash = parseNumber(row[4]);
             if (trips === null && cash === null) return;
             const dk = new Date(dateVal.getFullYear(), dateVal.getMonth(), dateVal.getDate()).getTime();
             if (!existingSummaryMap[driver]) existingSummaryMap[driver] = {};
@@ -449,13 +449,13 @@ function updateSummaryAndCharts(ss) {
         const lastNonAuxCashDay = nonAuxCashDays.length > 0 ? nonAuxCashDays[nonAuxCashDays.length - 1] : null;
 
         let sumExactTrips = 0;
-        let sumExactCash  = 0;
+        let sumExactCash = 0;
         let missingTripDays = [];
         let missingCashDays = [];
 
         activeDays.forEach(day => {
             const isLastTrip = lastNonAuxTripDay && day.dateKey === lastNonAuxTripDay.dateKey;
-            const isLastCash  = lastNonAuxCashDay && day.dateKey === lastNonAuxCashDay.dateKey;
+            const isLastCash = lastNonAuxCashDay && day.dateKey === lastNonAuxCashDay.dateKey;
 
             // TRIPS
             if (tripsDataMap[driverName] && tripsDataMap[driverName][day.dateKey] !== undefined) {
@@ -480,7 +480,7 @@ function updateSummaryAndCharts(ss) {
 
         // new_day = Count_total − sum_of_all_earlier_known_days
         const remainingTrips = Math.max(0, driverTrips - sumExactTrips);
-        const remainingCash  = driverCash - sumExactCash;
+        const remainingCash = driverCash - sumExactCash;
 
         const lastMissingTripDay = missingTripDays.length > 0 ? missingTripDays[missingTripDays.length - 1] : null;
         const lastMissingCashDay = missingCashDays.length > 0 ? missingCashDays[missingCashDays.length - 1] : null;
@@ -488,7 +488,7 @@ function updateSummaryAndCharts(ss) {
         // Build output rows
         activeDays.forEach(day => {
             let dailyTrips = 0;
-            let dailyCash  = 0;
+            let dailyCash = 0;
 
             // TRIPS (priority: aux > remainder for last day > Summary for earlier days > 0)
             if (tripsDataMap[driverName] && tripsDataMap[driverName][day.dateKey] !== undefined) {
@@ -972,7 +972,7 @@ function generateWeeklySummary(ss) {
                     const crossoverRows = prevAllData.map(row => {
                         if (row[0] && row[0] !== "") prevLastSeen = row[0];
                         else row[0] = prevLastSeen;
-                        
+
                         if (row[1]) {
                             row[1] = matchOldDriverName(row[1], currentDrivers);
                         }
@@ -1210,7 +1210,7 @@ function generateBonusReport(ss) {
                     const crossoverRows = prevAllData.map(row => {
                         if (row[0] && row[0] !== "") prevLastSeen = row[0];
                         else row[0] = prevLastSeen;
-                        
+
                         if (row[1]) {
                             row[1] = matchOldDriverName(row[1], currentDrivers);
                         }
@@ -1261,16 +1261,17 @@ function generateBonusReport(ss) {
             for (const driver in weekBlock) {
 
                 const info = weekBlock[driver];
+                const roundedCredit = Math.round(info.credit);
 
                 if (nonDispatchDrivers.has(driver)) {
-                    if (includeNonDispatchInBonus === true && info.credit >= 1500) {
-                        allQualifiedDrivers.push([driver, info.credit, weekKey]);
+                    if (includeNonDispatchInBonus === true && roundedCredit >= 1500) {
+                        allQualifiedDrivers.push([driver, roundedCredit, weekKey]);
                     }
                     continue;
                 }
 
-                if (info.credit >= 1500) {
-                    allQualifiedDrivers.push([driver, info.credit, weekKey]);
+                if (roundedCredit >= 1500) {
+                    allQualifiedDrivers.push([driver, roundedCredit, weekKey]);
                 }
             }
         }
@@ -1315,7 +1316,7 @@ function generateBonusReport(ss) {
             }
         }
 
-        bonusSheet.getRange(2, 2, allQualifiedDrivers.length, 1).setNumberFormat("$#,##0.00");
+        bonusSheet.getRange(2, 2, allQualifiedDrivers.length, 1).setNumberFormat("$#,##0");
 
         const totalBonusCredit = allQualifiedDrivers.reduce((sum, row) => sum + row[1], 0);
         const halfPercentBonus = totalBonusCredit * 0.005;
@@ -1331,7 +1332,7 @@ function generateBonusReport(ss) {
             .setBorder(true, true, true, true, true, true, "black", SpreadsheetApp.BorderStyle.SOLID_MEDIUM)
             .setHorizontalAlignment("center");
 
-        bonusSheet.getRange(totalRow, 2, 2, 1).setNumberFormat("$#,##0.00");
+        bonusSheet.getRange(totalRow, 2, 2, 1).setNumberFormat("$#,##0");
 
     } else {
         bonusSheet.getRange("A1").setValue("No Bonuses for this period.").setFontWeight("bold");
@@ -1379,7 +1380,7 @@ function matchOldDriverName(oldName, newNames) {
         }
         return matches[0];
     }
-    
+
     // If multiple matches or no matches, return original
     return oldStr;
 }
