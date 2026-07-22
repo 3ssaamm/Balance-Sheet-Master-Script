@@ -1133,7 +1133,7 @@ function generateWeeklySummary(ss) {
 
 
 // =================================================================
-// BONUS REPORT — Identifies drivers who hit $1500 weekly threshold
+// BONUS REPORT — Identifies drivers who hit $1495 weekly threshold
 // =================================================================
 /**
  * Creates the "Bonus" sheet with professional styling.
@@ -1264,13 +1264,13 @@ function generateBonusReport(ss) {
                 const roundedCredit = Math.round(info.credit);
 
                 if (nonDispatchDrivers.has(driver)) {
-                    if (includeNonDispatchInBonus === true && roundedCredit >= 1500) {
+                    if (includeNonDispatchInBonus === true && roundedCredit >= 1495) {
                         allQualifiedDrivers.push([driver, roundedCredit, weekKey]);
                     }
                     continue;
                 }
 
-                if (roundedCredit >= 1500) {
+                if (roundedCredit >= 1495) {
                     allQualifiedDrivers.push([driver, roundedCredit, weekKey]);
                 }
             }
