@@ -995,13 +995,24 @@ function updateSummaryAndCharts(ss) {
     settingsSheet.autoResizeColumns(1, 2);
 
     // =================================================================
-    // --- Write aggregated stats to Summary (column I = one gap after 7-col main table) ---
+    // --- Write aggregated stats to Summary (column J = one gap after 8-col main table) ---
     // =================================================================
     const startRow = 3, startCol = 10; // Column J (A-H = 8-col main table, I = 1-col gap)
     // Clear old aggregate area
     try { summarySheet.getRange(startRow, startCol, 50, 10).clearContent(); } catch (e) { }
 
-    summarySheet.getRange(startRow, startCol, aggRows.length, aggRows[0].length).setValues(aggRows);
+    const aggRange = summarySheet.getRange(startRow, startCol, aggRows.length, aggRows[0].length);
+    aggRange.setValues(aggRows);
+
+    // Decrease cell size / font size of aggregated table so chart can fully cover it
+    aggRange.setFontSize(7);
+    summarySheet.getRange(startRow, startCol, 1, aggRows[0].length).setFontWeight("bold");
+
+    // Compact column widths for columns J to R (cols 10 to 18)
+    summarySheet.setColumnWidth(startCol, 75); // Col J (Driver name)
+    for (let c = startCol + 1; c < startCol + aggRows[0].length; c++) {
+        summarySheet.setColumnWidth(c, 55); // Cols K to R (Stats)
+    }
 
     // --- Daily stats for chart (aggregate all drivers per day) ---
     let dailyStats = {};
@@ -1024,7 +1035,7 @@ function updateSummaryAndCharts(ss) {
         .map(d => [d.date, roundToTwo(d.credit), d.trips, roundToTwo(d.cash), d.noShow, roundToTwo(d.hours)]);
 
     const dailyHeader = ["Date", "Total Credit", "Trips", "Cash", "No Show", "Total Hours"];
-    const dailyStartCol = startCol + aggRows[0].length + 1; // One gap after aggregate table (Column T)
+    const dailyStartCol = startCol + aggRows[0].length + 6; // Shifted right (Column X = col 25) so chart doesn't overlap daily table
 
     summarySheet.getRange(2, dailyStartCol, 100, 7).clearContent();
     summarySheet.getRange(2, dailyStartCol, 1, dailyHeader.length).setValues([dailyHeader]).setFontWeight("bold");
@@ -1038,9 +1049,9 @@ function updateSummaryAndCharts(ss) {
     const allCharts = summarySheet.getCharts();
     allCharts.forEach(c => summarySheet.removeChart(c));
 
-    // Chart 1: Daily Total Credit Trend (line) — positioned NEXT TO the daily credit table (1 col gap Z)
+    // Chart 1: Daily Total Credit Trend (line) — positioned NEXT TO the daily credit table
     if (dailyRows.length > 0) {
-        const dailyChartCol = dailyStartCol + 7; // Col 27 (AA)
+        const dailyChartCol = dailyStartCol + 7; // Col 32 (AF)
         let dailyChart = summarySheet.newChart()
             .setChartType(Charts.ChartType.LINE)
             .addRange(summarySheet.getRange(3, dailyStartCol, dailyRows.length, 1))
@@ -1069,10 +1080,7 @@ function updateSummaryAndCharts(ss) {
     const colHours = String.fromCharCode(64 + startCol + 5);  // O (Total Hours)
     const colK = String.fromCharCode(64 + startCol + 8);     // R (Avg Per Day)
 
-    // Position column charts cleanly below the aggregated stats table
-    const chartStartRow = lastRow + 3;
-
-    // Chart 2: Total Credit by Driver (bar)
+    // Chart 2: Total Credit by Driver (bar) — POSITIONED AT ROW 3, COL J TO FULLY COVER AGGREGATED STATS TABLE
     let chart1 = summarySheet.newChart().setChartType(Charts.ChartType.COLUMN)
         .addRange(summarySheet.getRange(colF + dataStart + ":" + colF + lastRow))
         .addRange(summarySheet.getRange(colG + dataStart + ":" + colG + lastRow))
@@ -1080,12 +1088,12 @@ function updateSummaryAndCharts(ss) {
         .setOption("titleTextStyle", { bold: true, fontSize: 24 })
         .setOption("colors", ["#1f77b4"]).setOption("legend", { position: "none" })
         .setOption("vAxis", { title: "Credit" })
-        .setOption("width", 720)
+        .setOption("width", 850)
         .setOption("height", 450)
-        .setPosition(chartStartRow, startCol, 0, 0).build();
+        .setPosition(3, startCol, 0, 0).build();
     summarySheet.insertChart(chart1);
 
-    // Chart 3: Total Trips by Driver (bar)
+    // Chart 3: Total Trips by Driver (bar) — Stacked below Chart 1
     let chart2 = summarySheet.newChart().setChartType(Charts.ChartType.COLUMN)
         .addRange(summarySheet.getRange(colF + dataStart + ":" + colF + lastRow))
         .addRange(summarySheet.getRange(colH + dataStart + ":" + colH + lastRow))
@@ -1093,12 +1101,12 @@ function updateSummaryAndCharts(ss) {
         .setOption("titleTextStyle", { bold: true, fontSize: 24 })
         .setOption("colors", ["#8c564b"]).setOption("legend", { position: "none" })
         .setOption("vAxis", { title: "Trips" })
-        .setOption("width", 720)
+        .setOption("width", 850)
         .setOption("height", 450)
-        .setPosition(chartStartRow + 24, startCol, 0, 0).build();
+        .setPosition(26, startCol, 0, 0).build();
     summarySheet.insertChart(chart2);
 
-    // Chart 4: No Show by Driver (bar)
+    // Chart 4: No Show by Driver (bar) — Stacked below Chart 2
     let chartNoShow = summarySheet.newChart().setChartType(Charts.ChartType.COLUMN)
         .addRange(summarySheet.getRange(colF + dataStart + ":" + colF + lastRow))
         .addRange(summarySheet.getRange(colNoShow + dataStart + ":" + colNoShow + lastRow))
@@ -1106,12 +1114,12 @@ function updateSummaryAndCharts(ss) {
         .setOption("titleTextStyle", { bold: true, fontSize: 24 })
         .setOption("colors", ["#2ca02c"]).setOption("legend", { position: "none" })
         .setOption("vAxis", { title: "No Show Trips" })
-        .setOption("width", 720)
+        .setOption("width", 850)
         .setOption("height", 450)
-        .setPosition(chartStartRow + 48, startCol, 0, 0).build();
+        .setPosition(49, startCol, 0, 0).build();
     summarySheet.insertChart(chartNoShow);
 
-    // Chart 5: Total Working Hours by Driver (bar)
+    // Chart 5: Total Working Hours by Driver (bar) — Stacked below Chart 3
     let chartHours = summarySheet.newChart().setChartType(Charts.ChartType.COLUMN)
         .addRange(summarySheet.getRange(colF + dataStart + ":" + colF + lastRow))
         .addRange(summarySheet.getRange(colHours + dataStart + ":" + colHours + lastRow))
@@ -1119,12 +1127,12 @@ function updateSummaryAndCharts(ss) {
         .setOption("titleTextStyle", { bold: true, fontSize: 24 })
         .setOption("colors", ["#ff7f0e"]).setOption("legend", { position: "none" })
         .setOption("vAxis", { title: "Hours" })
-        .setOption("width", 720)
+        .setOption("width", 850)
         .setOption("height", 450)
-        .setPosition(chartStartRow + 72, startCol, 0, 0).build();
+        .setPosition(72, startCol, 0, 0).build();
     summarySheet.insertChart(chartHours);
 
-    // Chart 6: Average Per Day by Driver (bar)
+    // Chart 6: Average Per Day by Driver (bar) — Stacked below Chart 4
     let chart3 = summarySheet.newChart().setChartType(Charts.ChartType.COLUMN)
         .addRange(summarySheet.getRange(colF + dataStart + ":" + colF + lastRow))
         .addRange(summarySheet.getRange(colK + dataStart + ":" + colK + lastRow))
@@ -1132,9 +1140,9 @@ function updateSummaryAndCharts(ss) {
         .setOption("titleTextStyle", { bold: true, fontSize: 24 })
         .setOption("colors", ["#d62728"]).setOption("legend", { position: "none" })
         .setOption("vAxis", { title: "Daily Credit" })
-        .setOption("width", 720)
+        .setOption("width", 850)
         .setOption("height", 450)
-        .setPosition(chartStartRow + 96, startCol, 0, 0).build();
+        .setPosition(95, startCol, 0, 0).build();
     summarySheet.insertChart(chart3);
 }
 
