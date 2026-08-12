@@ -17,6 +17,7 @@ function onOpen() {
             .addSeparator()
             .addItem('📥 Import: NET Data  (from "Raw Data - NET" sheet)', 'importNetData')
             .addItem('📥 Import: Trips Data  (from "Raw Data - Trips" sheet)', 'importTripsData')
+            .addItem('🕒 Sync Working Hours Sheet', 'generateWorkingHoursSheetFromMenu')
             .addSeparator()
             .addItem('🔧 Setup Auto-Run Trigger', 'setupAutoRun')
             .addToUi();
@@ -272,11 +273,234 @@ function setupAutoRun() {
 }
 
 
+// =================================================================
+// WORKING HOURS SHEET GENERATION & LOAD HELPERS
+// =================================================================
+
+function generateWorkingHoursSheetFromMenu() {
+    const ss = SpreadsheetApp.openById(TARGET_SHEET_ID);
+    generateWorkingHoursSheet(ss);
+    SpreadsheetApp.flush();
+    try {
+        SpreadsheetApp.getUi().alert("✅ 'Working hours' sheet synced successfully!");
+    } catch (e) {}
+}
+
+/**
+ * Reads the "Working hours" sheet and returns:
+ * - map: { driverName -> { dateTimestamp -> hours } }
+ * - driverTotalHours: { driverName -> totalHours }
+ * - dailyTotalHours: { dateTimestamp -> totalHours }
+ */
+function loadWorkingHoursMap(ss) {
+    const hoursSheet = ss.getSheetByName("Working hours");
+    if (!hoursSheet) return { map: {}, driverTotalHours: {}, dailyTotalHours: {} };
+
+    const data = hoursSheet.getDataRange().getValues();
+    if (data.length < 2) return { map: {}, driverTotalHours: {}, dailyTotalHours: {} };
+
+    const headers = hoursSheet.getRange(1, 1, 1, hoursSheet.getLastColumn()).getDisplayValues()[0];
+    const dateCols = {}; // colIdx -> timestamp
+    for (let c = 1; c < headers.length; c++) {
+        if (headers[c].toLowerCase().includes("total")) continue;
+        const d = parseDDMMYY(headers[c]);
+        if (d) dateCols[c] = d.getTime();
+    }
+
+    const map = {};
+    const driverTotalHours = {};
+    const dailyTotalHours = {};
+
+    for (let r = 1; r < data.length; r++) {
+        const driver = (data[r][0] || "").toString().trim();
+        if (!driver || driver.toLowerCase().startsWith("total")) continue;
+
+        map[driver] = {};
+        let driverSum = 0;
+
+        for (const c in dateCols) {
+            const dateKey = dateCols[c];
+            const val = parseNumber(data[r][c]);
+            if (val !== null && !isNaN(val) && val > 0) {
+                map[driver][dateKey] = val;
+                driverSum += val;
+                dailyTotalHours[dateKey] = (dailyTotalHours[dateKey] || 0) + val;
+            }
+        }
+        driverTotalHours[driver] = roundToTwo(driverSum);
+    }
+
+    return { map, driverTotalHours, dailyTotalHours };
+}
+
+/**
+ * Generates/syncs the "Working hours" sheet based on "Raw Data".
+ * Preserves existing entered hours, defaults $0 credit days to 0 hours,
+ * adds a Total Hours column (formula =SUM(...)) and a Total Hours row at bottom.
+ * Applies custom data validation for 0.5-hour increments.
+ */
+function generateWorkingHoursSheet(ss) {
+    let hoursSheet = ss.getSheetByName("Working hours");
+    if (!hoursSheet) hoursSheet = ss.insertSheet("Working hours");
+
+    const rawSheet = ss.getSheetByName("Raw Data");
+    if (!rawSheet) {
+        Logger.log('❌ Sheet "Raw Data" not found.');
+        return;
+    }
+
+    const rawData = rawSheet.getDataRange().getValues();
+    if (rawData.length < 3) return;
+
+    const rawHeaders = rawSheet.getRange(1, 1, 1, rawSheet.getLastColumn()).getDisplayValues()[0];
+    const totalColIdx = rawHeaders.length - 3;
+
+    // Date columns from Raw Data
+    const dateColumns = []; // { colIdx, date, headerStr }
+    for (let c = 1; c < totalColIdx; c++) {
+        const d = parseDDMMYY(rawHeaders[c]);
+        if (d) dateColumns.push({ colIdx: c, date: d, headerStr: rawHeaders[c] });
+    }
+
+    if (dateColumns.length === 0) return;
+
+    // Drivers list from Raw Data (Col A, excluding Total/empty)
+    const rawDrivers = [];
+    const driverCreditMap = {}; // driver -> dateKey -> credit
+    for (let r = 2; r < rawData.length; r++) {
+        const driverName = (rawData[r][0] || "").toString().trim();
+        if (!driverName || driverName === "Total") continue;
+        rawDrivers.push(driverName);
+        driverCreditMap[driverName] = {};
+
+        dateColumns.forEach(dc => {
+            const credit = parseNumber(rawData[r][dc.colIdx]) || 0;
+            driverCreditMap[driverName][dc.date.getTime()] = credit;
+        });
+    }
+
+    // Read existing entered working hours to preserve them
+    const { map: existingHoursMap } = loadWorkingHoursMap(ss);
+
+    // Build Header
+    const headerRow = ["Driver"];
+    dateColumns.forEach(dc => headerRow.push(dc.headerStr));
+    headerRow.push("Total Hours");
+
+    const numDateCols = dateColumns.length;
+    const lastDateColLetter = getColumnLetter(numDateCols + 1); // Col B is 2
+
+    const matrixRows = [];
+
+    // Build driver rows
+    rawDrivers.forEach((driver, idx) => {
+        const rowIndex = idx + 2; // Row 2 is first driver
+        const row = [driver];
+
+        dateColumns.forEach(dc => {
+            const dateKey = dc.date.getTime();
+            const rawCredit = driverCreditMap[driver] ? driverCreditMap[driver][dateKey] : 0;
+
+            // Existing value takes priority
+            if (existingHoursMap[driver] && existingHoursMap[driver][dateKey] !== undefined) {
+                row.push(existingHoursMap[driver][dateKey]);
+            } else if (rawCredit === 0) {
+                // If $0 in raw data, default to 0 in working time
+                row.push(0);
+            } else {
+                row.push(""); // blank for user to enter working hours
+            }
+        });
+
+        // Formula for Total Hours row
+        row.push(`=SUM(B${rowIndex}:${lastDateColLetter}${rowIndex})`);
+        matrixRows.push(row);
+    });
+
+    // Summary Bottom Row (Total Hours Per Date)
+    const bottomRowIndex = rawDrivers.length + 2;
+    const bottomRow = ["Total Hours"];
+    for (let c = 0; c < numDateCols; c++) {
+        const colLetter = getColumnLetter(c + 2);
+        bottomRow.push(`=SUM(${colLetter}2:${colLetter}${bottomRowIndex - 1})`);
+    }
+    bottomRow.push(`=SUM(B${bottomRowIndex}:${lastDateColLetter}${bottomRowIndex})`);
+    matrixRows.push(bottomRow);
+
+    // Write to Sheet
+    hoursSheet.clear();
+    hoursSheet.getRange(1, 1, 1, headerRow.length).setValues([headerRow]);
+    hoursSheet.getRange(2, 1, matrixRows.length, headerRow.length).setValues(matrixRows);
+
+    // Formatting
+    const numRows = matrixRows.length;
+    const numCols = headerRow.length;
+
+    // Header styling
+    hoursSheet.getRange(1, 1, 1, numCols)
+        .setFontWeight("bold")
+        .setBackground("#3c78d8")
+        .setFontColor("white")
+        .setHorizontalAlignment("center");
+
+    // Matrix numbers format & alignment
+    hoursSheet.getRange(2, 2, numRows, numCols - 1)
+        .setNumberFormat("0.0")
+        .setHorizontalAlignment("center");
+
+    // Driver names column formatting
+    hoursSheet.getRange(2, 1, numRows, 1).setFontWeight("bold");
+
+    // Bottom total row styling
+    hoursSheet.getRange(bottomRowIndex, 1, 1, numCols)
+        .setFontWeight("bold")
+        .setBackground("#d0e0e3")
+        .setBorder(true, true, true, true, true, true, "black", SpreadsheetApp.BorderStyle.SOLID_THICK);
+
+    // Outer and grid borders
+    hoursSheet.getRange(1, 1, numRows + 1, numCols)
+        .setBorder(true, true, true, true, true, true, "black", SpreadsheetApp.BorderStyle.SOLID);
+
+    // Data Validation Rule (0.5 increments for cells B2 to lastDateCol, drivers only)
+    if (rawDrivers.length > 0 && numDateCols > 0) {
+        const firstCell = "B2";
+        const rule = SpreadsheetApp.newDataValidation()
+            .requireFormulaSatisfied(`=AND(ISNUMBER(${firstCell}), ${firstCell}>=0, MOD(${firstCell}*2, 1)=0)`)
+            .setAllowInvalid(true)
+            .setHelpText("Hours must be entered in 0.5 increments (e.g. 0, 0.5, 1, 1.5, 2, ...)")
+            .build();
+
+        hoursSheet.getRange(2, 2, rawDrivers.length, numDateCols).setDataValidation(rule);
+    }
+
+    hoursSheet.autoResizeColumns(1, numCols);
+    for (let c = 1; c <= numCols; c++) {
+        if (hoursSheet.getColumnWidth(c) < 80) hoursSheet.setColumnWidth(c, 80);
+    }
+}
+
+/**
+ * Helper to convert 1-based column index to letter (1->A, 2->B, etc.)
+ */
+function getColumnLetter(colIndex) {
+    let temp = "";
+    let letter = "";
+    while (colIndex > 0) {
+        temp = (colIndex - 1) % 26;
+        letter = String.fromCharCode(65 + temp) + letter;
+        colIndex = (colIndex - temp - 1) / 26;
+    }
+    return letter;
+}
+
 /**
  * Main entry point — runs all reporting functions in the correct order.
  */
 function runDailyBalance() {
     const ss = SpreadsheetApp.openById(TARGET_SHEET_ID);
+
+    // 0. Sync working hours sheet first so downstream reports can use working hours data
+    generateWorkingHoursSheet(ss);
 
     // 1. Update the main Summary sheet from Raw Data.
     updateSummaryAndCharts(ss);
@@ -338,6 +562,7 @@ function updateSummaryAndCharts(ss) {
     const tripsDataMap = loadAuxMap("Raw Data - Trips");
     const netDataMap = loadAuxMap("Raw Data - NET");
     const noShowMap = loadNoShowMap(ss, "No Show");
+    const { map: workingHoursMap, driverTotalHours, dailyTotalHours } = loadWorkingHoursMap(ss);
 
     // --- Read the entire Raw Data sheet ---
     const rawData = rawSheet.getDataRange().getValues();
@@ -519,6 +744,8 @@ function updateSummaryAndCharts(ss) {
                 dailyNoShowCount = noShowMap[driverName][day.dateKey].count;
             }
 
+            const dailyHours = (workingHoursMap[driverName] && workingHoursMap[driverName][day.dateKey]) ? workingHoursMap[driverName][day.dateKey] : 0;
+
             outputRows.push([
                 day.date,
                 driverName,
@@ -527,7 +754,8 @@ function updateSummaryAndCharts(ss) {
                 dailyTrips,
                 driverTotal,
                 driverCash,
-                dailyNoShowCount
+                dailyNoShowCount,
+                dailyHours
             ]);
         });
     }
@@ -545,7 +773,7 @@ function updateSummaryAndCharts(ss) {
     });
 
     // --- Write Summary headers ---
-    const headers = ["Date", "Driver", "Credit", "Trips", "Cash", "No Show", "Balance"];
+    const headers = ["Date", "Driver", "Credit", "Trips", "Cash", "No Show", "Hours", "Balance"];
     summarySheet.getRange(2, 1, 1, headers.length).setValues([headers]);
 
     // --- Read fare settings for balance calculation ---
@@ -607,6 +835,7 @@ function updateSummaryAndCharts(ss) {
         const dailyCash = Number(row[3]) || 0;
         const trips = Number(row[4]) || 0;
         const dailyNoShow = Number(row[7]) || 0;
+        const dailyHours = Number(row[8]) || 0;
 
         let dailyBalance = 0;
         if (fare === "80%-90%") {
@@ -639,7 +868,7 @@ function updateSummaryAndCharts(ss) {
             dailyBalance = Number(roundToTwo((dailyCredit * numericFare) - dailyCash)) || 0;
         }
 
-        // Summary rows: Date, Driver, Credit, Trips, Cash, No Show, Balance
+        // Summary rows: Date, Driver, Credit, Trips, Cash, No Show, Hours, Balance
         rowsToWrite.push([
             displayDate,
             row[1],
@@ -647,6 +876,7 @@ function updateSummaryAndCharts(ss) {
             trips,
             Number(roundToTwo(dailyCash)) || 0,
             dailyNoShow,
+            roundToTwo(dailyHours) || 0,
             dailyBalance
         ]);
     });
@@ -658,11 +888,11 @@ function updateSummaryAndCharts(ss) {
     // --- Clear old data and write new ---
     const maxRows = summarySheet.getMaxRows();
     if (maxRows > 2) {
-        summarySheet.getRange(3, 1, maxRows - 2, 7).clearContent();
+        summarySheet.getRange(3, 1, maxRows - 2, 8).clearContent();
         try { summarySheet.getRange(3, 1, maxRows - 2, 1).breakApart(); } catch (e) { }
     }
 
-    const dataRange = summarySheet.getRange(3, 1, rowsToWrite.length, 7);
+    const dataRange = summarySheet.getRange(3, 1, rowsToWrite.length, 8);
     dataRange.setValues(rowsToWrite);
     dataRange.setBorder(false, false, false, false, false, false);
     dataRange.setBorder(true, true, true, true, true, true, "black", SpreadsheetApp.BorderStyle.SOLID);
@@ -670,7 +900,7 @@ function updateSummaryAndCharts(ss) {
 
     // --- Apply day block borders and merge date cells ---
     dayBlocks.forEach(block => {
-        summarySheet.getRange(block.row, 1, block.count, 7)
+        summarySheet.getRange(block.row, 1, block.count, 8)
             .setBorder(true, null, true, null, null, null, "black", SpreadsheetApp.BorderStyle.SOLID_THICK);
         if (block.count > 1) {
             summarySheet.getRange(block.row, 1, block.count, 1).mergeVertically();
@@ -713,6 +943,9 @@ function updateSummaryAndCharts(ss) {
             }
         });
 
+        const driverHours = driverTotalHours[driverName] || 0;
+        const avgPerHour = driverHours > 0 ? roundToTwo(driverTotal / driverHours) : 0;
+
         driverStats[driverName] = {
             totalCredit: roundToTwo(driverTotal),
             totalTrips: driverTrips,
@@ -721,6 +954,8 @@ function updateSummaryAndCharts(ss) {
             driverNet: roundToTwo(driverNet),
             workingDays: workingDays,
             avgPerDay: workingDays > 0 ? roundToTwo(driverTotal / workingDays) : 0,
+            totalHours: driverHours,
+            avgPerHour: avgPerHour,
             firstWorkDate: firstWorkDate
         };
     }
@@ -731,14 +966,14 @@ function updateSummaryAndCharts(ss) {
     // (settingsSheet and existingFares already read above for balance calc)
 
     // --- Aggregated stats table (column I, one gap after the 7-col main table) ---
-    const aggHeader = ["Driver", "Total Credit", "Total Trips", "Total Cash", "No Show", "Driver NET", "Avg Per Day"];
+    const aggHeader = ["Driver", "Total Credit", "Total Trips", "Total Cash", "No Show", "Total Hours", "Avg Per Hour", "Driver NET", "Avg Per Day"];
     const aggRows = [aggHeader];
 
     const newSettingsRows = [["Driver", "Fare %"]];
 
     for (let driver in driverStats) {
         const s = driverStats[driver];
-        aggRows.push([driver, s.totalCredit, s.totalTrips, s.totalCash, s.totalNoShow, s.driverNet, s.avgPerDay]);
+        aggRows.push([driver, s.totalCredit, s.totalTrips, s.totalCash, s.totalNoShow, s.totalHours, s.avgPerHour, s.driverNet, s.avgPerDay]);
 
         let fare = existingFares[driver];
         if (fare === undefined || fare === null || fare === "") {
@@ -762,7 +997,7 @@ function updateSummaryAndCharts(ss) {
     // =================================================================
     // --- Write aggregated stats to Summary (column I = one gap after 7-col main table) ---
     // =================================================================
-    const startRow = 3, startCol = 9; // Column I (A-G = main table, H = gap)
+    const startRow = 3, startCol = 10; // Column J (A-H = 8-col main table, I = 1-col gap)
     // Clear old aggregate area
     try { summarySheet.getRange(startRow, startCol, 50, 10).clearContent(); } catch (e) { }
 
@@ -775,20 +1010,21 @@ function updateSummaryAndCharts(ss) {
         if (!dateVal) return;
         const dateKey = dateVal.getTime();
         if (!dailyStats[dateKey]) {
-            dailyStats[dateKey] = { date: dateVal, credit: 0, trips: 0, cash: 0, noShow: 0 };
+            dailyStats[dateKey] = { date: dateVal, credit: 0, trips: 0, cash: 0, noShow: 0, hours: 0 };
         }
         dailyStats[dateKey].credit += (r[2] || 0);
         dailyStats[dateKey].trips += (r[4] || 0);
         dailyStats[dateKey].cash += (r[3] || 0);
         dailyStats[dateKey].noShow += (r[7] || 0); // r[7] is No Show
+        dailyStats[dateKey].hours += (dailyTotalHours[dateKey] || 0);
     });
 
     const dailyRows = Object.values(dailyStats)
         .sort((a, b) => a.date - b.date)
-        .map(d => [d.date, roundToTwo(d.credit), d.trips, roundToTwo(d.cash), d.noShow]);
+        .map(d => [d.date, roundToTwo(d.credit), d.trips, roundToTwo(d.cash), d.noShow, roundToTwo(d.hours)]);
 
-    const dailyHeader = ["Date", "Total Credit", "Trips", "Cash", "No Show"];
-    const dailyStartCol = startCol + aggRows[0].length + 1; // One gap after aggregate table
+    const dailyHeader = ["Date", "Total Credit", "Trips", "Cash", "No Show", "Total Hours"];
+    const dailyStartCol = startCol + aggRows[0].length + 1; // One gap after aggregate table (Column T)
 
     summarySheet.getRange(2, dailyStartCol, 100, 7).clearContent();
     summarySheet.getRange(2, dailyStartCol, 1, dailyHeader.length).setValues([dailyHeader]).setFontWeight("bold");
@@ -802,9 +1038,9 @@ function updateSummaryAndCharts(ss) {
     const allCharts = summarySheet.getCharts();
     allCharts.forEach(c => summarySheet.removeChart(c));
 
-    // Chart 1: Daily Total Credit Trend (line) — positioned NEXT TO the daily credit table
+    // Chart 1: Daily Total Credit Trend (line) — positioned NEXT TO the daily credit table (1 col gap Z)
     if (dailyRows.length > 0) {
-        const dailyChartCol = dailyStartCol + 6; // Shifted right to accommodate the 5-column daily table
+        const dailyChartCol = dailyStartCol + 7; // Col 27 (AA)
         let dailyChart = summarySheet.newChart()
             .setChartType(Charts.ChartType.LINE)
             .addRange(summarySheet.getRange(3, dailyStartCol, dailyRows.length, 1))
@@ -825,12 +1061,16 @@ function updateSummaryAndCharts(ss) {
 
     const lastRow = startRow + aggRows.length - 1;
     const dataStart = startRow + 1;
-    // Build column letters from startCol for chart ranges
-    const colF = String.fromCharCode(64 + startCol);         // I (Driver)
-    const colG = String.fromCharCode(64 + startCol + 1);     // J (Total Credit)
-    const colH = String.fromCharCode(64 + startCol + 2);     // K (Total Trips)
-    const colNoShow = String.fromCharCode(64 + startCol + 4); // M (No Show)
-    const colK = String.fromCharCode(64 + startCol + 6);     // O (Avg Per Day) - 6 columns offset
+    // Build column letters from startCol (10 = J) for chart ranges
+    const colF = String.fromCharCode(64 + startCol);         // J (Driver)
+    const colG = String.fromCharCode(64 + startCol + 1);     // K (Total Credit)
+    const colH = String.fromCharCode(64 + startCol + 2);     // L (Total Trips)
+    const colNoShow = String.fromCharCode(64 + startCol + 4); // N (No Show)
+    const colHours = String.fromCharCode(64 + startCol + 5);  // O (Total Hours)
+    const colK = String.fromCharCode(64 + startCol + 8);     // R (Avg Per Day)
+
+    // Position column charts cleanly below the aggregated stats table
+    const chartStartRow = lastRow + 3;
 
     // Chart 2: Total Credit by Driver (bar)
     let chart1 = summarySheet.newChart().setChartType(Charts.ChartType.COLUMN)
@@ -842,7 +1082,7 @@ function updateSummaryAndCharts(ss) {
         .setOption("vAxis", { title: "Credit" })
         .setOption("width", 720)
         .setOption("height", 450)
-        .setPosition(3, startCol, 0, 0).build();
+        .setPosition(chartStartRow, startCol, 0, 0).build();
     summarySheet.insertChart(chart1);
 
     // Chart 3: Total Trips by Driver (bar)
@@ -855,7 +1095,7 @@ function updateSummaryAndCharts(ss) {
         .setOption("vAxis", { title: "Trips" })
         .setOption("width", 720)
         .setOption("height", 450)
-        .setPosition(27, startCol, 0, 0).build();
+        .setPosition(chartStartRow + 24, startCol, 0, 0).build();
     summarySheet.insertChart(chart2);
 
     // Chart 4: No Show by Driver (bar)
@@ -868,10 +1108,23 @@ function updateSummaryAndCharts(ss) {
         .setOption("vAxis", { title: "No Show Trips" })
         .setOption("width", 720)
         .setOption("height", 450)
-        .setPosition(51, startCol, 0, 0).build();
+        .setPosition(chartStartRow + 48, startCol, 0, 0).build();
     summarySheet.insertChart(chartNoShow);
 
-    // Chart 5: Average Per Day by Driver (bar)
+    // Chart 5: Total Working Hours by Driver (bar)
+    let chartHours = summarySheet.newChart().setChartType(Charts.ChartType.COLUMN)
+        .addRange(summarySheet.getRange(colF + dataStart + ":" + colF + lastRow))
+        .addRange(summarySheet.getRange(colHours + dataStart + ":" + colHours + lastRow))
+        .setOption("title", "Total Working Hours by Driver")
+        .setOption("titleTextStyle", { bold: true, fontSize: 24 })
+        .setOption("colors", ["#ff7f0e"]).setOption("legend", { position: "none" })
+        .setOption("vAxis", { title: "Hours" })
+        .setOption("width", 720)
+        .setOption("height", 450)
+        .setPosition(chartStartRow + 72, startCol, 0, 0).build();
+    summarySheet.insertChart(chartHours);
+
+    // Chart 6: Average Per Day by Driver (bar)
     let chart3 = summarySheet.newChart().setChartType(Charts.ChartType.COLUMN)
         .addRange(summarySheet.getRange(colF + dataStart + ":" + colF + lastRow))
         .addRange(summarySheet.getRange(colK + dataStart + ":" + colK + lastRow))
@@ -881,7 +1134,7 @@ function updateSummaryAndCharts(ss) {
         .setOption("vAxis", { title: "Daily Credit" })
         .setOption("width", 720)
         .setOption("height", 450)
-        .setPosition(75, startCol, 0, 0).build();
+        .setPosition(chartStartRow + 96, startCol, 0, 0).build();
     summarySheet.insertChart(chart3);
 }
 
@@ -987,6 +1240,9 @@ function generateWeeklySummary(ss) {
         } catch (e) { }
     }
 
+    // --- Load Working Hours ---
+    const { map: workingHoursMap } = loadWorkingHoursMap(ss);
+
     // --- Process Data ---
     const weeklyData = {};
     const dateIdx = 0, driverIdx = 1, creditIdx = 2, tripsIdx = 3, cashIdx = 4;
@@ -1006,14 +1262,18 @@ function generateWeeklySummary(ss) {
         weekEnd.setDate(weekEnd.getDate() + 6);
         const weekKey = `${formatDate(weekStart)} - ${formatDate(weekEnd)}`;
 
+        const dateKey = new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime();
+        const dayHours = (workingHoursMap[driver] && workingHoursMap[driver][dateKey]) ? workingHoursMap[driver][dateKey] : 0;
+
         if (!weeklyData[weekKey]) weeklyData[weekKey] = {};
         if (!weeklyData[weekKey][driver]) {
-            weeklyData[weekKey][driver] = { credit: 0, trips: 0, cash: 0 };
+            weeklyData[weekKey][driver] = { credit: 0, trips: 0, cash: 0, hours: 0 };
         }
 
         weeklyData[weekKey][driver].credit += credit;
         weeklyData[weekKey][driver].trips += trips;
         weeklyData[weekKey][driver].cash += cash;
+        weeklyData[weekKey][driver].hours += dayHours;
     });
 
     // --- Write Output ---
@@ -1036,7 +1296,7 @@ function generateWeeklySummary(ss) {
             const weekBlock = weeklyData[weekKey];
             const startRow = currentRow;
 
-            const titleRange = weeklySheet.getRange(currentRow, 1, 1, 5).merge();
+            const titleRange = weeklySheet.getRange(currentRow, 1, 1, 7).merge();
             titleRange.setValue(`WEEK ${displayedWeekCounter} (${weekKey})`)
                 .setFontWeight("bold")
                 .setFontSize(11)
@@ -1044,8 +1304,8 @@ function generateWeeklySummary(ss) {
 
             currentRow++;
 
-            const headerRange = weeklySheet.getRange(currentRow, 1, 1, 5);
-            headerRange.setValues([["Driver", "Total Credit", "Trips", "Total Cash", "Balance"]])
+            const headerRange = weeklySheet.getRange(currentRow, 1, 1, 7);
+            headerRange.setValues([["Driver", "Total Credit", "Trips", "Total Cash", "Total Hours", "Avg Per Hour", "Balance"]])
                 .setFontWeight("bold")
                 .setBackground("#3c78d8")
                 .setFontColor("white")
@@ -1074,36 +1334,43 @@ function generateWeeklySummary(ss) {
                 }
 
                 const balance = roundToTwo(grossPayout - cash);
-                tableData.push([d, info.credit, info.trips, cash, balance]);
+                const avgPerHour = info.hours > 0 ? roundToTwo(info.credit / info.hours) : 0;
+                tableData.push([d, info.credit, info.trips, cash, roundToTwo(info.hours), avgPerHour, balance]);
             });
 
             // Write Main Table
-            const dataRange = weeklySheet.getRange(currentRow, 1, tableData.length, 5);
+            const dataRange = weeklySheet.getRange(currentRow, 1, tableData.length, 7);
             dataRange.setValues(tableData);
             dataRange.setBorder(true, true, true, true, true, true, "black", SpreadsheetApp.BorderStyle.SOLID);
 
             weeklySheet.getRange(currentRow, 2, tableData.length, 1).setNumberFormat("$#,##0.00");
-            weeklySheet.getRange(currentRow, 4, tableData.length, 2).setNumberFormat("$#,##0.00");
+            weeklySheet.getRange(currentRow, 4, tableData.length, 1).setNumberFormat("$#,##0.00");
+            weeklySheet.getRange(currentRow, 5, tableData.length, 1).setNumberFormat("0.0");
+            weeklySheet.getRange(currentRow, 6, tableData.length, 2).setNumberFormat("$#,##0.00");
 
             const totalCredit = tableData.reduce((a, b) => a + b[1], 0);
             const totalTrips = tableData.reduce((a, b) => a + b[2], 0);
             const totalCash = tableData.reduce((a, b) => a + b[3], 0);
-            const totalBalance = tableData.reduce((a, b) => a + b[4], 0);
+            const totalHours = tableData.reduce((a, b) => a + b[4], 0);
+            const totalAvgPerHour = totalHours > 0 ? roundToTwo(totalCredit / totalHours) : 0;
+            const totalBalance = tableData.reduce((a, b) => a + b[6], 0);
 
-            const totalRowRange = weeklySheet.getRange(currentRow + tableData.length, 1, 1, 5);
-            totalRowRange.setValues([["TOTAL", totalCredit, totalTrips, totalCash, totalBalance]])
+            const totalRowRange = weeklySheet.getRange(currentRow + tableData.length, 1, 1, 7);
+            totalRowRange.setValues([["TOTAL", totalCredit, totalTrips, totalCash, roundToTwo(totalHours), totalAvgPerHour, totalBalance]])
                 .setFontWeight("bold")
                 .setBackground("#eeeeee")
                 .setBorder(true, true, true, true, true, true);
 
             weeklySheet.getRange(currentRow + tableData.length, 2, 1, 1).setNumberFormat("$#,##0.00");
-            weeklySheet.getRange(currentRow + tableData.length, 4, 1, 2).setNumberFormat("$#,##0.00");
+            weeklySheet.getRange(currentRow + tableData.length, 4, 1, 1).setNumberFormat("$#,##0.00");
+            weeklySheet.getRange(currentRow + tableData.length, 5, 1, 1).setNumberFormat("0.0");
+            weeklySheet.getRange(currentRow + tableData.length, 6, 1, 2).setNumberFormat("$#,##0.00");
 
             const tableEnd = currentRow + tableData.length;
 
-            // Chart 1: Total Credit by Driver
+            // Chart 1: Total Credit by Driver (Shifted 1 empty cell gap away from table: Col I = col 9)
             const chart1 = weeklySheet.newChart().asColumnChart()
-                .setPosition(startRow - 1, 7, 0, 0)
+                .setPosition(startRow - 1, 9, 0, 0)
                 .addRange(weeklySheet.getRange(currentRow, 1, tableData.length, 2))
                 .setOption("title", `WEEK ${displayedWeekCounter} - Total Credit`)
                 .setOption("colors", ["#1f77b4"])
@@ -1113,9 +1380,9 @@ function generateWeeklySummary(ss) {
                 .build();
             weeklySheet.insertChart(chart1);
 
-            // Chart 2: Trips by Driver
+            // Chart 2: Trips by Driver (Shifted 1 empty cell gap away from Chart 1: Col P = col 16)
             const chart2 = weeklySheet.newChart().asColumnChart()
-                .setPosition(startRow - 1, 13, 0, 0) // Place at column M
+                .setPosition(startRow - 1, 16, 0, 0)
                 .addRange(weeklySheet.getRange(currentRow, 1, tableData.length, 1)) // Driver Names
                 .addRange(weeklySheet.getRange(currentRow, 3, tableData.length, 1)) // Trips
                 .setOption("title", `WEEK ${displayedWeekCounter} - Trips`)
