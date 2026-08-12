@@ -461,8 +461,10 @@ function generateWorkingHoursSheet(ss) {
     hoursSheet.getRange(1, 1, numRows + 1, numCols)
         .setBorder(true, true, true, true, true, true, "black", SpreadsheetApp.BorderStyle.SOLID);
 
-    // Data Validation Rule (0.5 increments for cells B2 to lastDateCol, drivers only)
+    // Data Validation & Conditional Formatting Rules (cells B2 to lastDateCol, drivers only)
     if (rawDrivers.length > 0 && numDateCols > 0) {
+        const matrixRange = hoursSheet.getRange(2, 2, rawDrivers.length, numDateCols);
+
         const firstCell = "B2";
         const rule = SpreadsheetApp.newDataValidation()
             .requireFormulaSatisfied(`=AND(ISNUMBER(${firstCell}), ${firstCell}>=0, MOD(${firstCell}*2, 1)=0)`)
@@ -470,7 +472,31 @@ function generateWorkingHoursSheet(ss) {
             .setHelpText("Hours must be entered in 0.5 increments (e.g. 0, 0.5, 1, 1.5, 2, ...)")
             .build();
 
-        hoursSheet.getRange(2, 2, rawDrivers.length, numDateCols).setDataValidation(rule);
+        matrixRange.setDataValidation(rule);
+
+        // Conditional Formatting Rules: 0 = Red, < 8 = Yellow, >= 8 = Green
+        const redRule = SpreadsheetApp.newConditionalFormatRule()
+            .whenNumberEqualTo(0)
+            .setBackground("#f4cccc") // Soft pastel red
+            .setFontColor("#990000") // Dark red text
+            .setRanges([matrixRange])
+            .build();
+
+        const yellowRule = SpreadsheetApp.newConditionalFormatRule()
+            .whenNumberBetween(0.001, 7.999)
+            .setBackground("#fff2cc") // Soft pastel yellow
+            .setFontColor("#7f6000") // Dark yellow/brown text
+            .setRanges([matrixRange])
+            .build();
+
+        const greenRule = SpreadsheetApp.newConditionalFormatRule()
+            .whenNumberGreaterThanOrEqualTo(8)
+            .setBackground("#d9ead3") // Soft pastel green
+            .setFontColor("#274e13") // Dark green text
+            .setRanges([matrixRange])
+            .build();
+
+        hoursSheet.setConditionalFormatRules([redRule, yellowRule, greenRule]);
     }
 
     hoursSheet.autoResizeColumns(1, numCols);
