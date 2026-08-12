@@ -1035,9 +1035,10 @@ function updateSummaryAndCharts(ss) {
         .map(d => [d.date, roundToTwo(d.credit), d.trips, roundToTwo(d.cash), d.noShow, roundToTwo(d.hours)]);
 
     const dailyHeader = ["Date", "Total Credit", "Trips", "Cash", "No Show", "Total Hours"];
-    const dailyStartCol = 23; // Column W (Daily total summary table starts at Column W)
+    const dailyStartCol = 21; // Column U (Daily total summary table starts at Column U)
 
-    summarySheet.getRange(2, dailyStartCol, 100, 7).clearContent();
+    // Clear old daily table and chart area starting from Column T (col 20)
+    summarySheet.getRange(2, 20, 100, 20).clearContent();
     summarySheet.getRange(2, dailyStartCol, 1, dailyHeader.length).setValues([dailyHeader]).setFontWeight("bold");
 
     if (dailyRows.length > 0) {
@@ -1049,9 +1050,9 @@ function updateSummaryAndCharts(ss) {
     const allCharts = summarySheet.getCharts();
     allCharts.forEach(c => summarySheet.removeChart(c));
 
-    // Chart 1: Daily Total Credit Trend (line) — positioned NEXT TO the daily credit table (Col AD = 30)
+    // Chart 1: Daily Total Credit Trend (line) — positioned NEXT TO the daily credit table (Col AB = 28)
     if (dailyRows.length > 0) {
-        const dailyChartCol = dailyStartCol + 7; // Col 30 (AD)
+        const dailyChartCol = dailyStartCol + 7; // Col 28 (AB)
         let dailyChart = summarySheet.newChart()
             .setChartType(Charts.ChartType.LINE)
             .addRange(summarySheet.getRange(3, dailyStartCol, dailyRows.length, 1))
@@ -1088,7 +1089,7 @@ function updateSummaryAndCharts(ss) {
         .setOption("titleTextStyle", { bold: true, fontSize: 24 })
         .setOption("colors", ["#1f77b4"]).setOption("legend", { position: "none" })
         .setOption("vAxis", { title: "Credit" })
-        .setOption("width", 680)
+        .setOption("width", 550)
         .setOption("height", 450)
         .setPosition(3, startCol, 0, 0).build();
     summarySheet.insertChart(chart1);
@@ -1101,7 +1102,7 @@ function updateSummaryAndCharts(ss) {
         .setOption("titleTextStyle", { bold: true, fontSize: 24 })
         .setOption("colors", ["#8c564b"]).setOption("legend", { position: "none" })
         .setOption("vAxis", { title: "Trips" })
-        .setOption("width", 680)
+        .setOption("width", 550)
         .setOption("height", 450)
         .setPosition(26, startCol, 0, 0).build();
     summarySheet.insertChart(chart2);
@@ -1114,7 +1115,7 @@ function updateSummaryAndCharts(ss) {
         .setOption("titleTextStyle", { bold: true, fontSize: 24 })
         .setOption("colors", ["#2ca02c"]).setOption("legend", { position: "none" })
         .setOption("vAxis", { title: "No Show Trips" })
-        .setOption("width", 680)
+        .setOption("width", 550)
         .setOption("height", 450)
         .setPosition(49, startCol, 0, 0).build();
     summarySheet.insertChart(chartNoShow);
@@ -1127,7 +1128,7 @@ function updateSummaryAndCharts(ss) {
         .setOption("titleTextStyle", { bold: true, fontSize: 24 })
         .setOption("colors", ["#ff7f0e"]).setOption("legend", { position: "none" })
         .setOption("vAxis", { title: "Hours" })
-        .setOption("width", 680)
+        .setOption("width", 550)
         .setOption("height", 450)
         .setPosition(72, startCol, 0, 0).build();
     summarySheet.insertChart(chartHours);
@@ -1140,7 +1141,7 @@ function updateSummaryAndCharts(ss) {
         .setOption("titleTextStyle", { bold: true, fontSize: 24 })
         .setOption("colors", ["#d62728"]).setOption("legend", { position: "none" })
         .setOption("vAxis", { title: "Daily Credit" })
-        .setOption("width", 680)
+        .setOption("width", 550)
         .setOption("height", 450)
         .setPosition(95, startCol, 0, 0).build();
     summarySheet.insertChart(chart3);
