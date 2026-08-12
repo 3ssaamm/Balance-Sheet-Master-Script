@@ -1089,7 +1089,7 @@ function updateSummaryAndCharts(ss) {
         .setOption("titleTextStyle", { bold: true, fontSize: 24 })
         .setOption("colors", ["#1f77b4"]).setOption("legend", { position: "none" })
         .setOption("vAxis", { title: "Credit" })
-        .setOption("width", 550)
+        .setOption("width", 740)
         .setOption("height", 450)
         .setPosition(3, startCol, 0, 0).build();
     summarySheet.insertChart(chart1);
@@ -1102,7 +1102,7 @@ function updateSummaryAndCharts(ss) {
         .setOption("titleTextStyle", { bold: true, fontSize: 24 })
         .setOption("colors", ["#8c564b"]).setOption("legend", { position: "none" })
         .setOption("vAxis", { title: "Trips" })
-        .setOption("width", 550)
+        .setOption("width", 740)
         .setOption("height", 450)
         .setPosition(26, startCol, 0, 0).build();
     summarySheet.insertChart(chart2);
@@ -1115,7 +1115,7 @@ function updateSummaryAndCharts(ss) {
         .setOption("titleTextStyle", { bold: true, fontSize: 24 })
         .setOption("colors", ["#2ca02c"]).setOption("legend", { position: "none" })
         .setOption("vAxis", { title: "No Show Trips" })
-        .setOption("width", 550)
+        .setOption("width", 740)
         .setOption("height", 450)
         .setPosition(49, startCol, 0, 0).build();
     summarySheet.insertChart(chartNoShow);
@@ -1128,7 +1128,7 @@ function updateSummaryAndCharts(ss) {
         .setOption("titleTextStyle", { bold: true, fontSize: 24 })
         .setOption("colors", ["#ff7f0e"]).setOption("legend", { position: "none" })
         .setOption("vAxis", { title: "Hours" })
-        .setOption("width", 550)
+        .setOption("width", 740)
         .setOption("height", 450)
         .setPosition(72, startCol, 0, 0).build();
     summarySheet.insertChart(chartHours);
@@ -1141,7 +1141,7 @@ function updateSummaryAndCharts(ss) {
         .setOption("titleTextStyle", { bold: true, fontSize: 24 })
         .setOption("colors", ["#d62728"]).setOption("legend", { position: "none" })
         .setOption("vAxis", { title: "Daily Credit" })
-        .setOption("width", 550)
+        .setOption("width", 740)
         .setOption("height", 450)
         .setPosition(95, startCol, 0, 0).build();
     summarySheet.insertChart(chart3);
