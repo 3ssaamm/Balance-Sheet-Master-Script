@@ -1403,32 +1403,38 @@ function generateWeeklySummary(ss) {
 
             const tableEnd = currentRow + tableData.length;
 
-            // Chart 1: Total Credit by Driver (Shifted 1 empty cell gap away from table: Col I = col 9)
+            // Chart 1: Total Credit by Driver (Col I = col 9, width 480px, height 310px)
             const chart1 = weeklySheet.newChart().asColumnChart()
                 .setPosition(startRow - 1, 9, 0, 0)
-                .addRange(weeklySheet.getRange(currentRow, 1, tableData.length, 2))
+                .addRange(weeklySheet.getRange(currentRow - 1, 1, tableData.length + 1, 2))
+                .setNumHeaders(1)
                 .setOption("title", `WEEK ${displayedWeekCounter} - Total Credit`)
                 .setOption("colors", ["#1f77b4"])
                 .setOption("legend", { position: "none" })
                 .setOption("hAxis", { title: "Driver" })
                 .setOption("vAxis", { title: "Total Credit" })
+                .setOption("width", 480)
+                .setOption("height", 310)
                 .build();
             weeklySheet.insertChart(chart1);
 
-            // Chart 2: Trips by Driver (Shifted 1 empty cell gap away from Chart 1: Col P = col 16)
+            // Chart 2: Trips by Driver (Col N = col 14, width 480px, height 310px)
             const chart2 = weeklySheet.newChart().asColumnChart()
-                .setPosition(startRow - 1, 16, 0, 0)
-                .addRange(weeklySheet.getRange(currentRow, 1, tableData.length, 1)) // Driver Names
-                .addRange(weeklySheet.getRange(currentRow, 3, tableData.length, 1)) // Trips
+                .setPosition(startRow - 1, 14, 0, 0)
+                .addRange(weeklySheet.getRange(currentRow - 1, 1, tableData.length + 1, 1)) // Driver Names
+                .addRange(weeklySheet.getRange(currentRow - 1, 3, tableData.length + 1, 1)) // Trips
+                .setNumHeaders(1)
                 .setOption("title", `WEEK ${displayedWeekCounter} - Trips`)
                 .setOption("colors", ["#8c564b"]) // Distinct brown color
                 .setOption("legend", { position: "none" })
                 .setOption("hAxis", { title: "Driver" })
                 .setOption("vAxis", { title: "Trips" })
+                .setOption("width", 480)
+                .setOption("height", 310)
                 .build();
             weeklySheet.insertChart(chart2);
 
-            currentRow = Math.max(tableEnd + 2, startRow + 22);
+            currentRow = Math.max(tableEnd + 2, startRow + 16);
         }
     });
 }
