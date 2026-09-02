@@ -3,7 +3,7 @@
 // =================================================================
 // Change this ID each time you switch to a new monthly balance file.
 // This is the ONLY line you need to update.
-const TARGET_SHEET_ID = "11kVXSdzjkha9MdNHt_AOfSskct-5hj91cLhOlfDVu_A";
+const TARGET_SHEET_ID = "1kCE23R_uDKgRRukvxPNcusFFeD3yxivEjbaY5kHLE4M";
 
 // =================================================================
 // MENU — Appears at top of the Google Sheets menu bar when the
@@ -1233,6 +1233,9 @@ function generateWeeklySummary(ss) {
         currentYear = currentYear + 1;
     }
 
+    // --- Load Working Hours for Current Month ---
+    const { map: workingHoursMap } = loadWorkingHoursMap(ss);
+
     // --- Look Back Logic ---
     const firstOfMonth = new Date(Date.parse(`${currentMonthName} 1, ${currentYear}`));
     const currentMonthIndex = firstOfMonth.getMonth();
@@ -1270,13 +1273,22 @@ function generateWeeklySummary(ss) {
                         return d && d >= firstWeekMonday && d < firstOfMonth;
                     });
                     allRows = [...crossoverRows, ...allRows];
+
+                    // --- Also merge Working Hours from Previous Month ---
+                    const { map: prevHoursMap } = loadWorkingHoursMap(prevSpreadsheet);
+                    for (const prevDriver in prevHoursMap) {
+                        const mappedDriver = matchOldDriverName(prevDriver, currentDrivers);
+                        if (!workingHoursMap[mappedDriver]) {
+                            workingHoursMap[mappedDriver] = {};
+                        }
+                        for (const dateKey in prevHoursMap[prevDriver]) {
+                            workingHoursMap[mappedDriver][dateKey] = prevHoursMap[prevDriver][dateKey];
+                        }
+                    }
                 }
             }
         } catch (e) { }
     }
-
-    // --- Load Working Hours ---
-    const { map: workingHoursMap } = loadWorkingHoursMap(ss);
 
     // --- Process Data ---
     const weeklyData = {};
