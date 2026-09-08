@@ -55,119 +55,78 @@ function importNetData() {
     const rawSheet = ss.getSheetByName("Raw Data");
     if (!rawSheet) { Logger.log('❌ Sheet "Raw Data" not found.'); return; }
 
-    // --- Read the NET sheet (same 3-col summary structure as Raw Data) ---
-    const netData = netSheet.getDataRange().getValues();
-    const netHeaders = netSheet.getRange(1, 1, 1, netSheet.getLastColumn()).getDisplayValues()[0];
-    const numNetCols = netHeaders.length;
-
-    // The NET sheet has the same trailing 3 summary columns as Raw Data:
-    //   n-3 = Total NET  |  n-2 = Count  |  n-1 = Driver NET
-    // We want "Driver NET" (n-1) as the definitive monthly NET per driver.
-    // First try to find the column by header label; fall back to n-1.
-    const netDriverNetColIdx = findColByLabel(netHeaders, ['driver net', 'net'], numNetCols - 1);
-    Logger.log(`NET sheet: using column index ${netDriverNetColIdx} ("${netHeaders[netDriverNetColIdx]}") as Driver NET source.`);
-
-    // Date columns: everything before the first non-date summary column
-    const netDateCols = [];
-    for (let c = 1; c < numNetCols - 3; c++) {   // stop 3 before end (same as Raw Data)
-        const dateVal = parseDDMMYY(netHeaders[c]);
-        if (dateVal) netDateCols.push({ colIdx: c, date: dateVal, headerStr: netHeaders[c] });
-    }
-    // Also try the last 3 cols in case the sheet has fewer summary cols
-    if (netDateCols.length === 0) {
-        for (let c = 1; c < numNetCols - 1; c++) {
-            const dateVal = parseDDMMYY(netHeaders[c]);
-            if (dateVal) netDateCols.push({ colIdx: c, date: dateVal, headerStr: netHeaders[c] });
-        }
-    }
-    if (netDateCols.length === 0) {
-        Logger.log('⚠️ No valid date columns found in "Raw Data - NET". Column headers must be DD-MM-YY (e.g., 01-06-26).');
+    const rawWeeks = parseRawDataWeeks(rawSheet);
+    if (rawWeeks.length === 0) {
+        Logger.log('⚠️ No valid week tables found in "Raw Data".');
         return;
     }
 
-    // --- Build driver → row maps ---
-    const netDriverRowMap = {};
-    for (let r = 2; r < netData.length; r++) {
-        const name = (netData[r][0] || '').toString().trim();
-        if (name && name !== 'Total') netDriverRowMap[name] = r;
-    }
-
-    const rawHeaders = rawSheet.getRange(1, 1, 1, rawSheet.getLastColumn()).getDisplayValues()[0];
-    const rawNumCols = rawHeaders.length;
-    const rawTotalColIdx = rawNumCols - 3;   // 0-based
-    const rawNetColIdx = rawNumCols - 1;   // 0-based ("Driver NET" in Raw Data)
-
-    const rawData = rawSheet.getDataRange().getValues();
-    const rawDriverRowMap = {};
-    for (let r = 2; r < rawData.length; r++) {
-        const name = (rawData[r][0] || '').toString().trim();
-        if (name && name !== 'Total') rawDriverRowMap[name] = r;
-    }
-
-    // Build date-column map for Raw Data
-    const rawDateColMap = {};
-    for (let c = 1; c < rawTotalColIdx; c++) {
-        const d = parseDDMMYY(rawHeaders[c]);
-        if (d) rawDateColMap[d.getTime()] = c;
-    }
-
-    let insertedCols = 0;
-
-    // --- Insert any missing date columns into Raw Data ---
-    netDateCols.forEach(netDc => {
-        const dateKey = netDc.date.getTime();
-        if (rawDateColMap[dateKey] === undefined) {
-            const insertAt = rawSheet.getLastColumn() - 2; // before summary cols
-            rawSheet.insertColumnBefore(insertAt);
-            rawSheet.getRange(1, insertAt).setValue(netDc.headerStr);
-            // Fill credit = 0 for all driver rows (credit unknown from NET alone)
-            for (let r = 2; r < rawData.length; r++) {
-                const name = (rawData[r][0] || '').toString().trim();
-                if (name) rawSheet.getRange(r + 1, insertAt).setValue(0);
-            }
-            rawDateColMap[dateKey] = insertAt - 1;
-            insertedCols++;
-            Logger.log(`📅 Inserted missing date column: ${netDc.headerStr}`);
-        }
-    });
-
-    // --- Update "Driver NET" column in Raw Data with total from NET sheet ---
-    // Re-read headers after possible column insertions
-    const finalRawHeaders = rawSheet.getRange(1, 1, 1, rawSheet.getLastColumn()).getDisplayValues()[0];
-    const finalRawNetColIdx = finalRawHeaders.length - 1; // last col = Driver NET (1-indexed: +1)
-
+    const netWeeks = parseRawDataWeeks(netSheet);
     let updatedDrivers = 0;
-    for (const driverName in netDriverRowMap) {
-        const netRowIdx = netDriverRowMap[driverName];
-        const totalNet = parseNumber(netData[netRowIdx][netDriverNetColIdx]) || 0;
-        const rawRowIdx = rawDriverRowMap[driverName];
-        if (rawRowIdx === undefined) {
-            Logger.log(`⚠️ Driver "${driverName}" found in NET sheet but not in Raw Data — skipped.`);
-            continue;
+
+    if (netWeeks.length > 0) {
+        // Multi-week vertical tables in NET sheet
+        rawWeeks.forEach((rawW, wIdx) => {
+            const netW = netWeeks[wIdx];
+            if (!netW) return;
+
+            const netDriverMap = {};
+            netW.drivers.forEach(d => {
+                netDriverMap[d.name.toLowerCase()] = d.weeklyNet;
+            });
+
+            rawW.drivers.forEach(rawD => {
+                const canon = rawD.name.toLowerCase();
+                let netVal = netDriverMap[canon];
+                if (netVal === undefined) {
+                    // Try middle-initial-free match
+                    for (const netName in netDriverMap) {
+                        if (netName.replace(/\s+[a-z]\.?\s+/g, ' ') === canon.replace(/\s+[a-z]\.?\s+/g, ' ')) {
+                            netVal = netDriverMap[netName];
+                            break;
+                        }
+                    }
+                }
+                if (netVal !== undefined) {
+                    rawSheet.getRange(rawD.rowIdx + 1, rawW.netColIdx + 1).setValue(netVal);
+                    updatedDrivers++;
+                }
+            });
+        });
+    } else {
+        // Fallback: single table in NET sheet
+        const netData = netSheet.getDataRange().getValues();
+        const netHeaders = netSheet.getRange(1, 1, 1, netSheet.getLastColumn()).getDisplayValues()[0];
+        const netDriverNetColIdx = findColByLabel(netHeaders, ['driver net', 'net'], netHeaders.length - 1);
+
+        const netDriverMap = {};
+        for (let r = 2; r < netData.length; r++) {
+            const name = (netData[r][0] || '').toString().trim();
+            if (name && name !== 'Total') {
+                netDriverMap[name.toLowerCase()] = parseNumber(netData[r][netDriverNetColIdx]) || 0;
+            }
         }
-        rawSheet.getRange(rawRowIdx + 1, finalRawNetColIdx + 1).setValue(totalNet);
-        updatedDrivers++;
+
+        rawWeeks.forEach(rawW => {
+            rawW.drivers.forEach(rawD => {
+                const canon = rawD.name.toLowerCase();
+                let netVal = netDriverMap[canon];
+                if (netVal !== undefined) {
+                    rawSheet.getRange(rawD.rowIdx + 1, rawW.netColIdx + 1).setValue(netVal);
+                    updatedDrivers++;
+                }
+            });
+        });
     }
 
     SpreadsheetApp.flush();
-    Logger.log(`✅ NET Data import complete!`);
-    Logger.log(`   • ${insertedCols} new date column(s) added to Raw Data.`);
-    Logger.log(`   • Driver NET updated for ${updatedDrivers} driver(s).`);
+    Logger.log(`✅ NET Data import complete! Updated Driver NET for ${updatedDrivers} driver-week records.`);
     Logger.log(`   Running balance report...`);
     runDailyBalance();
 }
 
 // =================================================================
 // IMPORT: TRIPS DATA — Merges "Raw Data - Trips" into "Raw Data".
-//
-// How it works:
-//  1. Reads "Raw Data - Trips" — same layout as Raw Data but daily
-//     values are trip counts per driver per day.
-//  2. For each driver, the last column in the Trips sheet is the
-//     Total Trips for the period.
-//  3. Updates the "Count" column (2nd-to-last) in Raw Data with
-//     the total from the Trips sheet.
-//  4. After import, runs the full balance report automatically.
 // =================================================================
 function importTripsData() {
     const ss = SpreadsheetApp.openById(TARGET_SHEET_ID);
@@ -180,52 +139,68 @@ function importTripsData() {
     const rawSheet = ss.getSheetByName("Raw Data");
     if (!rawSheet) { Logger.log('❌ Sheet "Raw Data" not found.'); return; }
 
-    // --- Read the Trips sheet (same 3-col summary structure as Raw Data) ---
-    const tripsData = tripsSheet.getDataRange().getValues();
-    const tripsHeaders = tripsSheet.getRange(1, 1, 1, tripsSheet.getLastColumn()).getDisplayValues()[0];
-    const numTripsCols = tripsHeaders.length;
-
-    // The Trips sheet has the SAME trailing 3 summary columns as Raw Data:
-    //   n-3 = Total (sum trips)  |  n-2 = Count (trips)  |  n-1 = Driver NET (irrelevant)
-    // We want the COUNT column (n-2). Use header scanning to confirm; fall back to n-2.
-    const tripsCountColIdx = findColByLabel(tripsHeaders, ['count', 'trip', 'trips', 'total'], numTripsCols - 2);
-    Logger.log(`Trips sheet: using column index ${tripsCountColIdx} ("${tripsHeaders[tripsCountColIdx]}") as trip count source.`);
-
-    // Build map: driver name → total trips (from the Count column of the Trips sheet)
-    const driverTripsMap = {};
-    for (let r = 2; r < tripsData.length; r++) {
-        const name = (tripsData[r][0] || '').toString().trim();
-        if (name && name !== 'Total') {
-            driverTripsMap[name] = parseNumber(tripsData[r][tripsCountColIdx]) || 0;
-        }
-    }
-
-    if (Object.keys(driverTripsMap).length === 0) {
-        Logger.log('⚠️ No driver data found in "Raw Data - Trips". Make sure driver names are in column A.');
+    const rawWeeks = parseRawDataWeeks(rawSheet);
+    if (rawWeeks.length === 0) {
+        Logger.log('⚠️ No valid week tables found in "Raw Data".');
         return;
     }
 
-    // Log what we found so the user can sanity-check
-    Logger.log(`Found trips for ${Object.keys(driverTripsMap).length} driver(s):`);
-    for (const d in driverTripsMap) Logger.log(`   ${d}: ${driverTripsMap[d]} trips`);
-
-    // --- Update the Count column in Raw Data ---
-    const rawData = rawSheet.getDataRange().getValues();
-    const rawNumCols = rawData[0].length;
-    const rawCountCol1Idx = rawNumCols - 2; // 0-based; Count is 2nd-to-last in Raw Data
-
+    const tripsWeeks = parseRawDataWeeks(tripsSheet);
     let updatedCount = 0;
-    for (let r = 2; r < rawData.length; r++) {
-        const name = (rawData[r][0] || '').toString().trim();
-        if (!name || name === 'Total') continue;
-        if (driverTripsMap[name] !== undefined) {
-            rawSheet.getRange(r + 1, rawCountCol1Idx + 1).setValue(driverTripsMap[name]); // 1-indexed
-            updatedCount++;
+
+    if (tripsWeeks.length > 0) {
+        rawWeeks.forEach((rawW, wIdx) => {
+            const tripsW = tripsWeeks[wIdx];
+            if (!tripsW) return;
+
+            const tripsDriverMap = {};
+            tripsW.drivers.forEach(d => {
+                tripsDriverMap[d.name.toLowerCase()] = d.weeklyTrips;
+            });
+
+            rawW.drivers.forEach(rawD => {
+                const canon = rawD.name.toLowerCase();
+                let tripVal = tripsDriverMap[canon];
+                if (tripVal === undefined) {
+                    for (const tripsName in tripsDriverMap) {
+                        if (tripsName.replace(/\s+[a-z]\.?\s+/g, ' ') === canon.replace(/\s+[a-z]\.?\s+/g, ' ')) {
+                            tripVal = tripsDriverMap[tripsName];
+                            break;
+                        }
+                    }
+                }
+                if (tripVal !== undefined) {
+                    rawSheet.getRange(rawD.rowIdx + 1, rawW.countColIdx + 1).setValue(tripVal);
+                    updatedCount++;
+                }
+            });
+        });
+    } else {
+        const tripsData = tripsSheet.getDataRange().getValues();
+        const tripsHeaders = tripsSheet.getRange(1, 1, 1, tripsSheet.getLastColumn()).getDisplayValues()[0];
+        const tripsCountColIdx = findColByLabel(tripsHeaders, ['count', 'trip', 'trips', 'total'], tripsHeaders.length - 2);
+
+        const driverTripsMap = {};
+        for (let r = 2; r < tripsData.length; r++) {
+            const name = (tripsData[r][0] || '').toString().trim();
+            if (name && name !== 'Total') {
+                driverTripsMap[name.toLowerCase()] = parseNumber(tripsData[r][tripsCountColIdx]) || 0;
+            }
         }
+
+        rawWeeks.forEach(rawW => {
+            rawW.drivers.forEach(rawD => {
+                const canon = rawD.name.toLowerCase();
+                if (driverTripsMap[canon] !== undefined) {
+                    rawSheet.getRange(rawD.rowIdx + 1, rawW.countColIdx + 1).setValue(driverTripsMap[canon]);
+                    updatedCount++;
+                }
+            });
+        });
     }
 
     SpreadsheetApp.flush();
-    Logger.log(`✅ Trips Data import complete! Updated ${updatedCount} driver(s).`);
+    Logger.log(`✅ Trips Data import complete! Updated ${updatedCount} driver-week records.`);
     Logger.log(`   Running balance report...`);
     runDailyBalance();
 }
@@ -243,6 +218,166 @@ function findColByLabel(headers, keywords, defaultIdx) {
         }
     }
     return defaultIdx;
+}
+
+/**
+ * Reads a sheet containing one or more weekly tables stacked vertically.
+ * Weekly tables:
+ *  - Start at rows 1, 21, 41, 61, 81... (or any row where Column A is "Driver")
+ *  - Header row: Column A is "Driver", followed by date columns (DD-MM-YY), then Total, Count, Driver NET
+ *  - Row 2 of each table is a "Total" row (Column A = "Total")
+ *  - Driver rows follow until an empty cell in Column A or the next table header
+ *
+ * Returns an array of weekly table objects:
+ * [
+ *   {
+ *     weekIndex: number,
+ *     headerRowIdx: number,      // 0-based
+ *     dateColumns: [ { colIdx, date, headerStr } ],
+ *     totalColIdx: number,
+ *     countColIdx: number,
+ *     netColIdx: number,
+ *     drivers: [
+ *       {
+ *         rowIdx: number,        // 0-based row index in sheet
+ *         name: string,
+ *         dailyCredits: { [dateTimestamp]: number },
+ *         weeklyTotal: number,
+ *         weeklyTrips: number,
+ *         weeklyNet: number,
+ *         weeklyCash: number
+ *       }
+ *     ]
+ *   }
+ * ]
+ */
+function parseRawDataWeeks(sheet) {
+    if (!sheet) return [];
+    const data = sheet.getDataRange().getValues();
+    if (data.length < 2) return [];
+
+    const numCols = sheet.getLastColumn();
+    const displayValues = sheet.getRange(1, 1, data.length, numCols).getDisplayValues();
+
+    const weeks = [];
+    let r = 0;
+
+    while (r < data.length) {
+        const firstCell = (displayValues[r][0] || "").toString().trim().toLowerCase();
+        if (firstCell === "driver") {
+            const headerRowIdx = r;
+            const headerRow = displayValues[headerRowIdx];
+            const numHeaderCols = headerRow.length;
+
+            const dateColumns = [];
+            for (let c = 1; c < numHeaderCols; c++) {
+                const d = parseDDMMYY(headerRow[c]);
+                if (d) {
+                    dateColumns.push({ colIdx: c, date: d, headerStr: headerRow[c] });
+                }
+            }
+
+            if (dateColumns.length > 0) {
+                const lastDateCol = dateColumns[dateColumns.length - 1].colIdx;
+                const totalColIdx = findColByLabel(headerRow, ["total"], lastDateCol + 1);
+                const countColIdx = findColByLabel(headerRow, ["count", "trip", "trips"], lastDateCol + 2);
+                const netColIdx = findColByLabel(headerRow, ["driver net", "net"], lastDateCol + 3);
+
+                const weekDrivers = [];
+                let dr = headerRowIdx + 1;
+
+                while (dr < data.length) {
+                    const cellVal = (displayValues[dr][0] || "").toString().trim();
+                    const cellLower = cellVal.toLowerCase();
+
+                    if (cellLower === "driver") {
+                        break;
+                    }
+
+                    if (cellLower === "total") {
+                        dr++;
+                        continue;
+                    }
+
+                    if (cellVal !== "") {
+                        const driverName = cellVal;
+                        const weeklyTotal = parseNumber(data[dr][totalColIdx]) || 0;
+                        const weeklyTrips = parseNumber(data[dr][countColIdx]) || 0;
+                        const weeklyNet = parseNumber(data[dr][netColIdx]) || 0;
+                        const weeklyCash = roundToTwo(weeklyTotal - weeklyNet);
+
+                        const dailyCredits = {};
+                        dateColumns.forEach(dc => {
+                            const cred = parseNumber(data[dr][dc.colIdx]) || 0;
+                            dailyCredits[dc.date.getTime()] = cred;
+                        });
+
+                        weekDrivers.push({
+                            rowIdx: dr,
+                            name: driverName,
+                            dailyCredits: dailyCredits,
+                            weeklyTotal: weeklyTotal,
+                            weeklyTrips: weeklyTrips,
+                            weeklyNet: weeklyNet,
+                            weeklyCash: weeklyCash
+                        });
+                    }
+
+                    dr++;
+                    if (dr - headerRowIdx >= 20 && displayValues[dr] && (displayValues[dr][0] || "").toString().trim().toLowerCase() === "driver") {
+                        break;
+                    }
+                }
+
+                weeks.push({
+                    weekIndex: weeks.length,
+                    headerRowIdx: headerRowIdx,
+                    dateColumns: dateColumns,
+                    totalColIdx: totalColIdx,
+                    countColIdx: countColIdx,
+                    netColIdx: netColIdx,
+                    drivers: weekDrivers
+                });
+
+                r = dr;
+                continue;
+            }
+        }
+        r++;
+    }
+
+    return weeks;
+}
+
+/**
+ * Normalizes driver names to consolidate variations across weeks
+ * (e.g., "Hassan L En Nejjari" vs "Hassan En Nejjari").
+ */
+function getCanonicalDriverName(name, canonicalList) {
+    if (!name) return "";
+    const trimmed = name.toString().trim();
+    if (canonicalList.includes(trimmed)) return trimmed;
+
+    function simplify(n) {
+        return n.toLowerCase()
+            .replace(/\s+[a-z]\.?\s+/g, " ")
+            .replace(/\s+/g, " ")
+            .trim();
+    }
+
+    const simplified = simplify(trimmed);
+    for (const canon of canonicalList) {
+        if (simplify(canon) === simplified) {
+            return canon;
+        }
+    }
+
+    const matched = matchOldDriverName(trimmed, canonicalList);
+    if (matched && canonicalList.includes(matched)) {
+        return matched;
+    }
+
+    return trimmed;
 }
 
 
@@ -349,57 +484,77 @@ function generateWorkingHoursSheet(ss) {
         return;
     }
 
-    const rawData = rawSheet.getDataRange().getValues();
-    if (rawData.length < 3) return;
-
-    const rawHeaders = rawSheet.getRange(1, 1, 1, rawSheet.getLastColumn()).getDisplayValues()[0];
-    const totalColIdx = rawHeaders.length - 3;
-
-    // Date columns from Raw Data
-    const dateColumns = []; // { colIdx, date, headerStr }
-    for (let c = 1; c < totalColIdx; c++) {
-        const d = parseDDMMYY(rawHeaders[c]);
-        if (d) dateColumns.push({ colIdx: c, date: d, headerStr: rawHeaders[c] });
+    const weeks = parseRawDataWeeks(rawSheet);
+    if (weeks.length === 0) {
+        Logger.log('⚠️ No valid week tables found in "Raw Data".');
+        return;
     }
 
-    if (dateColumns.length === 0) return;
-
-    // Drivers list from Raw Data (Col A, excluding Total/empty)
-    const rawDrivers = [];
-    const driverCreditMap = {}; // driver -> dateKey -> credit
-    for (let r = 2; r < rawData.length; r++) {
-        const driverName = (rawData[r][0] || "").toString().trim();
-        if (!driverName || driverName === "Total") continue;
-        rawDrivers.push(driverName);
-        driverCreditMap[driverName] = {};
-
-        dateColumns.forEach(dc => {
-            const credit = parseNumber(rawData[r][dc.colIdx]) || 0;
-            driverCreditMap[driverName][dc.date.getTime()] = credit;
+    // Collect all date columns across all weeks (deduplicate and sort chronologically)
+    const dateMap = {}; // timestamp -> { date, headerStr }
+    weeks.forEach(w => {
+        w.dateColumns.forEach(dc => {
+            const t = dc.date.getTime();
+            if (!dateMap[t]) {
+                dateMap[t] = { date: dc.date, headerStr: dc.headerStr };
+            }
         });
+    });
+
+    const sortedTimestamps = Object.keys(dateMap).map(Number).sort((a, b) => a - b);
+    if (sortedTimestamps.length === 0) return;
+
+    const allDateCols = sortedTimestamps.map(t => dateMap[t]);
+
+    // Seed canonical drivers from Settings
+    const settingsSheet = ss.getSheetByName("Settings");
+    const canonicalDrivers = [];
+    if (settingsSheet) {
+        const sData = settingsSheet.getDataRange().getValues();
+        for (let i = 1; i < sData.length; i++) {
+            const d = (sData[i][0] || "").toString().trim();
+            if (d && !canonicalDrivers.includes(d)) canonicalDrivers.push(d);
+        }
     }
+
+    // Collect all unique drivers and their credit across all weeks
+    const driverList = [];
+    const driverCreditMap = {}; // canonDriver -> dateTimestamp -> credit
+
+    weeks.forEach(w => {
+        w.drivers.forEach(d => {
+            const canon = getCanonicalDriverName(d.name, canonicalDrivers);
+            if (!canonicalDrivers.includes(canon)) canonicalDrivers.push(canon);
+            if (!driverList.includes(canon)) driverList.push(canon);
+
+            if (!driverCreditMap[canon]) driverCreditMap[canon] = {};
+            for (const t in d.dailyCredits) {
+                driverCreditMap[canon][t] = (driverCreditMap[canon][t] || 0) + d.dailyCredits[t];
+            }
+        });
+    });
 
     // Read existing entered working hours to preserve them
     const { map: existingHoursMap } = loadWorkingHoursMap(ss);
 
     // Build Header
     const headerRow = ["Driver"];
-    dateColumns.forEach(dc => headerRow.push(dc.headerStr));
+    allDateCols.forEach(dc => headerRow.push(dc.headerStr));
     headerRow.push("Total Hours");
 
-    const numDateCols = dateColumns.length;
+    const numDateCols = allDateCols.length;
     const lastDateColLetter = getColumnLetter(numDateCols + 1); // Col B is 2
 
     const matrixRows = [];
 
     // Build driver rows
-    rawDrivers.forEach((driver, idx) => {
+    driverList.forEach((driver, idx) => {
         const rowIndex = idx + 2; // Row 2 is first driver
         const row = [driver];
 
-        dateColumns.forEach(dc => {
+        allDateCols.forEach(dc => {
             const dateKey = dc.date.getTime();
-            const rawCredit = driverCreditMap[driver] ? driverCreditMap[driver][dateKey] : 0;
+            const rawCredit = driverCreditMap[driver] ? (driverCreditMap[driver][dateKey] || 0) : 0;
 
             // Existing value takes priority
             if (existingHoursMap[driver] && existingHoursMap[driver][dateKey] !== undefined) {
@@ -418,7 +573,7 @@ function generateWorkingHoursSheet(ss) {
     });
 
     // Summary Bottom Row (Total Hours Per Date)
-    const bottomRowIndex = rawDrivers.length + 2;
+    const bottomRowIndex = driverList.length + 2;
     const bottomRow = ["Total Hours"];
     for (let c = 0; c < numDateCols; c++) {
         const colLetter = getColumnLetter(c + 2);
@@ -462,8 +617,8 @@ function generateWorkingHoursSheet(ss) {
         .setBorder(true, true, true, true, true, true, "black", SpreadsheetApp.BorderStyle.SOLID);
 
     // Data Validation & Conditional Formatting Rules (cells B2 to lastDateCol, drivers only)
-    if (rawDrivers.length > 0 && numDateCols > 0) {
-        const matrixRange = hoursSheet.getRange(2, 2, rawDrivers.length, numDateCols);
+    if (driverList.length > 0 && numDateCols > 0) {
+        const matrixRange = hoursSheet.getRange(2, 2, driverList.length, numDateCols);
 
         const firstCell = "B2";
         const rule = SpreadsheetApp.newDataValidation()
@@ -559,6 +714,21 @@ function updateSummaryAndCharts(ss) {
     function loadAuxMap(sheetName) {
         const auxSheet = ss.getSheetByName(sheetName);
         if (!auxSheet) return {};
+        const weeks = parseRawDataWeeks(auxSheet);
+        if (weeks.length > 0) {
+            const map = {};
+            weeks.forEach(w => {
+                w.drivers.forEach(d => {
+                    const dName = d.name;
+                    if (!map[dName]) map[dName] = {};
+                    for (const t in d.dailyCredits) {
+                        map[dName][t] = d.dailyCredits[t];
+                    }
+                });
+            });
+            return map;
+        }
+
         const data = auxSheet.getDataRange().getValues();
         if (data.length < 2) return {};
         const headers = auxSheet.getRange(1, 1, 1, auxSheet.getLastColumn()).getDisplayValues()[0];
@@ -583,49 +753,35 @@ function updateSummaryAndCharts(ss) {
         return map;
     }
 
-
     // Load auxiliary daily maps (driverName -> { timestamp -> value })
     const tripsDataMap = loadAuxMap("Raw Data - Trips");
     const netDataMap = loadAuxMap("Raw Data - NET");
     const noShowMap = loadNoShowMap(ss, "No Show");
     const { map: workingHoursMap, driverTotalHours, dailyTotalHours } = loadWorkingHoursMap(ss);
 
-    // --- Read the entire Raw Data sheet ---
-    const rawData = rawSheet.getDataRange().getValues();
-    if (rawData.length < 3) {
-        Logger.log("⚠️ Raw Data has fewer than 3 rows (need header + Total + at least 1 driver).");
+    // --- Read the entire Raw Data sheet as weekly tables ---
+    const weeks = parseRawDataWeeks(rawSheet);
+    if (weeks.length === 0) {
+        Logger.log("⚠️ No valid week tables found in Raw Data.");
         return;
     }
 
-    // Read headers as DISPLAY STRINGS so Google Sheets doesn't auto-convert DD-MM-YY dates
-    const headerStrings = rawSheet.getRange(1, 1, 1, rawSheet.getLastColumn()).getDisplayValues()[0];
-    const numCols = headerStrings.length;
-
-    // --- Identify date columns vs summary columns ---
-    // Last 3 columns are: Total, Count, Driver NET
-    // Everything between column 1 and (numCols - 3) are date columns
-    const totalColIdx = numCols - 3;
-    const countColIdx = numCols - 2;
-    const netColIdx = numCols - 1;
-
-    // Parse date headers (DD-MM-YY format, read as strings)
-    const dateColumns = []; // { colIdx, date }
-    for (let c = 1; c < totalColIdx; c++) {
-        const dateVal = parseDDMMYY(headerStrings[c]);
-        if (dateVal) {
-            dateColumns.push({ colIdx: c, date: dateVal });
+    // Seed canonical drivers from Settings
+    let settingsSheet = ss.getSheetByName("Settings");
+    if (!settingsSheet) settingsSheet = ss.insertSheet("Settings");
+    const settingsData = settingsSheet.getDataRange().getValues();
+    let existingFares = {};
+    const canonicalDrivers = [];
+    for (let i = 1; i < settingsData.length; i++) {
+        const d = (settingsData[i][0] || "").toString().trim();
+        if (d) {
+            if (!canonicalDrivers.includes(d)) canonicalDrivers.push(d);
+            existingFares[d] = settingsData[i][1];
         }
-    }
-
-    if (dateColumns.length === 0) {
-        Logger.log("⚠️ No valid date columns found in Raw Data headers.");
-        return;
     }
 
     // --- Read existing Summary data BEFORE clearing it ---
     // This acts as a memory of previously-calculated trips/cash values.
-    // When a new day is added to Raw Data, older days keep their correct values
-    // and the new day gets: total - sum_of_all_known_previous_days.
     const existingSummaryMap = {}; // { driver -> { dateKey -> { trips, cash } } }
     const existingLastRow = summarySheet.getLastRow();
     if (existingLastRow >= 3) {
@@ -645,146 +801,132 @@ function updateSummaryAndCharts(ss) {
         });
     }
 
-    // --- Build output rows: one row per driver per day (only days with credit > 0) ---
-    let outputRows = []; // [date, driver, credit, cash, trips, total]
+    // --- Build output rows: one row per driver per day across all weeks ---
+    let outputRows = []; // [date, driver, credit, cash, trips, total, cashTotal, noShow, hours]
 
-    for (let r = 2; r < rawData.length; r++) { // Skip header (0) and Total row (1)
-        const driverName = rawData[r][0];
-        if (!driverName || driverName.toString().trim() === "" || driverName === "Total") continue;
+    weeks.forEach(w => {
+        w.drivers.forEach(d => {
+            const driverName = getCanonicalDriverName(d.name, canonicalDrivers);
+            if (!canonicalDrivers.includes(driverName)) canonicalDrivers.push(driverName);
 
-        const rawDriverTotal = parseNumber(rawData[r][totalColIdx]) || 0;
+            const weeklyTotal = d.weeklyTotal;
+            const weeklyTrips = d.weeklyTrips;
+            const weeklyCash = d.weeklyCash;
 
-        let totalNoShowCashForDriver = 0;
-        if (noShowMap[driverName]) {
-            Object.values(noShowMap[driverName]).forEach(val => totalNoShowCashForDriver += val.cash);
-        }
+            // Collect all active days for this driver in this week
+            let activeDays = [];
+            w.dateColumns.forEach(dc => {
+                const dateKey = dc.date.getTime();
+                let credit = d.dailyCredits[dateKey] || 0;
 
-        const driverTotal = roundToTwo(rawDriverTotal - totalNoShowCashForDriver);
-        const driverTrips = parseNumber(rawData[r][countColIdx]) || 0;
-        const driverNet = parseNumber(rawData[r][netColIdx]) || 0;
-        let driverCash = roundToTwo(driverTotal - driverNet); // Base Cash = Total - NET
+                const hasExactTrips = tripsDataMap[driverName] && tripsDataMap[driverName][dateKey] !== undefined;
+                const hasExactNet = netDataMap[driverName] && netDataMap[driverName][dateKey] !== undefined;
 
-        // Collect all active days (days with credit, trips, or cash)
-        let activeDays = [];
-        dateColumns.forEach(dc => {
-            const dateKey = dc.date.getTime();
-            let credit = parseNumber(rawData[r][dc.colIdx]) || 0;
+                const exactTrips = hasExactTrips ? tripsDataMap[driverName][dateKey] : 0;
+                const exactNet = hasExactNet ? netDataMap[driverName][dateKey] : 0;
+                const hasNoShow = noShowMap[driverName] && noShowMap[driverName][dateKey] !== undefined;
 
-            const hasExactTrips = tripsDataMap[driverName] && tripsDataMap[driverName][dateKey] !== undefined;
-            const hasExactNet = netDataMap[driverName] && netDataMap[driverName][dateKey] !== undefined;
+                if (hasNoShow) {
+                    credit = roundToTwo(credit - noShowMap[driverName][dateKey].cash);
+                }
 
-            const exactTrips = hasExactTrips ? tripsDataMap[driverName][dateKey] : 0;
-            const exactNet = hasExactNet ? netDataMap[driverName][dateKey] : 0;
-            const hasNoShow = noShowMap[driverName] && noShowMap[driverName][dateKey] !== undefined;
+                // Include day if there's credit, trips, non-zero net, or No Show
+                if (credit > 0 || exactTrips > 0 || exactNet !== 0 || hasNoShow) {
+                    activeDays.push({ date: dc.date, dateKey: dateKey, credit: credit });
+                }
+            });
 
-            if (hasNoShow) {
-                credit = roundToTwo(credit - noShowMap[driverName][dateKey].cash);
-            }
+            if (activeDays.length === 0) return;
 
-            // Include day if there's credit, trips, non-zero net (implying cash), or a No Show adjustment
-            if (credit > 0 || exactTrips > 0 || exactNet !== 0 || hasNoShow) {
-                activeDays.push({ date: dc.date, dateKey: dateKey, credit: credit });
-            }
+            const nonAuxTripDays = activeDays.filter(day =>
+                !(tripsDataMap[driverName] && tripsDataMap[driverName][day.dateKey] !== undefined));
+            const nonAuxCashDays = activeDays.filter(day =>
+                !(netDataMap[driverName] && netDataMap[driverName][day.dateKey] !== undefined));
+
+            const lastNonAuxTripDay = nonAuxTripDays.length > 0 ? nonAuxTripDays[nonAuxTripDays.length - 1] : null;
+            const lastNonAuxCashDay = nonAuxCashDays.length > 0 ? nonAuxCashDays[nonAuxCashDays.length - 1] : null;
+
+            let sumExactTrips = 0;
+            let sumExactCash = 0;
+            let missingTripDays = [];
+            let missingCashDays = [];
+
+            activeDays.forEach(day => {
+                const isLastTrip = lastNonAuxTripDay && day.dateKey === lastNonAuxTripDay.dateKey;
+                const isLastCash = lastNonAuxCashDay && day.dateKey === lastNonAuxCashDay.dateKey;
+
+                // TRIPS
+                if (tripsDataMap[driverName] && tripsDataMap[driverName][day.dateKey] !== undefined) {
+                    sumExactTrips += tripsDataMap[driverName][day.dateKey];
+                } else if (!isLastTrip && existingSummaryMap[driverName] && existingSummaryMap[driverName][day.dateKey] !== undefined) {
+                    sumExactTrips += existingSummaryMap[driverName][day.dateKey].trips;
+                } else {
+                    missingTripDays.push(day);
+                }
+
+                // CASH
+                if (netDataMap[driverName] && netDataMap[driverName][day.dateKey] !== undefined) {
+                    sumExactCash += roundToTwo(day.credit - netDataMap[driverName][day.dateKey]);
+                } else if (!isLastCash && existingSummaryMap[driverName] && existingSummaryMap[driverName][day.dateKey] !== undefined) {
+                    sumExactCash += existingSummaryMap[driverName][day.dateKey].cash;
+                } else {
+                    missingCashDays.push(day);
+                }
+            });
+
+            const remainingTrips = Math.max(0, weeklyTrips - sumExactTrips);
+            const remainingCash = weeklyCash - sumExactCash;
+
+            const lastMissingTripDay = missingTripDays.length > 0 ? missingTripDays[missingTripDays.length - 1] : null;
+            const lastMissingCashDay = missingCashDays.length > 0 ? missingCashDays[missingCashDays.length - 1] : null;
+
+            activeDays.forEach(day => {
+                let dailyTrips = 0;
+                let dailyCash = 0;
+
+                // TRIPS
+                if (tripsDataMap[driverName] && tripsDataMap[driverName][day.dateKey] !== undefined) {
+                    dailyTrips = tripsDataMap[driverName][day.dateKey];
+                } else if (lastMissingTripDay && day.dateKey === lastMissingTripDay.dateKey && remainingTrips > 0) {
+                    dailyTrips = remainingTrips;
+                } else if (existingSummaryMap[driverName] && existingSummaryMap[driverName][day.dateKey] !== undefined) {
+                    dailyTrips = existingSummaryMap[driverName][day.dateKey].trips;
+                } else {
+                    dailyTrips = 0;
+                }
+
+                // CASH
+                if (netDataMap[driverName] && netDataMap[driverName][day.dateKey] !== undefined) {
+                    dailyCash = roundToTwo(day.credit - netDataMap[driverName][day.dateKey]);
+                } else if (lastMissingCashDay && day.dateKey === lastMissingCashDay.dateKey && remainingCash > 0) {
+                    dailyCash = remainingCash;
+                } else if (existingSummaryMap[driverName] && existingSummaryMap[driverName][day.dateKey] !== undefined) {
+                    dailyCash = existingSummaryMap[driverName][day.dateKey].cash;
+                } else {
+                    dailyCash = 0;
+                }
+
+                let dailyNoShowCount = 0;
+                if (noShowMap[driverName] && noShowMap[driverName][day.dateKey]) {
+                    dailyNoShowCount = noShowMap[driverName][day.dateKey].count;
+                }
+
+                const dailyHours = (workingHoursMap[driverName] && workingHoursMap[driverName][day.dateKey]) ? workingHoursMap[driverName][day.dateKey] : 0;
+
+                outputRows.push([
+                    day.date,
+                    driverName,
+                    day.credit,
+                    dailyCash,
+                    dailyTrips,
+                    weeklyTotal,
+                    weeklyCash,
+                    dailyNoShowCount,
+                    dailyHours
+                ]);
+            });
         });
-
-        // The last non-aux active day ALWAYS gets the remainder, even if the Summary
-        // has a value for it — because that Summary value might be stale/wrong from a
-        // previous broken run. Only EARLIER days use the Summary as a fallback.
-        // This ensures: new_day_trips = Count_total − sum_of_all_earlier_days
-        const nonAuxTripDays = activeDays.filter(d =>
-            !(tripsDataMap[driverName] && tripsDataMap[driverName][d.dateKey] !== undefined));
-        const nonAuxCashDays = activeDays.filter(d =>
-            !(netDataMap[driverName] && netDataMap[driverName][d.dateKey] !== undefined));
-
-        const lastNonAuxTripDay = nonAuxTripDays.length > 0 ? nonAuxTripDays[nonAuxTripDays.length - 1] : null;
-        const lastNonAuxCashDay = nonAuxCashDays.length > 0 ? nonAuxCashDays[nonAuxCashDays.length - 1] : null;
-
-        let sumExactTrips = 0;
-        let sumExactCash = 0;
-        let missingTripDays = [];
-        let missingCashDays = [];
-
-        activeDays.forEach(day => {
-            const isLastTrip = lastNonAuxTripDay && day.dateKey === lastNonAuxTripDay.dateKey;
-            const isLastCash = lastNonAuxCashDay && day.dateKey === lastNonAuxCashDay.dateKey;
-
-            // TRIPS
-            if (tripsDataMap[driverName] && tripsDataMap[driverName][day.dateKey] !== undefined) {
-                sumExactTrips += tripsDataMap[driverName][day.dateKey];
-            } else if (!isLastTrip && existingSummaryMap[driverName] && existingSummaryMap[driverName][day.dateKey] !== undefined) {
-                // Earlier day — use Summary as baseline (its value should be correct)
-                sumExactTrips += existingSummaryMap[driverName][day.dateKey].trips;
-            } else {
-                // Last non-aux day (or no Summary data) — will receive the remainder
-                missingTripDays.push(day);
-            }
-
-            // CASH
-            if (netDataMap[driverName] && netDataMap[driverName][day.dateKey] !== undefined) {
-                sumExactCash += roundToTwo(day.credit - netDataMap[driverName][day.dateKey]);
-            } else if (!isLastCash && existingSummaryMap[driverName] && existingSummaryMap[driverName][day.dateKey] !== undefined) {
-                sumExactCash += existingSummaryMap[driverName][day.dateKey].cash;
-            } else {
-                missingCashDays.push(day);
-            }
-        });
-
-        // new_day = Count_total − sum_of_all_earlier_known_days
-        const remainingTrips = Math.max(0, driverTrips - sumExactTrips);
-        const remainingCash = driverCash - sumExactCash;
-
-        const lastMissingTripDay = missingTripDays.length > 0 ? missingTripDays[missingTripDays.length - 1] : null;
-        const lastMissingCashDay = missingCashDays.length > 0 ? missingCashDays[missingCashDays.length - 1] : null;
-
-        // Build output rows
-        activeDays.forEach(day => {
-            let dailyTrips = 0;
-            let dailyCash = 0;
-
-            // TRIPS (priority: aux > remainder for last day > Summary for earlier days > 0)
-            if (tripsDataMap[driverName] && tripsDataMap[driverName][day.dateKey] !== undefined) {
-                dailyTrips = tripsDataMap[driverName][day.dateKey];
-            } else if (lastMissingTripDay && day.dateKey === lastMissingTripDay.dateKey && remainingTrips > 0) {
-                // Last non-aux day always gets the remainder
-                dailyTrips = remainingTrips;
-            } else if (existingSummaryMap[driverName] && existingSummaryMap[driverName][day.dateKey] !== undefined) {
-                // Earlier day — restore from Summary
-                dailyTrips = existingSummaryMap[driverName][day.dateKey].trips;
-            } else {
-                dailyTrips = 0;
-            }
-
-            // CASH (same priority)
-            if (netDataMap[driverName] && netDataMap[driverName][day.dateKey] !== undefined) {
-                dailyCash = roundToTwo(day.credit - netDataMap[driverName][day.dateKey]);
-            } else if (lastMissingCashDay && day.dateKey === lastMissingCashDay.dateKey && remainingCash > 0) {
-                dailyCash = remainingCash;
-            } else if (existingSummaryMap[driverName] && existingSummaryMap[driverName][day.dateKey] !== undefined) {
-                dailyCash = existingSummaryMap[driverName][day.dateKey].cash;
-            } else {
-                dailyCash = 0;
-            }
-
-            let dailyNoShowCount = 0;
-            if (noShowMap[driverName] && noShowMap[driverName][day.dateKey]) {
-                dailyNoShowCount = noShowMap[driverName][day.dateKey].count;
-            }
-
-            const dailyHours = (workingHoursMap[driverName] && workingHoursMap[driverName][day.dateKey]) ? workingHoursMap[driverName][day.dateKey] : 0;
-
-            outputRows.push([
-                day.date,
-                driverName,
-                day.credit,
-                dailyCash,
-                dailyTrips,
-                driverTotal,
-                driverCash,
-                dailyNoShowCount,
-                dailyHours
-            ]);
-        });
-    }
+    });
 
     if (outputRows.length === 0) {
         Logger.log("⚠️ No driver data found in Raw Data.");
@@ -801,17 +943,6 @@ function updateSummaryAndCharts(ss) {
     // --- Write Summary headers ---
     const headers = ["Date", "Driver", "Credit", "Trips", "Cash", "No Show", "Hours", "Balance"];
     summarySheet.getRange(2, 1, 1, headers.length).setValues([headers]);
-
-    // --- Read fare settings for balance calculation ---
-    let settingsSheet = ss.getSheetByName("Settings");
-    if (!settingsSheet) settingsSheet = ss.insertSheet("Settings");
-    const settingsData = settingsSheet.getDataRange().getValues();
-    let existingFares = {}; // driver -> fare value
-    for (let i = 1; i < settingsData.length; i++) {
-        if (settingsData[i][0]) {
-            existingFares[settingsData[i][0]] = settingsData[i][1];
-        }
-    }
 
     // Helper to get fare as decimal
     function getFareDecimal(driver) {
@@ -933,19 +1064,43 @@ function updateSummaryAndCharts(ss) {
         }
     });
 
-    // --- Aggregate per driver (for the stats table) ---
+    // --- Aggregate per driver across all weeks (for the stats table) ---
     let driverStats = {};
-    // We need to aggregate from raw data directly (not outputRows) to get accurate totals
-    for (let r = 2; r < rawData.length; r++) {
-        const driverName = rawData[r][0];
-        if (!driverName || driverName.toString().trim() === "" || driverName === "Total") continue;
+    weeks.forEach(w => {
+        w.drivers.forEach(d => {
+            const driverName = getCanonicalDriverName(d.name, canonicalDrivers);
+            if (!driverStats[driverName]) {
+                driverStats[driverName] = {
+                    totalCredit: 0,
+                    totalTrips: 0,
+                    totalCash: 0,
+                    totalNoShow: 0,
+                    driverNet: 0,
+                    workingDays: 0,
+                    firstWorkDate: null
+                };
+            }
 
-        const driverTotal = parseNumber(rawData[r][totalColIdx]) || 0;
-        const driverTrips = parseNumber(rawData[r][countColIdx]) || 0;
-        const driverNet = parseNumber(rawData[r][netColIdx]) || 0;
-        let driverCash = roundToTwo(driverTotal - driverNet);
+            driverStats[driverName].totalCredit += d.weeklyTotal;
+            driverStats[driverName].totalTrips += d.weeklyTrips;
+            driverStats[driverName].driverNet += d.weeklyNet;
+            driverStats[driverName].totalCash += d.weeklyCash;
 
-        // Deduct ALL No Show CASH for this driver from their monthly total cash
+            w.dateColumns.forEach(dc => {
+                const cred = d.dailyCredits[dc.date.getTime()] || 0;
+                if (cred > 0) {
+                    driverStats[driverName].workingDays++;
+                    if (!driverStats[driverName].firstWorkDate) {
+                        driverStats[driverName].firstWorkDate = dc.date;
+                    }
+                }
+            });
+        });
+    });
+
+    // Deduct No Show and calculate hourly/daily averages
+    for (let driverName in driverStats) {
+        const s = driverStats[driverName];
         let totalNoShowCashForDriver = 0;
         let totalNoShowCountForDriver = 0;
         if (noShowMap[driverName]) {
@@ -954,36 +1109,15 @@ function updateSummaryAndCharts(ss) {
                 totalNoShowCountForDriver += val.count;
             });
         }
-        driverCash = roundToTwo(driverCash - totalNoShowCashForDriver);
-
-        if (driverTotal <= 0) continue;
-
-        // Count working days for this driver
-        let workingDays = 0;
-        let firstWorkDate = null;
-        dateColumns.forEach(dc => {
-            const credit = parseNumber(rawData[r][dc.colIdx]) || 0;
-            if (credit > 0) {
-                workingDays++;
-                if (!firstWorkDate) firstWorkDate = dc.date;
-            }
-        });
+        s.totalCredit = roundToTwo(s.totalCredit - totalNoShowCashForDriver);
+        s.totalCash = roundToTwo(s.totalCash - totalNoShowCashForDriver);
+        s.totalNoShow = totalNoShowCountForDriver;
+        s.driverNet = roundToTwo(s.driverNet);
 
         const driverHours = driverTotalHours[driverName] || 0;
-        const avgPerHour = driverHours > 0 ? roundToTwo(driverTotal / driverHours) : 0;
-
-        driverStats[driverName] = {
-            totalCredit: roundToTwo(driverTotal),
-            totalTrips: driverTrips,
-            totalCash: driverCash,
-            totalNoShow: totalNoShowCountForDriver,
-            driverNet: roundToTwo(driverNet),
-            workingDays: workingDays,
-            avgPerDay: workingDays > 0 ? roundToTwo(driverTotal / workingDays) : 0,
-            totalHours: driverHours,
-            avgPerHour: avgPerHour,
-            firstWorkDate: firstWorkDate
-        };
+        s.totalHours = driverHours;
+        s.avgPerHour = driverHours > 0 ? roundToTwo(s.totalCredit / driverHours) : 0;
+        s.avgPerDay = s.workingDays > 0 ? roundToTwo(s.totalCredit / s.workingDays) : 0;
     }
 
     // =================================================================
