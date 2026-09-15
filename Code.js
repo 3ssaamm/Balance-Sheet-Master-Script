@@ -442,7 +442,7 @@ function generateWorkingHoursSheetFromMenu() {
     SpreadsheetApp.flush();
     try {
         SpreadsheetApp.getUi().alert("✅ 'Working hours' sheet synced successfully!");
-    } catch (e) {}
+    } catch (e) { }
 }
 
 /**
@@ -989,7 +989,11 @@ function runDailyBalance() {
     const ss = SpreadsheetApp.openById(TARGET_SHEET_ID);
 
     // 0. Sync working hours sheet first so downstream reports can use working hours data
-    generateWorkingHoursSheet(ss);
+    try {
+        generateWorkingHoursSheet(ss);
+    } catch (e) {
+        Logger.log("Error in generateWorkingHoursSheet: " + e.toString() + "\n" + (e.stack || ""));
+    }
 
     // 1. Update the main Summary sheet from Raw Data.
     updateSummaryAndCharts(ss);
@@ -998,13 +1002,25 @@ function runDailyBalance() {
     SpreadsheetApp.flush();
 
     // 3. Generate the weekly summary.
-    generateWeeklySummary(ss);
+    try {
+        generateWeeklySummary(ss);
+    } catch (e) {
+        Logger.log("Error in generateWeeklySummary: " + e.toString() + "\n" + (e.stack || ""));
+    }
 
     // 4. Generate the final Bonus report.
-    generateBonusReport(ss);
+    try {
+        generateBonusReport(ss);
+    } catch (e) {
+        Logger.log("Error in generateBonusReport: " + e.toString() + "\n" + (e.stack || ""));
+    }
 
     // 5. Generate Angel's specific progressive report.
-    generateAngelReport(ss);
+    try {
+        generateAngelReport(ss);
+    } catch (e) {
+        Logger.log("Error in generateAngelReport: " + e.toString() + "\n" + (e.stack || ""));
+    }
 }
 
 
@@ -1704,21 +1720,114 @@ function updateSummaryAndCharts(ss) {
 }
 
 
+/**
+ * Detects the active month and year for reporting.
+ * 1. Analyzes valid dates in `allRows` or `summarySheet` to pick the most frequent month/year.
+ * 2. If no dates available, searches spreadsheet name for any English month name and 4-digit year.
+ * 3. Falls back to current system date.
+ */
+function getSpreadsheetMonthAndYear(ss, allRows) {
+    const monthNames = [
+        "January", "February", "March", "April", "May", "June",
+        "July", "August", "September", "October", "November", "December"
+    ];
+
+    // Priority 1: Extract from valid dates in allRows
+    if (Array.isArray(allRows) && allRows.length > 0) {
+        const monthCounts = {};
+        const yearCounts = {};
+        for (let i = 0; i < allRows.length; i++) {
+            const rawDate = allRows[i][0];
+            const d = parseDate(rawDate);
+            if (d && !isNaN(d.getTime())) {
+                const m = d.getMonth();
+                const y = d.getFullYear();
+                monthCounts[m] = (monthCounts[m] || 0) + 1;
+                yearCounts[y] = (yearCounts[y] || 0) + 1;
+            }
+        }
+        let bestMonth = -1, maxMonthCount = 0;
+        for (const m in monthCounts) {
+            if (monthCounts[m] > maxMonthCount) {
+                maxMonthCount = monthCounts[m];
+                bestMonth = parseInt(m, 10);
+            }
+        }
+        let bestYear = -1, maxYearCount = 0;
+        for (const y in yearCounts) {
+            if (yearCounts[y] > maxYearCount) {
+                maxYearCount = yearCounts[y];
+                bestYear = parseInt(y, 10);
+            }
+        }
+        if (bestMonth >= 0 && bestYear > 2000) {
+            return {
+                monthIndex: bestMonth,
+                year: bestYear,
+                monthName: monthNames[bestMonth]
+            };
+        }
+    }
+
+    // Priority 2: Check spreadsheet name for any month name (full or short) and 4-digit year
+    const ssName = (ss && typeof ss.getName === "function") ? ss.getName() : "";
+    let foundMonthIndex = -1;
+    for (let i = 0; i < monthNames.length; i++) {
+        const regex = new RegExp("\\b" + monthNames[i] + "\\b", "i");
+        if (regex.test(ssName)) {
+            foundMonthIndex = i;
+            break;
+        }
+    }
+    if (foundMonthIndex === -1) {
+        const shortNames = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+        for (let i = 0; i < shortNames.length; i++) {
+            const regex = new RegExp("\\b" + shortNames[i] + "\\b", "i");
+            if (regex.test(ssName)) {
+                foundMonthIndex = i;
+                break;
+            }
+        }
+    }
+
+    let foundYear = -1;
+    const yearMatch = ssName.match(/\b(20\d\d)\b/);
+    if (yearMatch) {
+        foundYear = parseInt(yearMatch[1], 10);
+    }
+
+    const now = new Date();
+    const finalMonthIndex = foundMonthIndex >= 0 ? foundMonthIndex : now.getMonth();
+    const finalYear = foundYear > 2000 ? foundYear : now.getFullYear();
+
+    return {
+        monthIndex: finalMonthIndex,
+        year: finalYear,
+        monthName: monthNames[finalMonthIndex]
+    };
+}
+
+
 // =================================================================
 // WEEKLY SUMMARY — Generates weekly performance breakdown
 // =================================================================
 function generateWeeklySummary(ss) {
     const summarySheet = ss.getSheetByName("Summary");
+    if (!summarySheet) {
+        Logger.log("generateWeeklySummary: Summary sheet not found.");
+        return;
+    }
     let weeklySheet = ss.getSheetByName("Weekly Summary");
-
     if (!weeklySheet) weeklySheet = ss.insertSheet("Weekly Summary");
-    weeklySheet.getRange("A:Z").clearContent();
-    weeklySheet.getRange("A:Z").setBackground(null);
-    weeklySheet.getRange("A:Z").setBorder(false, false, false, false, false, false);
+
+    // Ensure weeklySheet has at least 26 columns for charts and tables
+    if (weeklySheet.getMaxColumns() < 26) {
+        weeklySheet.insertColumnsAfter(weeklySheet.getMaxColumns(), 26 - weeklySheet.getMaxColumns());
+    }
+
+    weeklySheet.clear();
     weeklySheet.getCharts().forEach(c => weeklySheet.removeChart(c));
     weeklySheet.getRange("A1").setValue("WEEKLY SUMMARY").setFontWeight("bold").setFontSize(14);
-
-
 
     // --- Read Fare % from Settings sheet ---
     let driverFareMap = {}; // driver -> fare as decimal (e.g. 0.9)
@@ -1766,21 +1875,14 @@ function generateWeeklySummary(ss) {
         }).filter(r => r[0] && r[1]);
     }
 
-    const currentMonthName = ss.getName().split(" ")[0];
-    const now = new Date();
-    let currentYear = now.getFullYear();
-    if (allRows.length > 0 && allRows[0][0] instanceof Date) {
-        currentYear = allRows[0][0].getFullYear();
-    } else if (currentMonthName.startsWith("Jan") && now.getMonth() === 11) {
-        currentYear = currentYear + 1;
-    }
+    // --- Month and Year Detection (from Summary dates, spreadsheet name, or current date) ---
+    const { monthIndex: currentMonthIndex, year: currentYear, monthName: currentMonthName } = getSpreadsheetMonthAndYear(ss, allRows);
 
     // --- Load Working Hours for Current Month ---
     const { map: workingHoursMap } = loadWorkingHoursMap(ss);
 
     // --- Look Back Logic ---
-    const firstOfMonth = new Date(Date.parse(`${currentMonthName} 1, ${currentYear}`));
-    const currentMonthIndex = firstOfMonth.getMonth();
+    const firstOfMonth = new Date(currentYear, currentMonthIndex, 1);
     const firstWeekMonday = getMonday(firstOfMonth);
 
     if (firstWeekMonday.getMonth() < currentMonthIndex || firstWeekMonday.getFullYear() < firstOfMonth.getFullYear()) {
@@ -1788,8 +1890,14 @@ function generateWeeklySummary(ss) {
             const prevMonthDate = new Date(firstOfMonth);
             prevMonthDate.setMonth(currentMonthIndex - 1);
             const prevMonthName = prevMonthDate.toLocaleString('en-US', { month: 'long' });
-            const prevFileName = `${prevMonthName} - Drivers Daily Balance`;
-            const files = DriveApp.getFilesByName(prevFileName);
+
+            let files = DriveApp.getFilesByName(`${prevMonthName} - Drivers Daily Balance`);
+            if (!files.hasNext()) {
+                files = DriveApp.getFilesByName(`Drivers Daily Balance - ${prevMonthName}`);
+            }
+            if (!files.hasNext()) {
+                files = DriveApp.getFilesByName(`${prevMonthName} ${prevMonthDate.getFullYear()} - Drivers Daily Balance`);
+            }
 
             if (files.hasNext()) {
                 const prevFile = files.next();
@@ -1798,8 +1906,8 @@ function generateWeeklySummary(ss) {
                 if (prevSummarySheet && prevSummarySheet.getLastRow() >= 3) {
                     const prevHeaders = prevSummarySheet.getRange(2, 1, 1, Math.min(prevSummarySheet.getLastColumn(), 9)).getDisplayValues()[0];
                     const prevCreditCol = findMainSummaryCol(prevHeaders, ['credit'], 2);
-                    const prevTripsCol = findMainSummaryCol(prevHeaders, ['trips', 'trip'], 3);
-                    const prevCashCol = findMainSummaryCol(prevHeaders, ['cash'], 4);
+                    const prevTripsCol = findMainSummaryCol(prevHeaders, ['trips', 'trip'], 5);
+                    const prevCashCol = findMainSummaryCol(prevHeaders, ['cash'], 6);
                     const prevMaxCol = Math.max(prevCreditCol, prevTripsCol, prevCashCol) + 1;
                     const prevAllData = prevSummarySheet.getRange(3, 1, prevSummarySheet.getLastRow() - 2, prevMaxCol).getValues();
 
@@ -1827,19 +1935,25 @@ function generateWeeklySummary(ss) {
                     allRows = [...crossoverRows, ...allRows];
 
                     // --- Also merge Working Hours from Previous Month ---
-                    const { map: prevHoursMap } = loadWorkingHoursMap(prevSpreadsheet);
-                    for (const prevDriver in prevHoursMap) {
-                        const mappedDriver = matchOldDriverName(prevDriver, currentDrivers);
-                        if (!workingHoursMap[mappedDriver]) {
-                            workingHoursMap[mappedDriver] = {};
+                    try {
+                        const { map: prevHoursMap } = loadWorkingHoursMap(prevSpreadsheet);
+                        for (const prevDriver in prevHoursMap) {
+                            const mappedDriver = matchOldDriverName(prevDriver, currentDrivers);
+                            if (!workingHoursMap[mappedDriver]) {
+                                workingHoursMap[mappedDriver] = {};
+                            }
+                            for (const dateKey in prevHoursMap[prevDriver]) {
+                                workingHoursMap[mappedDriver][dateKey] = prevHoursMap[prevDriver][dateKey];
+                            }
                         }
-                        for (const dateKey in prevHoursMap[prevDriver]) {
-                            workingHoursMap[mappedDriver][dateKey] = prevHoursMap[prevDriver][dateKey];
-                        }
+                    } catch (eHours) {
+                        Logger.log("Error merging previous month working hours: " + eHours);
                     }
                 }
             }
-        } catch (e) { }
+        } catch (e) {
+            Logger.log("Error in previous month lookback: " + e);
+        }
     }
 
     // --- Process Data ---
@@ -1852,9 +1966,9 @@ function generateWeeklySummary(ss) {
         if (!date) return;
 
         const driver = row[driverIdx];
-        const credit = Number(row[creditIdx]) || 0;
-        const trips = Number(row[tripsIdx]) || 0;
-        const cash = Number(row[cashIdx]) || 0;
+        const credit = parseNumber(row[creditIdx]) || 0;
+        const trips = parseNumber(row[tripsIdx]) || 0;
+        const cash = parseNumber(row[cashIdx]) || 0;
 
         const weekStart = getMonday(date);
         const weekEnd = new Date(weekStart);
@@ -1864,15 +1978,21 @@ function generateWeeklySummary(ss) {
         const dateKey = new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime();
         const dayHours = (workingHoursMap[driver] && workingHoursMap[driver][dateKey]) ? workingHoursMap[driver][dateKey] : 0;
 
-        if (!weeklyData[weekKey]) weeklyData[weekKey] = {};
-        if (!weeklyData[weekKey][driver]) {
-            weeklyData[weekKey][driver] = { credit: 0, trips: 0, cash: 0, hours: 0 };
+        if (!weeklyData[weekKey]) {
+            weeklyData[weekKey] = {
+                startDate: weekStart,
+                endDate: weekEnd,
+                drivers: {}
+            };
+        }
+        if (!weeklyData[weekKey].drivers[driver]) {
+            weeklyData[weekKey].drivers[driver] = { credit: 0, trips: 0, cash: 0, hours: 0 };
         }
 
-        weeklyData[weekKey][driver].credit += credit;
-        weeklyData[weekKey][driver].trips += trips;
-        weeklyData[weekKey][driver].cash += cash;
-        weeklyData[weekKey][driver].hours += dayHours;
+        weeklyData[weekKey].drivers[driver].credit += credit;
+        weeklyData[weekKey].drivers[driver].trips += trips;
+        weeklyData[weekKey].drivers[driver].cash += cash;
+        weeklyData[weekKey].drivers[driver].hours += dayHours;
     });
 
     // --- Write Output ---
@@ -1880,19 +2000,19 @@ function generateWeeklySummary(ss) {
     let displayedWeekCounter = 0;
 
     const sortedWeekKeys = Object.keys(weeklyData).sort((a, b) => {
-        return parseDate(a.split(" - ")[0]) - parseDate(b.split(" - ")[0]);
+        return weeklyData[a].startDate.getTime() - weeklyData[b].startDate.getTime();
     });
 
     sortedWeekKeys.forEach((weekKey) => {
-        const weekStartDate = parseDate(weekKey.split(" - ")[0]);
-        const weekEndDate = parseDate(weekKey.split(" - ")[1]);
+        const weekBlock = weeklyData[weekKey];
+        const weekStartDate = weekBlock.startDate;
+        const weekEndDate = weekBlock.endDate;
 
-        const isInCurrentMonth = (weekStartDate.getMonth() === currentMonthIndex && weekStartDate.getFullYear() === currentYear) ||
-            (weekEndDate.getMonth() === currentMonthIndex && weekEndDate.getFullYear() === currentYear);
+        const isInCurrentMonth = (weekStartDate && weekStartDate.getMonth() === currentMonthIndex && weekStartDate.getFullYear() === currentYear) ||
+            (weekEndDate && weekEndDate.getMonth() === currentMonthIndex && weekEndDate.getFullYear() === currentYear);
 
-        if (weekStartDate && isInCurrentMonth) {
+        if (isInCurrentMonth) {
             displayedWeekCounter++;
-            const weekBlock = weeklyData[weekKey];
             const startRow = currentRow;
 
             const titleRange = weeklySheet.getRange(currentRow, 1, 1, 7).merge();
@@ -1912,11 +2032,11 @@ function generateWeeklySummary(ss) {
 
             currentRow++;
 
-            const drivers = Object.keys(weekBlock);
+            const drivers = Object.keys(weekBlock.drivers);
             const tableData = [];
 
             drivers.forEach(d => {
-                const info = weeklyData[weekKey][d];
+                const info = weekBlock.drivers[d];
                 const cash = info.cash;
                 const fare = driverFareMap[d] !== undefined ? driverFareMap[d] : 0.9;
 
@@ -1937,70 +2057,103 @@ function generateWeeklySummary(ss) {
                 tableData.push([d, info.credit, info.trips, cash, roundToTwo(info.hours), avgPerHour, balance]);
             });
 
-            // Write Main Table
-            const dataRange = weeklySheet.getRange(currentRow, 1, tableData.length, 7);
-            dataRange.setValues(tableData);
-            dataRange.setBorder(true, true, true, true, true, true, "black", SpreadsheetApp.BorderStyle.SOLID);
+            if (tableData.length > 0) {
+                // Write Main Table
+                const dataRange = weeklySheet.getRange(currentRow, 1, tableData.length, 7);
+                dataRange.setValues(tableData);
+                dataRange.setBorder(true, true, true, true, true, true, "black", SpreadsheetApp.BorderStyle.SOLID);
 
-            weeklySheet.getRange(currentRow, 2, tableData.length, 1).setNumberFormat("$#,##0.00");
-            weeklySheet.getRange(currentRow, 4, tableData.length, 1).setNumberFormat("$#,##0.00");
-            weeklySheet.getRange(currentRow, 5, tableData.length, 1).setNumberFormat("0.0");
-            weeklySheet.getRange(currentRow, 6, tableData.length, 2).setNumberFormat("$#,##0.00");
+                weeklySheet.getRange(currentRow, 2, tableData.length, 1).setNumberFormat("$#,##0.00");
+                weeklySheet.getRange(currentRow, 4, tableData.length, 1).setNumberFormat("$#,##0.00");
+                weeklySheet.getRange(currentRow, 5, tableData.length, 1).setNumberFormat("0.0");
+                weeklySheet.getRange(currentRow, 6, tableData.length, 2).setNumberFormat("$#,##0.00");
 
-            const totalCredit = tableData.reduce((a, b) => a + b[1], 0);
-            const totalTrips = tableData.reduce((a, b) => a + b[2], 0);
-            const totalCash = tableData.reduce((a, b) => a + b[3], 0);
-            const totalHours = tableData.reduce((a, b) => a + b[4], 0);
-            const totalAvgPerHour = totalHours > 0 ? roundToTwo(totalCredit / totalHours) : 0;
-            const totalBalance = tableData.reduce((a, b) => a + b[6], 0);
+                const totalCredit = tableData.reduce((a, b) => a + b[1], 0);
+                const totalTrips = tableData.reduce((a, b) => a + b[2], 0);
+                const totalCash = tableData.reduce((a, b) => a + b[3], 0);
+                const totalHours = tableData.reduce((a, b) => a + b[4], 0);
+                const totalAvgPerHour = totalHours > 0 ? roundToTwo(totalCredit / totalHours) : 0;
+                const totalBalance = tableData.reduce((a, b) => a + b[6], 0);
 
-            const totalRowRange = weeklySheet.getRange(currentRow + tableData.length, 1, 1, 7);
-            totalRowRange.setValues([["TOTAL", totalCredit, totalTrips, totalCash, roundToTwo(totalHours), totalAvgPerHour, totalBalance]])
-                .setFontWeight("bold")
-                .setBackground("#eeeeee")
-                .setBorder(true, true, true, true, true, true);
+                const totalRow = [
+                    "Total",
+                    roundToTwo(totalCredit),
+                    totalTrips,
+                    roundToTwo(totalCash),
+                    roundToTwo(totalHours),
+                    totalAvgPerHour,
+                    roundToTwo(totalBalance)
+                ];
 
-            weeklySheet.getRange(currentRow + tableData.length, 2, 1, 1).setNumberFormat("$#,##0.00");
-            weeklySheet.getRange(currentRow + tableData.length, 4, 1, 1).setNumberFormat("$#,##0.00");
-            weeklySheet.getRange(currentRow + tableData.length, 5, 1, 1).setNumberFormat("0.0");
-            weeklySheet.getRange(currentRow + tableData.length, 6, 1, 2).setNumberFormat("$#,##0.00");
+                const totalRange = weeklySheet.getRange(currentRow + tableData.length, 1, 1, 7);
+                totalRange.setValues([totalRow])
+                    .setFontWeight("bold")
+                    .setBackground("#eeeeee")
+                    .setBorder(true, true, true, true, true, true);
 
-            const tableEnd = currentRow + tableData.length;
+                weeklySheet.getRange(currentRow + tableData.length, 2, 1, 1).setNumberFormat("$#,##0.00");
+                weeklySheet.getRange(currentRow + tableData.length, 4, 1, 1).setNumberFormat("$#,##0.00");
+                weeklySheet.getRange(currentRow + tableData.length, 5, 1, 1).setNumberFormat("0.0");
+                weeklySheet.getRange(currentRow + tableData.length, 6, 1, 2).setNumberFormat("$#,##0.00");
 
-            // Chart 1: Total Credit by Driver (Col I = col 9, width 480px, height 310px)
-            const chart1 = weeklySheet.newChart().asColumnChart()
-                .setPosition(startRow - 1, 9, 0, 0)
-                .addRange(weeklySheet.getRange(currentRow - 1, 1, tableData.length + 1, 2))
-                .setNumHeaders(1)
-                .setOption("title", `WEEK ${displayedWeekCounter} - Total Credit`)
-                .setOption("colors", ["#1f77b4"])
-                .setOption("legend", { position: "none" })
-                .setOption("hAxis", { title: "Driver" })
-                .setOption("vAxis", { title: "Total Credit" })
-                .setOption("width", 480)
-                .setOption("height", 310)
-                .build();
-            weeklySheet.insertChart(chart1);
+                const tableEnd = currentRow + tableData.length;
 
-            // Chart 2: Trips by Driver (Col N = col 14, width 480px, height 310px)
-            const chart2 = weeklySheet.newChart().asColumnChart()
-                .setPosition(startRow - 1, 14, 0, 0)
-                .addRange(weeklySheet.getRange(currentRow - 1, 1, tableData.length + 1, 1)) // Driver Names
-                .addRange(weeklySheet.getRange(currentRow - 1, 3, tableData.length + 1, 1)) // Trips
-                .setNumHeaders(1)
-                .setOption("title", `WEEK ${displayedWeekCounter} - Trips`)
-                .setOption("colors", ["#8c564b"]) // Distinct brown color
-                .setOption("legend", { position: "none" })
-                .setOption("hAxis", { title: "Driver" })
-                .setOption("vAxis", { title: "Trips" })
-                .setOption("width", 480)
-                .setOption("height", 310)
-                .build();
-            weeklySheet.insertChart(chart2);
+                // Chart 1: Total Credit by Driver (Col I = col 9, width 480px, height 310px)
+                try {
+                    const chart1 = weeklySheet.newChart().asColumnChart()
+                        .setPosition(startRow - 1, 9, 0, 0)
+                        .addRange(weeklySheet.getRange(currentRow - 1, 1, tableData.length + 1, 2))
+                        .setNumHeaders(1)
+                        .setOption("title", `WEEK ${displayedWeekCounter} - Total Credit`)
+                        .setOption("colors", ["#1f77b4"])
+                        .setOption("legend", { position: "none" })
+                        .setOption("hAxis", { title: "Driver" })
+                        .setOption("vAxis", { title: "Total Credit" })
+                        .setOption("width", 480)
+                        .setOption("height", 310)
+                        .build();
+                    weeklySheet.insertChart(chart1);
+                } catch (eChart1) {
+                    Logger.log("Error inserting Chart 1 for week " + displayedWeekCounter + ": " + eChart1);
+                }
 
-            currentRow = Math.max(tableEnd + 2, startRow + 16);
+                // Chart 2: Trips by Driver (Col N = col 14, width 480px, height 310px)
+                try {
+                    const chart2 = weeklySheet.newChart().asColumnChart()
+                        .setPosition(startRow - 1, 14, 0, 0)
+                        .addRange(weeklySheet.getRange(currentRow - 1, 1, tableData.length + 1, 1)) // Driver Names
+                        .addRange(weeklySheet.getRange(currentRow - 1, 3, tableData.length + 1, 1)) // Trips
+                        .setNumHeaders(1)
+                        .setOption("title", `WEEK ${displayedWeekCounter} - Trips`)
+                        .setOption("colors", ["#8c564b"]) // Distinct brown color
+                        .setOption("legend", { position: "none" })
+                        .setOption("hAxis", { title: "Driver" })
+                        .setOption("vAxis", { title: "Trips" })
+                        .setOption("width", 480)
+                        .setOption("height", 310)
+                        .build();
+                    weeklySheet.insertChart(chart2);
+                } catch (eChart2) {
+                    Logger.log("Error inserting Chart 2 for week " + displayedWeekCounter + ": " + eChart2);
+                }
+
+                currentRow = Math.max(tableEnd + 2, startRow + 16);
+            }
         }
     });
+
+    if (displayedWeekCounter === 0) {
+        weeklySheet.getRange("A3:G3").merge()
+            .setValue("No weekly data available yet for this month.")
+            .setFontStyle("italic")
+            .setHorizontalAlignment("center")
+            .setBackground("#f9f9f9");
+    } else {
+        weeklySheet.autoResizeColumns(1, 7);
+        for (let col = 1; col <= 7; col++) {
+            weeklySheet.setColumnWidth(col, Math.max(weeklySheet.getColumnWidth(col) + 15, 110));
+        }
+    }
 }
 
 
@@ -2015,13 +2168,17 @@ function generateBonusReport(ss) {
     Logger.log("--- Starting generateBonusReport (Styled) ---");
 
     const summarySheet = ss.getSheetByName("Summary");
+    if (!summarySheet) {
+        Logger.log("generateBonusReport: Summary sheet not found.");
+        return;
+    }
     const bonusSheetName = "Bonus";
 
     // 1. --- Get Main Data from Summary (WITH DATE FILL-DOWN) ---
     const lastRowCurrent = summarySheet.getLastRow();
     let allRows = [];
     if (lastRowCurrent >= 3) {
-        const rawRows = summarySheet.getRange("A3:D" + lastRowCurrent).getValues();
+        const rawRows = summarySheet.getRange(3, 1, lastRowCurrent - 2, 4).getValues();
 
         let lastSeenDate = null;
         allRows = rawRows.map(r => {
@@ -2046,19 +2203,11 @@ function generateBonusReport(ss) {
         }
     }
 
-    // 2. --- Year Detection ---
-    const currentMonthName = ss.getName().split(" ")[0];
-    const now = new Date();
-    let currentYear = now.getFullYear();
-    if (allRows.length > 0 && allRows[0][0] instanceof Date) {
-        currentYear = allRows[0][0].getFullYear();
-    } else if (currentMonthName.startsWith("Jan") && now.getMonth() === 11) {
-        currentYear = currentYear + 1;
-    }
+    // 2. --- Month and Year Detection ---
+    const { monthIndex: currentMonthIndex, year: currentYear, monthName: currentMonthName } = getSpreadsheetMonthAndYear(ss, allRows);
 
     // 3. --- Look Back Logic (WITH DATE FILL-DOWN) ---
-    const firstOfMonth = new Date(Date.parse(`${currentMonthName} 1, ${currentYear}`));
-    const currentMonthIndex = firstOfMonth.getMonth();
+    const firstOfMonth = new Date(currentYear, currentMonthIndex, 1);
     const firstWeekMonday = getMonday(firstOfMonth);
 
     if (firstWeekMonday.getMonth() < currentMonthIndex || firstWeekMonday.getFullYear() < firstOfMonth.getFullYear()) {
@@ -2066,8 +2215,15 @@ function generateBonusReport(ss) {
             const prevMonthDate = new Date(firstOfMonth);
             prevMonthDate.setMonth(currentMonthIndex - 1);
             const prevMonthName = prevMonthDate.toLocaleString('en-US', { month: 'long' });
-            const prevFileName = `${prevMonthName} - Drivers Daily Balance`;
-            const files = DriveApp.getFilesByName(prevFileName);
+
+            let files = DriveApp.getFilesByName(`${prevMonthName} - Drivers Daily Balance`);
+            if (!files.hasNext()) {
+                files = DriveApp.getFilesByName(`Drivers Daily Balance - ${prevMonthName}`);
+            }
+            if (!files.hasNext()) {
+                files = DriveApp.getFilesByName(`${prevMonthName} ${prevMonthDate.getFullYear()} - Drivers Daily Balance`);
+            }
+
             if (files.hasNext()) {
                 const prevFile = files.next();
                 const prevSpreadsheet = SpreadsheetApp.openById(prevFile.getId());
@@ -2106,33 +2262,40 @@ function generateBonusReport(ss) {
         if (!date) return;
 
         const driver = row[driverIdx];
-        const credit = Number(row[creditIdx]) || 0;
+        const credit = parseNumber(row[creditIdx]) || 0;
 
         const weekStart = getMonday(date);
         const weekEnd = new Date(weekStart);
         weekEnd.setDate(weekEnd.getDate() + 6);
         const weekKey = `${formatDate(weekStart)} - ${formatDate(weekEnd)}`;
 
-        if (!weeklyData[weekKey]) weeklyData[weekKey] = {};
-        if (!weeklyData[weekKey][driver]) {
-            weeklyData[weekKey][driver] = { credit: 0 };
+        if (!weeklyData[weekKey]) {
+            weeklyData[weekKey] = {
+                startDate: weekStart,
+                endDate: weekEnd,
+                drivers: {}
+            };
         }
-        weeklyData[weekKey][driver].credit += credit;
+        if (!weeklyData[weekKey].drivers[driver]) {
+            weeklyData[weekKey].drivers[driver] = { credit: 0 };
+        }
+        weeklyData[weekKey].drivers[driver].credit += credit;
     });
 
     const includeNonDispatchInBonus = true;
-
     let allQualifiedDrivers = [];
 
     Object.keys(weeklyData).forEach(weekKey => {
-        const weekEndDate = parseDate(weekKey.split(" - ")[1]);
+        const weekBlock = weeklyData[weekKey];
+        const weekStartDate = weekBlock.startDate;
+        const weekEndDate = weekBlock.endDate;
 
-        if (weekEndDate.getMonth() === currentMonthIndex && weekEndDate.getFullYear() === currentYear) {
+        const isCurrentMonthWeek = (weekEndDate && weekEndDate.getMonth() === currentMonthIndex && weekEndDate.getFullYear() === currentYear) ||
+            (weekStartDate && weekStartDate.getMonth() === currentMonthIndex && weekStartDate.getFullYear() === currentYear);
 
-            const weekBlock = weeklyData[weekKey];
-            for (const driver in weekBlock) {
-
-                const info = weekBlock[driver];
+        if (isCurrentMonthWeek) {
+            for (const driver in weekBlock.drivers) {
+                const info = weekBlock.drivers[driver];
                 const roundedCredit = Math.round(info.credit);
 
                 if (nonDispatchDrivers.has(driver)) {
@@ -2155,26 +2318,32 @@ function generateBonusReport(ss) {
         bonusSheet = ss.insertSheet(bonusSheetName);
     }
 
+    // Ensure bonusSheet has at least 3 columns
+    if (bonusSheet.getMaxColumns() < 3) {
+        bonusSheet.insertColumnsAfter(bonusSheet.getMaxColumns(), 3 - bonusSheet.getMaxColumns());
+    }
+
     bonusSheet.clear();
-    bonusSheet.getRange("A:C").setBackground(null).setBorder(false, false, false, false, false, false);
+
+    const headerRange = bonusSheet.getRange("A1:C1");
+    headerRange.setValues([["Driver", "Total Credit", "Week Period"]])
+        .setFontWeight("bold")
+        .setFontColor("white")
+        .setBackground("#3c78d8")
+        .setHorizontalAlignment("center")
+        .setVerticalAlignment("middle")
+        .setFontSize(11);
 
     if (allQualifiedDrivers.length > 0) {
         allQualifiedDrivers.sort((a, b) => {
-            const dateA = parseDate(a[2].split(" - ")[0]);
-            const dateB = parseDate(b[2].split(" - ")[0]);
-            if (dateA < dateB) return -1;
-            if (dateA > dateB) return 1;
-            return a[0].localeCompare(b[0]);
+            const blockA = weeklyData[a[2]];
+            const blockB = weeklyData[b[2]];
+            if (blockA && blockB) {
+                const diff = blockA.startDate.getTime() - blockB.startDate.getTime();
+                if (diff !== 0) return diff;
+            }
+            return String(a[0]).localeCompare(String(b[0]));
         });
-
-        const headerRange = bonusSheet.getRange("A1:C1");
-        headerRange.setValues([["Driver", "Total Credit", "Week Period"]])
-            .setFontWeight("bold")
-            .setFontColor("white")
-            .setBackground("#3c78d8")
-            .setHorizontalAlignment("center")
-            .setVerticalAlignment("middle")
-            .setFontSize(11);
 
         const dataRange = bonusSheet.getRange(2, 1, allQualifiedDrivers.length, 3);
         dataRange.setValues(allQualifiedDrivers)
@@ -2207,13 +2376,18 @@ function generateBonusReport(ss) {
         bonusSheet.getRange(totalRow, 2, 2, 1).setNumberFormat("$#,##0");
 
     } else {
-        bonusSheet.getRange("A1").setValue("No Bonuses for this period.").setFontWeight("bold");
+        bonusSheet.getRange("A2:C2").merge()
+            .setValue("No drivers have reached the threshold yet for this period.")
+            .setFontStyle("italic")
+            .setHorizontalAlignment("center")
+            .setVerticalAlignment("middle")
+            .setBackground("#f9f9f9");
     }
 
     bonusSheet.autoResizeColumns(1, 3);
-    bonusSheet.setColumnWidth(1, bonusSheet.getColumnWidth(1) + 20);
-    bonusSheet.setColumnWidth(2, bonusSheet.getColumnWidth(2) + 20);
-    bonusSheet.setColumnWidth(3, bonusSheet.getColumnWidth(3) + 20);
+    bonusSheet.setColumnWidth(1, Math.max(bonusSheet.getColumnWidth(1) + 20, 140));
+    bonusSheet.setColumnWidth(2, Math.max(bonusSheet.getColumnWidth(2) + 20, 120));
+    bonusSheet.setColumnWidth(3, Math.max(bonusSheet.getColumnWidth(3) + 20, 180));
 }
 
 
@@ -2300,45 +2474,7 @@ function loadNoShowMap(ss, sheetName) {
  */
 function parseDDMMYY(value) {
     if (!value) return null;
-
-    // Handle native Google Sheets Date objects directly
-    if (value instanceof Date) {
-        return new Date(value.getFullYear(), value.getMonth(), value.getDate());
-    }
-
-    const str = String(value).trim();
-
-    // Handle DD-MM-YY format (e.g., "01-06-26")
-    const dashParts = str.split("-");
-    if (dashParts.length === 3) {
-        const day = parseInt(dashParts[0], 10);
-        const month = parseInt(dashParts[1], 10) - 1; // zero-based
-        let year = parseInt(dashParts[2], 10);
-        if (year < 100) year += 2000; // 26 → 2026
-        if (isNaN(day) || isNaN(month) || isNaN(year)) return null;
-        const d = new Date(year, month, day);
-        return isNaN(d.getTime()) ? null : d;
-    }
-
-    // Handle DD/MM/YYYY format (e.g., "01/06/2026")
-    const slashParts = str.split("/");
-    if (slashParts.length === 3) {
-        const day = parseInt(slashParts[0], 10);
-        const month = parseInt(slashParts[1], 10) - 1;
-        let year = parseInt(slashParts[2], 10);
-        if (year < 100) year += 2000;
-        if (isNaN(day) || isNaN(month) || isNaN(year)) return null;
-        const d = new Date(year, month, day);
-        return isNaN(d.getTime()) ? null : d;
-    }
-
-    // Final fallback: try standard JS Date parser for strings like "Thursday, June 25, 2026"
-    const fallback = new Date(str);
-    if (!isNaN(fallback.getTime())) {
-        return new Date(fallback.getFullYear(), fallback.getMonth(), fallback.getDate());
-    }
-
-    return null;
+    return parseDate(value);
 }
 
 // =================================================================
@@ -2353,24 +2489,15 @@ function generateAngelReport(ss) {
     if (!summarySheet) return;
 
     // 1. --- Detect Month and Year ---
-    const ssName = ss.getName();
-    const monthMatch = ssName.match(/^(January|February|March|April|May|June|July|August|September|October|November|December)/i);
-    const currentMonthName = monthMatch ? monthMatch[1] : null;
-
-    if (!currentMonthName) return;
-
     const lastRow = summarySheet.getLastRow();
-    let currentYear = new Date().getFullYear();
+    let sampleRows = [];
     if (lastRow >= 3) {
-        const firstDateVal = summarySheet.getRange("A3").getValue();
-        if (firstDateVal instanceof Date) {
-            currentYear = firstDateVal.getFullYear();
-        }
+        sampleRows = summarySheet.getRange(3, 1, Math.min(lastRow - 2, 30), 2).getValues();
     }
+    const { monthIndex: currentMonthIndex, year: currentYear, monthName: currentMonthName } = getSpreadsheetMonthAndYear(ss, sampleRows);
 
-    const firstOfMonth = new Date(Date.parse(`${currentMonthName} 1, ${currentYear}`));
-    if (isNaN(firstOfMonth.getTime())) return;
-    const endDate = new Date(currentYear, firstOfMonth.getMonth() + 1, 0);
+    const firstOfMonth = new Date(currentYear, currentMonthIndex, 1);
+    const endDate = new Date(currentYear, currentMonthIndex + 1, 0);
     const reportStartDate = getMonday(firstOfMonth);
 
     // 2. --- Initialize Data Map ---
@@ -2378,17 +2505,18 @@ function generateAngelReport(ss) {
 
     function mapRowToAngelData(row, colIndices) {
         const driverName = String(row[1] || "");
-        if (driverName.includes(targetDriver) && row[0] instanceof Date) {
-            let dateKey = row[0].toDateString();
+        const d = parseDate(row[0]);
+        if (driverName.toLowerCase().includes(targetDriver.toLowerCase()) && d) {
+            let dateKey = d.toDateString();
             const cIdx = colIndices ? colIndices.credit : 2;
-            const tIdx = colIndices ? colIndices.trips : 3;
-            const caIdx = colIndices ? colIndices.cash : 4;
-            const nsIdx = colIndices ? colIndices.noShow : 5;
+            const tIdx = colIndices ? colIndices.trips : 5;
+            const caIdx = colIndices ? colIndices.cash : 6;
+            const nsIdx = colIndices ? colIndices.noShow : 7;
             angelDataMap[dateKey] = {
-                credit: Number(row[cIdx]) || 0,
-                trips: Number(row[tIdx]) || 0,
-                cash: Number(row[caIdx]) || 0,
-                noShow: Number(row[nsIdx]) || 0
+                credit: parseNumber(row[cIdx]) || 0,
+                trips: parseNumber(row[tIdx]) || 0,
+                cash: parseNumber(row[caIdx]) || 0,
+                noShow: parseNumber(row[nsIdx]) || 0
             };
         }
     }
@@ -2399,9 +2527,15 @@ function generateAngelReport(ss) {
             const prevMonthDate = new Date(firstOfMonth);
             prevMonthDate.setMonth(firstOfMonth.getMonth() - 1);
             const prevMonthName = prevMonthDate.toLocaleString('en-US', { month: 'long' });
-            const prevFileName = `${prevMonthName} - Drivers Daily Balance`;
 
-            const files = DriveApp.getFilesByName(prevFileName);
+            let files = DriveApp.getFilesByName(`${prevMonthName} - Drivers Daily Balance`);
+            if (!files.hasNext()) {
+                files = DriveApp.getFilesByName(`Drivers Daily Balance - ${prevMonthName}`);
+            }
+            if (!files.hasNext()) {
+                files = DriveApp.getFilesByName(`${prevMonthName} ${prevMonthDate.getFullYear()} - Drivers Daily Balance`);
+            }
+
             if (files.hasNext()) {
                 const prevFile = files.next();
                 const prevSpreadsheet = SpreadsheetApp.openById(prevFile.getId());
@@ -2411,9 +2545,9 @@ function generateAngelReport(ss) {
                     const prevHeaders = prevSummarySheet.getRange(2, 1, 1, Math.min(prevSummarySheet.getLastColumn(), 9)).getDisplayValues()[0];
                     const prevIndices = {
                         credit: findMainSummaryCol(prevHeaders, ['credit'], 2),
-                        trips: findMainSummaryCol(prevHeaders, ['trips', 'trip'], 3),
-                        cash: findMainSummaryCol(prevHeaders, ['cash'], 4),
-                        noShow: findMainSummaryCol(prevHeaders, ['no show', 'noshow'], 5)
+                        trips: findMainSummaryCol(prevHeaders, ['trips', 'trip'], 5),
+                        cash: findMainSummaryCol(prevHeaders, ['cash'], 6),
+                        noShow: findMainSummaryCol(prevHeaders, ['no show', 'noshow'], 7)
                     };
                     const prevData = prevSummarySheet.getRange(3, 1, prevSummarySheet.getLastRow() - 2, 11).getValues();
 
@@ -2696,44 +2830,68 @@ function formatDate(date) {
 
 function parseDate(value) {
     if (!value) return null;
-    if (value instanceof Date) {
+    if (value instanceof Date || Object.prototype.toString.call(value) === '[object Date]' || (typeof value === 'object' && typeof value.getTime === 'function')) {
         return new Date(value.getFullYear(), value.getMonth(), value.getDate());
     }
     if (typeof value === "string") {
         const str = value.trim();
         if (!str) return null;
 
-        // Standard JS Date parsing for strings like "Tuesday, September 1, 2026"
-        const std = new Date(str);
-        if (!isNaN(std.getTime()) && /[a-zA-Z]/.test(str)) {
-            return new Date(std.getFullYear(), std.getMonth(), std.getDate());
+        // 1. Strings with month names like "Tuesday, September 1, 2026"
+        if (/[a-zA-Z]/.test(str)) {
+            const std = new Date(str);
+            if (!isNaN(std.getTime())) {
+                return new Date(std.getFullYear(), std.getMonth(), std.getDate());
+            }
         }
 
-        // Try parseDDMMYY (e.g. "01-09-26", "01-09-2026")
-        const dd = parseDDMMYY(str);
-        if (dd && !isNaN(dd.getTime())) return dd;
-
-        // Try MM/DD/YYYY or DD/MM/YYYY format with slashes
-        const parts = str.split("/");
-        if (parts.length === 3) {
-            const p0 = parseInt(parts[0], 10);
-            const p1 = parseInt(parts[1], 10);
-            let year = parseInt(parts[2], 10);
+        // 2. Slash format: "MM/DD/YYYY" (from formatDate) or "DD/MM/YYYY"
+        const slashParts = str.split("/");
+        if (slashParts.length === 3) {
+            const p0 = parseInt(slashParts[0], 10);
+            const p1 = parseInt(slashParts[1], 10);
+            let year = parseInt(slashParts[2], 10);
             if (year < 100) year += 2000;
             let month, day;
             if (p0 > 12) {
+                // p0 cannot be month, must be DD/MM/YYYY
                 day = p0;
                 month = p1 - 1;
+            } else if (p1 > 12) {
+                // p1 cannot be month, must be MM/DD/YYYY
+                month = p0 - 1;
+                day = p1;
             } else {
+                // Default to standard MM/DD/YYYY as produced by formatDate
                 month = p0 - 1;
                 day = p1;
             }
-            const d = new Date(year, month, day);
-            if (!isNaN(d.getTime())) return d;
+            if (month >= 0 && month < 12 && day >= 1 && day <= 31) {
+                const d = new Date(year, month, day);
+                if (!isNaN(d.getTime())) return d;
+            }
         }
 
-        if (!isNaN(std.getTime())) {
-            return new Date(std.getFullYear(), std.getMonth(), std.getDate());
+        // 3. Dash format: "DD-MM-YYYY", "DD-MM-YY", or "YYYY-MM-DD"
+        const dashParts = str.split("-");
+        if (dashParts.length === 3) {
+            const p0 = parseInt(dashParts[0], 10);
+            const p1 = parseInt(dashParts[1], 10);
+            const p2 = parseInt(dashParts[2], 10);
+            if (p0 > 1000) {
+                return new Date(p0, p1 - 1, p2);
+            }
+            let year = p2 < 100 ? p2 + 2000 : p2;
+            let month = p1 - 1;
+            let day = p0;
+            if (month >= 0 && month < 12 && day >= 1 && day <= 31) {
+                return new Date(year, month, day);
+            }
+        }
+
+        const fallback = new Date(str);
+        if (!isNaN(fallback.getTime())) {
+            return new Date(fallback.getFullYear(), fallback.getMonth(), fallback.getDate());
         }
     }
     return null;
