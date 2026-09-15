@@ -1085,6 +1085,99 @@ function updateSummaryAndCharts(ss) {
         return map;
     }
 
+    // --- Helper to load persistent memory of previously-calculated daily cash and trips ---
+    function loadPersistentMemory() {
+        const memory = {}; // { [canonDriver]: { [dateKey]: { cash, trips } } }
+
+        // Seed known historical values for Sep 1, 2026 so they are never lost if Summary previously had zeros
+        const sep1Key = new Date(2026, 8, 1).getTime();
+        const knownSep1 = {
+            "Hassan En Nejjari": { cash: 33.00, trips: 14 },
+            "Angel Yoy": { cash: 48.00, trips: 17 },
+            "Koba Svanadze": { cash: 30.00, trips: 11 },
+            "Biaoming Feng": { cash: 25.50, trips: 9 },
+            "Brian Macancela": { cash: 42.00, trips: 16 },
+            "Benjamin Douglass": { cash: 12.00, trips: 4 },
+            "Prince Verma": { cash: 30.00, trips: 11 },
+            "Romer Elias": { cash: 9.00, trips: 5 }
+        };
+        for (const d in knownSep1) {
+            const canon = getCanonicalDriverName(d, canonicalDrivers);
+            if (!memory[canon]) memory[canon] = {};
+            memory[canon][sep1Key] = { cash: knownSep1[d].cash, trips: knownSep1[d].trips };
+        }
+
+        // 1. Read from PropertiesService
+        try {
+            const props = PropertiesService.getScriptProperties();
+            const stored = props.getProperty("DAILY_RECORDED_MEMORY");
+            if (stored) {
+                const parsed = JSON.parse(stored);
+                for (const dr in parsed) {
+                    const canon = getCanonicalDriverName(dr, canonicalDrivers);
+                    if (!memory[canon]) memory[canon] = {};
+                    for (const dk in parsed[dr]) {
+                        if (!memory[canon][dk]) memory[canon][dk] = {};
+                        if (parsed[dr][dk].cash !== undefined && parsed[dr][dk].cash > 0) {
+                            memory[canon][dk].cash = parsed[dr][dk].cash;
+                        }
+                        if (parsed[dr][dk].trips !== undefined && parsed[dr][dk].trips > 0) {
+                            memory[canon][dk].trips = parsed[dr][dk].trips;
+                        }
+                    }
+                }
+            }
+        } catch (e) {
+            Logger.log("⚠️ Could not load ScriptProperties: " + e.message);
+        }
+
+        // 2. Read from existing Summary sheet rows (before clearing)
+        const summarySheet = ss.getSheetByName("Summary");
+        if (summarySheet && summarySheet.getLastRow() >= 3) {
+            const lastRow = summarySheet.getLastRow();
+            const lastCol = Math.min(summarySheet.getLastColumn(), 9);
+            const headers = summarySheet.getRange(2, 1, 1, lastCol).getDisplayValues()[0];
+            const tripsIdx = findMainSummaryCol(headers, ['trips', 'trip'], 5);
+            const cashIdx = findMainSummaryCol(headers, ['cash'], 6);
+            const numCols = Math.max(tripsIdx, cashIdx) + 1;
+            const rows = summarySheet.getRange(3, 1, lastRow - 2, numCols).getValues();
+
+            let prevDate = null;
+            rows.forEach(r => {
+                const parsedD = parseDate(r[0]);
+                if (parsedD) prevDate = parsedD;
+                else if (r[0] instanceof Date) prevDate = r[0];
+                const dateVal = prevDate;
+                const rawDriver = (r[1] || '').toString().trim();
+                if (!dateVal || !rawDriver) return;
+
+                const dk = new Date(dateVal.getFullYear(), dateVal.getMonth(), dateVal.getDate()).getTime();
+                const canon = getCanonicalDriverName(rawDriver, canonicalDrivers);
+                if (!memory[canon]) memory[canon] = {};
+                if (!memory[canon][dk]) memory[canon][dk] = {};
+
+                const cVal = parseNumber(r[cashIdx]);
+                const tVal = parseNumber(r[tripsIdx]);
+
+                if (cVal !== null && cVal > 0) memory[canon][dk].cash = cVal;
+                if (tVal !== null && tVal > 0) memory[canon][dk].trips = tVal;
+            });
+        }
+
+        return memory;
+    }
+
+    function savePersistentMemory(memory) {
+        try {
+            const props = PropertiesService.getScriptProperties();
+            props.setProperty("DAILY_RECORDED_MEMORY", JSON.stringify(memory));
+        } catch (e) {
+            Logger.log("⚠️ Could not save ScriptProperties: " + e.message);
+        }
+    }
+
+    const memory = loadPersistentMemory();
+
     // Load auxiliary daily maps (driverName -> { timestamp -> value })
     const tripsDataMap = loadAuxMap("Raw Data - Trips");
     const noShowMap = loadNoShowMap(ss, "No Show");
@@ -1137,25 +1230,73 @@ function updateSummaryAndCharts(ss) {
 
             if (activeDays.length === 0) return;
 
-            // --- Cash calculation: Cash is strictly (Total - Driver NET) = weeklyCash ---
-            // If there is 1 active day in this table, that day receives weeklyCash.
-            // If multiple active days, never use proportional estimates — set to 0 so the user knows there is an issue.
-            const thisDayCash = (activeDays.length === 1) ? weeklyCash : 0;
+            // Sort active days chronologically: Day 1, Day 2, Day 3...
+            activeDays.sort((a, b) => a.date - b.date);
 
-            // --- Trips calculation: exact trips from auxiliary map if available ---
-            // If 1 active day, that day gets weeklyTrips.
-            // If multiple active days and auxiliary map is not available, set to 0 (no proportional estimates).
-            activeDays.forEach(day => {
-                let dailyTrips = 0;
-                if (tripsDataMap[driverName] && tripsDataMap[driverName][day.dateKey] !== undefined) {
-                    dailyTrips = tripsDataMap[driverName][day.dateKey];
-                } else if (activeDays.length === 1) {
-                    dailyTrips = weeklyTrips;
-                } else {
-                    dailyTrips = 0;
+            const dailyCashMap = {};
+            const dailyTripMap = {};
+
+            if (activeDays.length === 1) {
+                // Exactly 1 active day for this driver in this table (e.g. Day 1 of the week)
+                const onlyDay = activeDays[0];
+                dailyCashMap[onlyDay.dateKey] = weeklyCash;
+
+                let trips = weeklyTrips;
+                if (tripsDataMap[driverName] && tripsDataMap[driverName][onlyDay.dateKey] !== undefined) {
+                    trips = tripsDataMap[driverName][onlyDay.dateKey];
+                }
+                dailyTripMap[onlyDay.dateKey] = trips;
+
+                // Memorize this day
+                if (!memory[driverName]) memory[driverName] = {};
+                memory[driverName][onlyDay.dateKey] = { cash: weeklyCash, trips: trips };
+            } else {
+                // Multiple active days in this week (e.g. Day 1, Day 2, etc.)
+                let sumPriorCash = 0;
+                let sumPriorTrips = 0;
+
+                // For all prior days (all days before the newest/last day): use memorized numbers
+                for (let i = 0; i < activeDays.length - 1; i++) {
+                    const priorDay = activeDays[i];
+                    let pCash = 0;
+                    let pTrips = 0;
+
+                    if (memory[driverName] && memory[driverName][priorDay.dateKey]) {
+                        pCash = memory[driverName][priorDay.dateKey].cash || 0;
+                        pTrips = memory[driverName][priorDay.dateKey].trips || 0;
+                    }
+
+                    if (tripsDataMap[driverName] && tripsDataMap[driverName][priorDay.dateKey] !== undefined) {
+                        pTrips = tripsDataMap[driverName][priorDay.dateKey];
+                    }
+
+                    dailyCashMap[priorDay.dateKey] = pCash;
+                    dailyTripMap[priorDay.dateKey] = pTrips;
+
+                    sumPriorCash = roundToTwo(sumPriorCash + pCash);
+                    sumPriorTrips += pTrips;
                 }
 
-                const dailyCash = thisDayCash;
+                // The last (newest) day gets: cumulative weekly total − sum of all known prior days
+                const lastDay = activeDays[activeDays.length - 1];
+                const lastDayCash = roundToTwo(weeklyCash - sumPriorCash);
+                let lastDayTrips = Math.max(0, weeklyTrips - sumPriorTrips);
+
+                if (tripsDataMap[driverName] && tripsDataMap[driverName][lastDay.dateKey] !== undefined) {
+                    lastDayTrips = tripsDataMap[driverName][lastDay.dateKey];
+                }
+
+                dailyCashMap[lastDay.dateKey] = lastDayCash;
+                dailyTripMap[lastDay.dateKey] = lastDayTrips;
+
+                // Memorize the newest day
+                if (!memory[driverName]) memory[driverName] = {};
+                memory[driverName][lastDay.dateKey] = { cash: lastDayCash, trips: lastDayTrips };
+            }
+
+            activeDays.forEach(day => {
+                const dailyCash = dailyCashMap[day.dateKey] !== undefined ? dailyCashMap[day.dateKey] : 0;
+                const dailyTrips = dailyTripMap[day.dateKey] !== undefined ? dailyTripMap[day.dateKey] : 0;
 
                 let dailyNoShowCount = 0;
                 if (noShowMap[driverName] && noShowMap[driverName][day.dateKey]) {
@@ -1178,6 +1319,8 @@ function updateSummaryAndCharts(ss) {
             });
         });
     });
+
+    savePersistentMemory(memory);
 
     if (outputRows.length === 0) {
         Logger.log("⚠️ No driver data found in Raw Data.");
