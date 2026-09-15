@@ -439,6 +439,28 @@ function generateWorkingHoursSheetFromMenu() {
 }
 
 /**
+ * Safely parses a date header from a sheet (display value string + raw cell value).
+ * Prioritizes DD-MM-YY display string to prevent Google Sheets US-locale Date object distortion.
+ */
+function parseSheetDateHeader(displayHeader, rawHeader) {
+    if (displayHeader) {
+        const disp = String(displayHeader).trim();
+        if (disp && !disp.toLowerCase().includes("total")) {
+            const d = parseDDMMYY(disp);
+            if (d && !isNaN(d.getTime())) return d;
+        }
+    }
+    if (rawHeader instanceof Date) {
+        return new Date(rawHeader.getFullYear(), rawHeader.getMonth(), rawHeader.getDate());
+    }
+    if (rawHeader) {
+        const d = parseDDMMYY(rawHeader);
+        if (d && !isNaN(d.getTime())) return d;
+    }
+    return null;
+}
+
+/**
  * Reads the "Working hours" sheet and returns:
  * - map: { driverName -> { dateTimestamp -> hours } }
  * - driverTotalHours: { driverName -> totalHours }
@@ -460,16 +482,7 @@ function loadWorkingHoursMap(ss) {
         const hText = (displayHeaders[c] || '').toString().toLowerCase().trim();
         if (hText.includes("total")) continue;
 
-        let d = null;
-        if (rawHeaders[c] instanceof Date) {
-            d = new Date(rawHeaders[c].getFullYear(), rawHeaders[c].getMonth(), rawHeaders[c].getDate());
-        } else {
-            d = parseDDMMYY(displayHeaders[c]) || parseDate(displayHeaders[c]);
-            if (!d) {
-                const fb = new Date(displayHeaders[c]);
-                if (!isNaN(fb.getTime())) d = new Date(fb.getFullYear(), fb.getMonth(), fb.getDate());
-            }
-        }
+        const d = parseSheetDateHeader(displayHeaders[c], rawHeaders[c]);
         if (d && !isNaN(d.getTime())) dateCols[c] = d.getTime();
     }
 
@@ -497,19 +510,28 @@ function loadWorkingHoursMap(ss) {
         if (!map[canonDriver]) map[canonDriver] = {};
 
         let driverSum = 0;
+        const seenDatesForRow = {};
 
         for (const c in dateCols) {
             const dateKey = dateCols[c];
             const val = parseNumber(data[r][c]);
             if (val !== null && !isNaN(val)) {
-                map[rawDriver][dateKey] = val;
-                map[canonDriver][dateKey] = val;
-                if (val > 0) {
-                    driverSum += val;
-                    dailyTotalHours[dateKey] = (dailyTotalHours[dateKey] || 0) + val;
+                if (seenDatesForRow[dateKey] === undefined || val > seenDatesForRow[dateKey]) {
+                    seenDatesForRow[dateKey] = val;
                 }
             }
         }
+
+        for (const dateKey in seenDatesForRow) {
+            const val = seenDatesForRow[dateKey];
+            map[rawDriver][dateKey] = val;
+            map[canonDriver][dateKey] = val;
+            if (val > 0) {
+                driverSum += val;
+                dailyTotalHours[dateKey] = (dailyTotalHours[dateKey] || 0) + val;
+            }
+        }
+
         driverTotalHours[rawDriver] = roundToTwo(driverSum);
         driverTotalHours[canonDriver] = roundToTwo(driverSum);
     }
@@ -520,6 +542,7 @@ function loadWorkingHoursMap(ss) {
 /**
  * Generates/syncs the "Working hours" sheet based on "Raw Data".
  * ADDITIVE ONLY: Never erases or clears existing entered hours.
+ * Automatically de-duplicates any duplicate columns/rows from previous runs.
  * Only adds new date columns and new driver rows when they appear in Raw Data.
  */
 function generateWorkingHoursSheet(ss) {
@@ -620,71 +643,184 @@ function generateWorkingHoursSheet(ss) {
         bottomRow.push(`=SUM(B${bottomRowIndex}:${lastDateColLetter}${bottomRowIndex})`);
         matrixRows.push(bottomRow);
 
-        hoursSheet.getRange(1, 1, 1, headerRow.length).setValues([headerRow]);
+        hoursSheet.getRange(1, 1, 1, headerRow.length).setNumberFormat("@").setValues([headerRow]);
         hoursSheet.getRange(2, 1, matrixRows.length, headerRow.length).setValues(matrixRows);
 
         applyWorkingHoursFormatting(hoursSheet, driverList.length, numDateCols, bottomRowIndex);
         return;
     }
 
-    // --- ADDITIVE SYNC (Sheet already exists: NEVER clear existing user hours!) ---
-    const rawHeaders = hoursSheet.getRange(1, 1, 1, existingLastCol).getValues()[0];
-    const displayHeaders = hoursSheet.getRange(1, 1, 1, existingLastCol).getDisplayValues()[0];
+    // --- ADDITIVE SYNC & AUTOMATIC CLEANUP OF ANY DUPLICATES ---
+    // STEP 1: Delete any trailing columns beyond the first "Total" header
+    const initialRawHeaders = hoursSheet.getRange(1, 1, 1, existingLastCol).getValues()[0];
+    const initialDisplayHeaders = hoursSheet.getRange(1, 1, 1, existingLastCol).getDisplayValues()[0];
 
-    let totalColNumber = -1; // 1-based colNumber for "Total Hours"
-    const existingDateCols = {}; // timestamp -> 1-based colNumber
-
+    let firstTotalCol = -1;
     for (let c = 1; c < existingLastCol; c++) {
-        const hText = (displayHeaders[c] || '').toString().toLowerCase().trim();
+        const hText = (initialDisplayHeaders[c] || '').toString().toLowerCase().trim();
+        if (hText.includes("total")) {
+            firstTotalCol = c + 1; // 1-based column index
+            break;
+        }
+    }
+
+    if (firstTotalCol > 1 && existingLastCol > firstTotalCol) {
+        hoursSheet.deleteColumns(firstTotalCol + 1, existingLastCol - firstTotalCol);
+        SpreadsheetApp.flush();
+    }
+
+    // STEP 2: Deduplicate columns between Col B and Total Hours
+    const midLastCol = hoursSheet.getLastColumn();
+    const midLastRow = hoursSheet.getLastRow();
+    const midDisplayHeaders = hoursSheet.getRange(1, 1, 1, midLastCol).getDisplayValues()[0];
+    const midRawHeaders = hoursSheet.getRange(1, 1, 1, midLastCol).getValues()[0];
+
+    let totalColIndex = midLastCol;
+    for (let c = 1; c < midLastCol; c++) {
+        const hText = (midDisplayHeaders[c] || '').toString().toLowerCase().trim();
+        if (hText.includes("total")) {
+            totalColIndex = c + 1;
+            break;
+        }
+    }
+
+    const seenDates = {}; // normKey -> 1-based primaryColNumber
+    const colsToDelete = [];
+
+    for (let c = 1; c < totalColIndex - 1; c++) {
+        const colNum = c + 1;
+        const disp = (midDisplayHeaders[c] || '').toString().trim();
+        const raw = midRawHeaders[c];
+
+        if (!disp || disp.toLowerCase().includes("total")) {
+            colsToDelete.push(colNum);
+            continue;
+        }
+
+        const d = parseSheetDateHeader(disp, raw);
+        const normKey = d ? d.getTime() : disp.replace(/[^0-9]/g, '');
+
+        if (seenDates[normKey]) {
+            const primaryCol = seenDates[normKey];
+            if (midLastRow > 1) {
+                const primaryRange = hoursSheet.getRange(2, primaryCol, midLastRow - 1, 1);
+                const dupRange = hoursSheet.getRange(2, colNum, midLastRow - 1, 1);
+                const pVals = primaryRange.getValues();
+                const dVals = dupRange.getValues();
+                let needUpdate = false;
+                for (let r = 0; r < pVals.length; r++) {
+                    const pNum = parseNumber(pVals[r][0]);
+                    const dNum = parseNumber(dVals[r][0]);
+                    if ((pNum === null || pNum === 0) && dNum !== null && dNum > 0) {
+                        pVals[r][0] = dNum;
+                        needUpdate = true;
+                    }
+                }
+                if (needUpdate) primaryRange.setValues(pVals);
+            }
+            colsToDelete.push(colNum);
+        } else {
+            seenDates[normKey] = colNum;
+        }
+    }
+
+    if (colsToDelete.length > 0) {
+        colsToDelete.sort((a, b) => b - a);
+        colsToDelete.forEach(colNum => {
+            hoursSheet.deleteColumn(colNum);
+        });
+        SpreadsheetApp.flush();
+    }
+
+    // STEP 3: Deduplicate any extra rows below the first bottom "Total Hours" row
+    let curLastRow = hoursSheet.getLastRow();
+    let curLastCol = hoursSheet.getLastColumn();
+    const colAData = hoursSheet.getRange(1, 1, curLastRow, 1).getDisplayValues();
+    let firstBottomTotalRow = -1;
+
+    for (let r = 1; r < colAData.length; r++) {
+        const txt = (colAData[r][0] || '').toString().toLowerCase().trim();
+        if (txt.startsWith("total")) {
+            firstBottomTotalRow = r + 1; // 1-based index
+            break;
+        }
+    }
+
+    if (firstBottomTotalRow > -1 && curLastRow > firstBottomTotalRow) {
+        hoursSheet.deleteRows(firstBottomTotalRow + 1, curLastRow - firstBottomTotalRow);
+        SpreadsheetApp.flush();
+    }
+
+    // STEP 4: Now scan the cleaned sheet to find existing columns and drivers
+    curLastRow = hoursSheet.getLastRow();
+    curLastCol = hoursSheet.getLastColumn();
+
+    let totalColNumber = curLastCol;
+    for (let c = 1; c < curLastCol; c++) {
+        const hText = (hoursSheet.getRange(1, c + 1).getDisplayValue() || '').toString().toLowerCase().trim();
         if (hText.includes("total")) {
             totalColNumber = c + 1;
             break;
         }
-        let d = null;
-        if (rawHeaders[c] instanceof Date) {
-            d = new Date(rawHeaders[c].getFullYear(), rawHeaders[c].getMonth(), rawHeaders[c].getDate());
-        } else {
-            d = parseDDMMYY(displayHeaders[c]) || parseDate(displayHeaders[c]);
-            if (!d) {
-                const fb = new Date(displayHeaders[c]);
-                if (!isNaN(fb.getTime())) d = new Date(fb.getFullYear(), fb.getMonth(), fb.getDate());
-            }
-        }
+    }
+
+    let bottomTotalRowNumber = (firstBottomTotalRow > -1) ? firstBottomTotalRow : curLastRow + 1;
+
+    const cleanedHeaders = hoursSheet.getRange(1, 1, 1, totalColNumber).getDisplayValues()[0];
+    const cleanedRawHeaders = hoursSheet.getRange(1, 1, 1, totalColNumber).getValues()[0];
+
+    const existingDateCols = {}; // timestamp -> 1-based colNumber
+    const existingDateDigits = {}; // digits -> 1-based colNumber
+    const existingDateStrings = {}; // lowercase str -> 1-based colNumber
+
+    for (let c = 1; c < totalColNumber - 1; c++) {
+        const disp = (cleanedHeaders[c] || '').toString().trim();
+        const raw = cleanedRawHeaders[c];
+        const d = parseSheetDateHeader(disp, raw);
         if (d && !isNaN(d.getTime())) {
             existingDateCols[d.getTime()] = c + 1;
         }
-    }
-    if (totalColNumber === -1) totalColNumber = existingLastCol;
-
-    const driverColData = hoursSheet.getRange(2, 1, existingLastRow - 1, 1).getDisplayValues();
-    const existingDriverRows = {}; // canonName -> 1-based rowNumber
-    let bottomTotalRowNumber = -1;
-
-    for (let r = 0; r < driverColData.length; r++) {
-        const rawName = (driverColData[r][0] || '').toString().trim();
-        if (!rawName) continue;
-        if (rawName.toLowerCase().startsWith("total")) {
-            bottomTotalRowNumber = r + 2;
-            break;
+        const digits = disp.replace(/[^0-9]/g, '');
+        if (digits.length >= 6) {
+            existingDateDigits[digits] = c + 1;
         }
-        const canon = getCanonicalDriverName(rawName, canonicalDrivers);
-        existingDriverRows[canon] = r + 2;
-        existingDriverRows[rawName] = r + 2;
+        if (disp) {
+            existingDateStrings[disp.toLowerCase()] = c + 1;
+        }
     }
-    if (bottomTotalRowNumber === -1) bottomTotalRowNumber = existingLastRow + 1;
 
-    // 1. Insert any missing date columns before "Total Hours"
-    const missingDates = allDateCols.filter(dc => !existingDateCols[dc.date.getTime()]);
+    const numDriversExisting = Math.max(0, bottomTotalRowNumber - 2);
+    const existingDriverRows = {};
+    if (numDriversExisting > 0) {
+        const driverColData = hoursSheet.getRange(2, 1, numDriversExisting, 1).getDisplayValues();
+        for (let r = 0; r < driverColData.length; r++) {
+            const rawName = (driverColData[r][0] || '').toString().trim();
+            if (!rawName) continue;
+            const canon = getCanonicalDriverName(rawName, canonicalDrivers);
+            existingDriverRows[canon] = r + 2;
+            existingDriverRows[rawName] = r + 2;
+        }
+    }
+
+    // STEP 5: Insert any truly missing date columns before "Total Hours"
+    const missingDates = allDateCols.filter(dc => {
+        const t = dc.date.getTime();
+        const digits = (dc.headerStr || '').replace(/[^0-9]/g, '');
+        const str = (dc.headerStr || '').trim().toLowerCase();
+        return !existingDateCols[t] && !existingDateDigits[digits] && !existingDateStrings[str];
+    });
+
     for (let i = 0; i < missingDates.length; i++) {
         const dc = missingDates[i];
         hoursSheet.insertColumnBefore(totalColNumber);
-        hoursSheet.getRange(1, totalColNumber).setValue(dc.headerStr);
+        hoursSheet.getRange(1, totalColNumber).setNumberFormat("@").setValue(dc.headerStr);
 
         const numExistingDrivers = bottomTotalRowNumber - 2;
         if (numExistingDrivers > 0) {
+            const curDriverData = hoursSheet.getRange(2, 1, numExistingDrivers, 1).getDisplayValues();
             const colValues = [];
             for (let r = 0; r < numExistingDrivers; r++) {
-                const driverName = (driverColData[r][0] || '').toString().trim();
+                const driverName = (curDriverData[r][0] || '').toString().trim();
                 const canon = getCanonicalDriverName(driverName, canonicalDrivers);
                 const rawCredit = (driverCreditMap[canon] && driverCreditMap[canon][dc.date.getTime()]) ? driverCreditMap[canon][dc.date.getTime()] : 0;
                 colValues.push([rawCredit === 0 ? 0 : ""]);
@@ -693,10 +829,13 @@ function generateWorkingHoursSheet(ss) {
         }
 
         existingDateCols[dc.date.getTime()] = totalColNumber;
+        const digits = (dc.headerStr || '').replace(/[^0-9]/g, '');
+        if (digits.length >= 6) existingDateDigits[digits] = totalColNumber;
+        existingDateStrings[(dc.headerStr || '').trim().toLowerCase()] = totalColNumber;
         totalColNumber++;
     }
 
-    // 2. Insert any missing driver rows before bottom "Total Hours"
+    // STEP 6: Insert any missing driver rows before bottom "Total Hours"
     const missingDrivers = driverList.filter(d => !existingDriverRows[d]);
     for (let i = 0; i < missingDrivers.length; i++) {
         const missingDriver = missingDrivers[i];
@@ -717,12 +856,14 @@ function generateWorkingHoursSheet(ss) {
         bottomTotalRowNumber++;
     }
 
-    // 3. Refresh SUM formulas
+    // STEP 7: Refresh SUM formulas
     const numDrivers = bottomTotalRowNumber - 2;
     const numDateCols = totalColNumber - 2;
     const lastDateColLetter = getColumnLetter(totalColNumber - 1);
 
     if (numDrivers > 0 && numDateCols > 0) {
+        hoursSheet.getRange(1, totalColNumber).setValue("Total Hours");
+
         const totalFormulas = [];
         for (let r = 2; r < bottomTotalRowNumber; r++) {
             totalFormulas.push([`=SUM(B${r}:${lastDateColLetter}${r})`]);
@@ -752,12 +893,17 @@ function applyWorkingHoursFormatting(hoursSheet, numDrivers, numDateCols, bottom
         .setFontColor("white")
         .setHorizontalAlignment("center");
 
+    // Ensure header row date columns are plain text
+    hoursSheet.getRange(1, 1, 1, totalCols - 1).setNumberFormat("@");
+
     // Matrix numbers format & alignment
     if (numDrivers > 0 && totalCols > 1) {
         hoursSheet.getRange(2, 2, numDrivers + 1, totalCols - 1)
             .setNumberFormat("0.0")
             .setHorizontalAlignment("center");
-        hoursSheet.getRange(2, 1, numDrivers, 1).setFontWeight("bold");
+        hoursSheet.getRange(2, 1, numDrivers, 1)
+            .setFontWeight("bold")
+            .setHorizontalAlignment("left");
     }
 
     // Bottom total row styling
@@ -765,6 +911,7 @@ function applyWorkingHoursFormatting(hoursSheet, numDrivers, numDateCols, bottom
         .setFontWeight("bold")
         .setBackground("#d0e0e3")
         .setBorder(true, true, true, true, true, true, "black", SpreadsheetApp.BorderStyle.SOLID_THICK);
+    hoursSheet.getRange(bottomRowIndex, 1).setHorizontalAlignment("left");
 
     // Grid borders
     hoursSheet.getRange(1, 1, totalRows, totalCols)
@@ -804,6 +951,7 @@ function applyWorkingHoursFormatting(hoursSheet, numDrivers, numDateCols, bottom
             .setRanges([matrixRange])
             .build();
 
+        hoursSheet.clearConditionalFormatRules();
         hoursSheet.setConditionalFormatRules([redRule, yellowRule, greenRule]);
     }
 
