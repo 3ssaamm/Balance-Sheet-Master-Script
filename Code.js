@@ -288,7 +288,7 @@ function parseRawDataWeeks(sheet) {
 
             const dateColumns = [];
             for (let c = 1; c < numHeaderCols; c++) {
-                const d = parseDDMMYY(headerRow[c]);
+                const d = parseSheetDateHeader(headerRow[c], data[headerRowIdx][c]);
                 if (d) {
                     dateColumns.push({ colIdx: c, date: d, headerStr: headerRow[c] });
                 }
@@ -318,14 +318,21 @@ function parseRawDataWeeks(sheet) {
 
                     if (cellVal !== "") {
                         const driverName = cellVal;
-                        const weeklyTotal = parseNumber(data[dr][totalColIdx]) || 0;
-                        const weeklyTrips = parseNumber(data[dr][countColIdx]) || 0;
-                        const weeklyNet = parseNumber(data[dr][netColIdx]) || 0;
+                        let weeklyTotal = parseNumber(data[dr][totalColIdx]);
+                        if (weeklyTotal === null) weeklyTotal = parseNumber(displayValues[dr][totalColIdx]) || 0;
+
+                        let weeklyTrips = parseNumber(data[dr][countColIdx]);
+                        if (weeklyTrips === null) weeklyTrips = parseNumber(displayValues[dr][countColIdx]) || 0;
+
+                        let weeklyNet = parseNumber(data[dr][netColIdx]);
+                        if (weeklyNet === null) weeklyNet = parseNumber(displayValues[dr][netColIdx]) || 0;
+
                         const weeklyCash = roundToTwo(weeklyTotal - weeklyNet);
 
                         const dailyCredits = {};
                         dateColumns.forEach(dc => {
-                            const cred = parseNumber(data[dr][dc.colIdx]) || 0;
+                            let cred = parseNumber(data[dr][dc.colIdx]);
+                            if (cred === null) cred = parseNumber(displayValues[dr][dc.colIdx]) || 0;
                             dailyCredits[dc.date.getTime()] = cred;
                         });
 
@@ -445,7 +452,7 @@ function generateWorkingHoursSheetFromMenu() {
 function parseSheetDateHeader(displayHeader, rawHeader) {
     if (displayHeader) {
         const disp = String(displayHeader).trim();
-        if (disp && !disp.toLowerCase().includes("total")) {
+        if (disp && !disp.toLowerCase().includes("total") && !disp.toLowerCase().includes("count") && !disp.toLowerCase().includes("net") && !disp.toLowerCase().includes("trip")) {
             const d = parseDDMMYY(disp);
             if (d && !isNaN(d.getTime())) return d;
         }
@@ -1011,63 +1018,7 @@ function updateSummaryAndCharts(ss) {
     const rawSheet = ss.getSheetByName("Raw Data");
     if (!rawSheet) throw new Error('No sheet named "Raw Data" was found.');
 
-    // --- Helper to load exact daily data from auxiliary sheets ---
-    function loadAuxMap(sheetName) {
-        const auxSheet = ss.getSheetByName(sheetName);
-        if (!auxSheet) return {};
-        const weeks = parseRawDataWeeks(auxSheet);
-        if (weeks.length > 0) {
-            const map = {};
-            weeks.forEach(w => {
-                w.drivers.forEach(d => {
-                    const dName = d.name;
-                    if (!map[dName]) map[dName] = {};
-                    for (const t in d.dailyCredits) {
-                        map[dName][t] = d.dailyCredits[t];
-                    }
-                });
-            });
-            return map;
-        }
-
-        const data = auxSheet.getDataRange().getValues();
-        if (data.length < 2) return {};
-        const headers = auxSheet.getRange(1, 1, 1, auxSheet.getLastColumn()).getDisplayValues()[0];
-
-        const dateCols = {};
-        for (let c = 1; c < headers.length; c++) {
-            const d = parseDDMMYY(headers[c]);
-            if (d) dateCols[c] = d.getTime();
-        }
-
-        const map = {};
-        for (let r = 2; r < data.length; r++) {
-            const driver = (data[r][0] || "").toString().trim();
-            if (driver && driver !== "Total") {
-                map[driver] = {};
-                for (const c in dateCols) {
-                    const val = parseNumber(data[r][c]);
-                    if (val !== null && !isNaN(val)) map[driver][dateCols[c]] = val;
-                }
-            }
-        }
-        return map;
-    }
-
-    // Load auxiliary daily maps (driverName -> { timestamp -> value })
-    const tripsDataMap = loadAuxMap("Raw Data - Trips");
-    const netDataMap = loadAuxMap("Raw Data - NET");
-    const noShowMap = loadNoShowMap(ss, "No Show");
-    const { map: workingHoursMap, driverTotalHours, dailyTotalHours } = loadWorkingHoursMap(ss);
-
-    // --- Read the entire Raw Data sheet as weekly tables ---
-    const weeks = parseRawDataWeeks(rawSheet);
-    if (weeks.length === 0) {
-        Logger.log("⚠️ No valid week tables found in Raw Data.");
-        return;
-    }
-
-    // Seed canonical drivers from Settings
+    // Seed canonical drivers from Settings first so auxiliary loaders can normalize names
     let settingsSheet = ss.getSheetByName("Settings");
     if (!settingsSheet) settingsSheet = ss.insertSheet("Settings");
     const settingsData = settingsSheet.getDataRange().getValues();
@@ -1081,34 +1032,69 @@ function updateSummaryAndCharts(ss) {
         }
     }
 
-    // --- Read existing Summary data BEFORE clearing it ---
-    // This acts as a memory of previously-calculated trips/cash values.
-    const existingSummaryMap = {}; // { driver -> { dateKey -> { trips, cash } } }
-    const existingLastRow = summarySheet.getLastRow();
-    if (existingLastRow >= 3) {
-        const existingHeaders = summarySheet.getRange(2, 1, 1, Math.min(summarySheet.getLastColumn(), 9)).getDisplayValues()[0];
-        const existingTripsIdx = findMainSummaryCol(existingHeaders, ['trips', 'trip'], 5);
-        const existingCashIdx = findMainSummaryCol(existingHeaders, ['cash'], 6);
-        const readCols = Math.max(existingTripsIdx, existingCashIdx) + 1;
-        const existingRows = summarySheet.getRange(3, 1, existingLastRow - 2, readCols).getValues();
-        let prevSummaryDate = null;
-        existingRows.forEach(row => {
-            const parsedD = parseDate(row[0]);
-            if (parsedD) prevSummaryDate = parsedD;
-            else if (row[0] instanceof Date) prevSummaryDate = row[0];
-            const dateVal = prevSummaryDate;
-            const driver = (row[1] || '').toString().trim();
-            if (!dateVal || !driver) return;
-            const trips = parseNumber(row[existingTripsIdx]);
-            const cash = parseNumber(row[existingCashIdx]);
-            if (trips === null && cash === null) return;
-            const dk = new Date(dateVal.getFullYear(), dateVal.getMonth(), dateVal.getDate()).getTime();
-            const canonDriver = getCanonicalDriverName(driver, canonicalDrivers);
-            if (!existingSummaryMap[canonDriver]) existingSummaryMap[canonDriver] = {};
-            existingSummaryMap[canonDriver][dk] = { trips: trips || 0, cash: cash || 0 };
-            if (!existingSummaryMap[driver]) existingSummaryMap[driver] = {};
-            existingSummaryMap[driver][dk] = { trips: trips || 0, cash: cash || 0 };
-        });
+    // --- Helper to load exact daily data from auxiliary sheets ---
+    function loadAuxMap(sheetName) {
+        const auxSheet = ss.getSheetByName(sheetName);
+        if (!auxSheet) return {};
+        const weeks = parseRawDataWeeks(auxSheet);
+        if (weeks.length > 0) {
+            const map = {};
+            weeks.forEach(w => {
+                w.drivers.forEach(d => {
+                    const rawName = d.name;
+                    const canonName = getCanonicalDriverName(rawName, canonicalDrivers);
+                    if (!map[rawName]) map[rawName] = {};
+                    if (!map[canonName]) map[canonName] = {};
+                    for (const t in d.dailyCredits) {
+                        map[rawName][t] = d.dailyCredits[t];
+                        map[canonName][t] = d.dailyCredits[t];
+                    }
+                });
+            });
+            return map;
+        }
+
+        const data = auxSheet.getDataRange().getValues();
+        if (data.length < 2) return {};
+        const lastCol = auxSheet.getLastColumn();
+        const rawHeaders = auxSheet.getRange(1, 1, 1, lastCol).getValues()[0];
+        const displayHeaders = auxSheet.getRange(1, 1, 1, lastCol).getDisplayValues()[0];
+
+        const dateCols = {};
+        for (let c = 1; c < lastCol; c++) {
+            const d = parseSheetDateHeader(displayHeaders[c], rawHeaders[c]);
+            if (d && !isNaN(d.getTime())) dateCols[c] = d.getTime();
+        }
+
+        const map = {};
+        for (let r = 1; r < data.length; r++) {
+            const rawDriver = (data[r][0] || "").toString().trim();
+            if (rawDriver && !rawDriver.toLowerCase().startsWith("total") && rawDriver.toLowerCase() !== "driver") {
+                const canonDriver = getCanonicalDriverName(rawDriver, canonicalDrivers);
+                if (!map[rawDriver]) map[rawDriver] = {};
+                if (!map[canonDriver]) map[canonDriver] = {};
+                for (const c in dateCols) {
+                    const val = parseNumber(data[r][c]);
+                    if (val !== null && !isNaN(val)) {
+                        map[rawDriver][dateCols[c]] = val;
+                        map[canonDriver][dateCols[c]] = val;
+                    }
+                }
+            }
+        }
+        return map;
+    }
+
+    // Load auxiliary daily maps (driverName -> { timestamp -> value })
+    const tripsDataMap = loadAuxMap("Raw Data - Trips");
+    const noShowMap = loadNoShowMap(ss, "No Show");
+    const { map: workingHoursMap, driverTotalHours, dailyTotalHours } = loadWorkingHoursMap(ss);
+
+    // --- Read the entire Raw Data sheet as weekly tables ---
+    const weeks = parseRawDataWeeks(rawSheet);
+    if (weeks.length === 0) {
+        Logger.log("⚠️ No valid week tables found in Raw Data.");
+        return;
     }
 
     // --- Build output rows: one row per driver per day across all weeks ---
@@ -1121,7 +1107,7 @@ function updateSummaryAndCharts(ss) {
 
             const weeklyTotal = d.weeklyTotal;
             const weeklyTrips = d.weeklyTrips;
-            const weeklyCash = d.weeklyCash;
+            const weeklyCash = d.weeklyCash; // Cash is Total - Driver NET
 
             // Collect all active days for this driver in this week
             let activeDays = [];
@@ -1130,91 +1116,46 @@ function updateSummaryAndCharts(ss) {
                 let credit = d.dailyCredits[dateKey] || 0;
 
                 const hasExactTrips = tripsDataMap[driverName] && tripsDataMap[driverName][dateKey] !== undefined;
-                const hasExactNet = netDataMap[driverName] && netDataMap[driverName][dateKey] !== undefined;
-
                 const exactTrips = hasExactTrips ? tripsDataMap[driverName][dateKey] : 0;
-                const exactNet = hasExactNet ? netDataMap[driverName][dateKey] : 0;
                 const hasNoShow = noShowMap[driverName] && noShowMap[driverName][dateKey] !== undefined;
 
                 if (hasNoShow) {
                     credit = roundToTwo(credit - noShowMap[driverName][dateKey].cash);
                 }
 
-                // Include day if there's credit, trips, non-zero net, or No Show
-                if (credit > 0 || exactTrips > 0 || exactNet !== 0 || hasNoShow) {
+                // Include day if there's credit, trips, or No Show
+                if (credit > 0 || exactTrips > 0 || hasNoShow) {
                     activeDays.push({ date: dc.date, dateKey: dateKey, credit: credit });
                 }
             });
 
+            // If no active day found by credit/trips but the driver has weeklyTotal or weeklyCash, fallback to first date column
+            if (activeDays.length === 0 && (weeklyTotal > 0 || weeklyCash > 0) && w.dateColumns.length > 0) {
+                const dc = w.dateColumns[0];
+                activeDays.push({ date: dc.date, dateKey: dc.date.getTime(), credit: d.dailyCredits[dc.date.getTime()] || weeklyTotal });
+            }
+
             if (activeDays.length === 0) return;
 
-            const nonAuxTripDays = activeDays.filter(day =>
-                !(tripsDataMap[driverName] && tripsDataMap[driverName][day.dateKey] !== undefined));
-            const nonAuxCashDays = activeDays.filter(day =>
-                !(netDataMap[driverName] && netDataMap[driverName][day.dateKey] !== undefined));
+            // --- Cash calculation: Cash is strictly (Total - Driver NET) = weeklyCash ---
+            // If there is 1 active day in this table, that day receives weeklyCash.
+            // If multiple active days, never use proportional estimates — set to 0 so the user knows there is an issue.
+            const thisDayCash = (activeDays.length === 1) ? weeklyCash : 0;
 
-            const lastNonAuxTripDay = nonAuxTripDays.length > 0 ? nonAuxTripDays[nonAuxTripDays.length - 1] : null;
-            const lastNonAuxCashDay = nonAuxCashDays.length > 0 ? nonAuxCashDays[nonAuxCashDays.length - 1] : null;
-
-            let sumExactTrips = 0;
-            let sumExactCash = 0;
-            let missingTripDays = [];
-            let missingCashDays = [];
-
-            activeDays.forEach(day => {
-                const isLastTrip = lastNonAuxTripDay && day.dateKey === lastNonAuxTripDay.dateKey;
-                const isLastCash = lastNonAuxCashDay && day.dateKey === lastNonAuxCashDay.dateKey;
-
-                // TRIPS
-                if (tripsDataMap[driverName] && tripsDataMap[driverName][day.dateKey] !== undefined) {
-                    sumExactTrips += tripsDataMap[driverName][day.dateKey];
-                } else if (!isLastTrip && existingSummaryMap[driverName] && existingSummaryMap[driverName][day.dateKey] !== undefined) {
-                    sumExactTrips += existingSummaryMap[driverName][day.dateKey].trips;
-                } else {
-                    missingTripDays.push(day);
-                }
-
-                // CASH
-                if (netDataMap[driverName] && netDataMap[driverName][day.dateKey] !== undefined) {
-                    sumExactCash += roundToTwo(day.credit - netDataMap[driverName][day.dateKey]);
-                } else if (!isLastCash && existingSummaryMap[driverName] && existingSummaryMap[driverName][day.dateKey] !== undefined) {
-                    sumExactCash += existingSummaryMap[driverName][day.dateKey].cash;
-                } else {
-                    missingCashDays.push(day);
-                }
-            });
-
-            const remainingTrips = Math.max(0, weeklyTrips - sumExactTrips);
-            const remainingCash = weeklyCash - sumExactCash;
-
-            const lastMissingTripDay = missingTripDays.length > 0 ? missingTripDays[missingTripDays.length - 1] : null;
-            const lastMissingCashDay = missingCashDays.length > 0 ? missingCashDays[missingCashDays.length - 1] : null;
-
+            // --- Trips calculation: exact trips from auxiliary map if available ---
+            // If 1 active day, that day gets weeklyTrips.
+            // If multiple active days and auxiliary map is not available, set to 0 (no proportional estimates).
             activeDays.forEach(day => {
                 let dailyTrips = 0;
-                let dailyCash = 0;
-
-                // TRIPS
                 if (tripsDataMap[driverName] && tripsDataMap[driverName][day.dateKey] !== undefined) {
                     dailyTrips = tripsDataMap[driverName][day.dateKey];
-                } else if (lastMissingTripDay && day.dateKey === lastMissingTripDay.dateKey && remainingTrips > 0) {
-                    dailyTrips = remainingTrips;
-                } else if (existingSummaryMap[driverName] && existingSummaryMap[driverName][day.dateKey] !== undefined) {
-                    dailyTrips = existingSummaryMap[driverName][day.dateKey].trips;
+                } else if (activeDays.length === 1) {
+                    dailyTrips = weeklyTrips;
                 } else {
                     dailyTrips = 0;
                 }
 
-                // CASH
-                if (netDataMap[driverName] && netDataMap[driverName][day.dateKey] !== undefined) {
-                    dailyCash = roundToTwo(day.credit - netDataMap[driverName][day.dateKey]);
-                } else if (lastMissingCashDay && day.dateKey === lastMissingCashDay.dateKey && remainingCash > 0) {
-                    dailyCash = remainingCash;
-                } else if (existingSummaryMap[driverName] && existingSummaryMap[driverName][day.dateKey] !== undefined) {
-                    dailyCash = existingSummaryMap[driverName][day.dateKey].cash;
-                } else {
-                    dailyCash = 0;
-                }
+                const dailyCash = thisDayCash;
 
                 let dailyNoShowCount = 0;
                 if (noShowMap[driverName] && noShowMap[driverName][day.dateKey]) {
@@ -2585,7 +2526,7 @@ function parseNumber(val) {
     if (typeof val === "string" && val.includes("%")) {
         return parseFloat(val) / 100;
     }
-    const s = String(val).replace(/,/g, "").trim();
+    const s = String(val).replace(/[$,]/g, "").trim();
     if (s === "") return null;
     const n = Number(s);
     return isNaN(n) ? null : n;
@@ -2612,15 +2553,44 @@ function formatDate(date) {
 
 function parseDate(value) {
     if (!value) return null;
-    if (value instanceof Date) return value;
+    if (value instanceof Date) {
+        return new Date(value.getFullYear(), value.getMonth(), value.getDate());
+    }
     if (typeof value === "string") {
-        const parts = value.split("/");
+        const str = value.trim();
+        if (!str) return null;
+
+        // Standard JS Date parsing for strings like "Tuesday, September 1, 2026"
+        const std = new Date(str);
+        if (!isNaN(std.getTime()) && /[a-zA-Z]/.test(str)) {
+            return new Date(std.getFullYear(), std.getMonth(), std.getDate());
+        }
+
+        // Try parseDDMMYY (e.g. "01-09-26", "01-09-2026")
+        const dd = parseDDMMYY(str);
+        if (dd && !isNaN(dd.getTime())) return dd;
+
+        // Try MM/DD/YYYY or DD/MM/YYYY format with slashes
+        const parts = str.split("/");
         if (parts.length === 3) {
-            const month = parseInt(parts[0], 10) - 1;
-            const day = parseInt(parts[1], 10);
-            const year = parseInt(parts[2], 10);
+            const p0 = parseInt(parts[0], 10);
+            const p1 = parseInt(parts[1], 10);
+            let year = parseInt(parts[2], 10);
+            if (year < 100) year += 2000;
+            let month, day;
+            if (p0 > 12) {
+                day = p0;
+                month = p1 - 1;
+            } else {
+                month = p0 - 1;
+                day = p1;
+            }
             const d = new Date(year, month, day);
-            return isNaN(d.getTime()) ? null : d;
+            if (!isNaN(d.getTime())) return d;
+        }
+
+        if (!isNaN(std.getTime())) {
+            return new Date(std.getFullYear(), std.getMonth(), std.getDate());
         }
     }
     return null;
