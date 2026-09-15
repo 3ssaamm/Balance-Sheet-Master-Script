@@ -18,6 +18,7 @@ function onOpen() {
             .addItem('📥 Import: NET Data  (from "Raw Data - NET" sheet)', 'importNetData')
             .addItem('📥 Import: Trips Data  (from "Raw Data - Trips" sheet)', 'importTripsData')
             .addItem('🕒 Sync Working Hours Sheet', 'generateWorkingHoursSheetFromMenu')
+            .addItem('☕ Sync Breaks Table', 'syncBreaksTableFromMenu')
             .addSeparator()
             .addItem('🔧 Setup Auto-Run Trigger', 'setupAutoRun')
             .addToUi();
@@ -437,12 +438,29 @@ function setupAutoRun() {
 // =================================================================
 
 function generateWorkingHoursSheetFromMenu() {
-    const ss = SpreadsheetApp.openById(TARGET_SHEET_ID);
+    const ss = SpreadsheetApp.getActiveSpreadsheet() || SpreadsheetApp.openById(TARGET_SHEET_ID);
     generateWorkingHoursSheet(ss);
+    syncBreaksTable(ss);
     SpreadsheetApp.flush();
     try {
-        SpreadsheetApp.getUi().alert("✅ 'Working hours' sheet synced successfully!");
+        SpreadsheetApp.getUi().alert("✅ 'Working hours' and breaks table synced successfully!");
     } catch (e) { }
+}
+
+function syncBreaksTableFromMenu() {
+    try {
+        const ss = SpreadsheetApp.getActiveSpreadsheet() || SpreadsheetApp.openById(TARGET_SHEET_ID);
+        syncBreaksTable(ss);
+        SpreadsheetApp.flush();
+        try {
+            SpreadsheetApp.getUi().alert("✅ Breaks table synced successfully! Look below row 12 in 'Working hours'.");
+        } catch (uiErr) { }
+    } catch (e) {
+        Logger.log("Error syncing breaks table: " + e.message);
+        try {
+            SpreadsheetApp.getUi().alert("⚠️ Error syncing breaks table: " + e.message);
+        } catch (uiErr) { }
+    }
 }
 
 /**
@@ -510,7 +528,8 @@ function loadWorkingHoursMap(ss) {
 
     for (let r = 1; r < data.length; r++) {
         const rawDriver = (data[r][0] || "").toString().trim();
-        if (!rawDriver || rawDriver.toLowerCase().startsWith("total")) continue;
+        if (rawDriver.toLowerCase().startsWith("total") || rawDriver.toLowerCase().includes("breaks")) break;
+        if (!rawDriver) continue;
 
         const canonDriver = getCanonicalDriverName(rawDriver, canonicalDrivers);
         if (!map[rawDriver]) map[rawDriver] = {};
@@ -654,6 +673,7 @@ function generateWorkingHoursSheet(ss) {
         hoursSheet.getRange(2, 1, matrixRows.length, headerRow.length).setValues(matrixRows);
 
         applyWorkingHoursFormatting(hoursSheet, driverList.length, numDateCols, bottomRowIndex);
+        syncBreaksTable(ss);
         return;
     }
 
@@ -887,6 +907,7 @@ function generateWorkingHoursSheet(ss) {
     }
 
     applyWorkingHoursFormatting(hoursSheet, numDrivers, numDateCols, bottomTotalRowNumber);
+    syncBreaksTable(ss);
 }
 
 function applyWorkingHoursFormatting(hoursSheet, numDrivers, numDateCols, bottomRowIndex) {
@@ -966,6 +987,378 @@ function applyWorkingHoursFormatting(hoursSheet, numDrivers, numDateCols, bottom
     for (let c = 1; c <= totalCols; c++) {
         if (hoursSheet.getColumnWidth(c) < 80) hoursSheet.setColumnWidth(c, 80);
     }
+
+    // Automatically sync breaks table below the main working hours table
+    try {
+        syncBreaksTable(ss);
+    } catch (e) {
+        Logger.log("Error syncing breaks table inside generateWorkingHoursSheet: " + e.message);
+    }
+}
+
+// =================================================================
+// BREAKS SHEET LOAD & TABLE RENDERING HELPERS
+// =================================================================
+
+/**
+ * Converts a time representation (Date object, string like "10:30 AM", "17:30") to minutes from midnight.
+ */
+function parseTimeToMinutes(val) {
+    if (!val) return null;
+    if (val instanceof Date) {
+        return val.getHours() * 60 + val.getMinutes() + (val.getSeconds() / 60);
+    }
+    const str = val.toString().trim();
+    const match = str.match(/(\d+):(\d+)(?::(\d+))?\s*(AM|PM)?/i);
+    if (match) {
+        let h = parseInt(match[1], 10);
+        const m = parseInt(match[2], 10);
+        const s = match[3] ? parseInt(match[3], 10) : 0;
+        const ampm = match[4] ? match[4].toUpperCase() : null;
+        if (ampm === "PM" && h < 12) h += 12;
+        if (ampm === "AM" && h === 12) h = 0;
+        return h * 60 + m + (s / 60);
+    }
+    return null;
+}
+
+/**
+ * Parses break duration into decimal hours (e.g. 0:30:00 -> 0.5).
+ * Returns 0 if break is incomplete (empty 'To'), negative, or invalid.
+ */
+function parseBreakPeriodToHours(periodVal, periodDisp, fromVal, toVal) {
+    if (toVal === undefined || toVal === null || String(toVal).trim() === "") {
+        return 0;
+    }
+
+    const str = (periodDisp || '').toString().trim();
+    if (str.startsWith("-") || str === "0:00:00" || str === "0:00" || str === "0") {
+        return 0;
+    }
+
+    if (str && str.includes(":")) {
+        const parts = str.split(":");
+        const h = parseFloat(parts[0]) || 0;
+        const m = parseFloat(parts[1]) || 0;
+        const s = (parts.length > 2 ? parseFloat(parts[2]) : 0) || 0;
+        const totalHours = h + (m / 60) + (s / 3600);
+        if (totalHours > 0) return roundToTwo(totalHours);
+    }
+
+    if (periodVal instanceof Date) {
+        const h = periodVal.getHours();
+        const m = periodVal.getMinutes();
+        const s = periodVal.getSeconds();
+        const totalHours = h + (m / 60) + (s / 3600);
+        if (totalHours > 0) return roundToTwo(totalHours);
+    }
+
+    if (typeof periodVal === "number" && periodVal > 0) {
+        return roundToTwo(periodVal * 24);
+    }
+
+    if (fromVal && toVal) {
+        const fromMins = parseTimeToMinutes(fromVal);
+        const toMins = parseTimeToMinutes(toVal);
+        if (fromMins !== null && toMins !== null && toMins > fromMins) {
+            return roundToTwo((toMins - fromMins) / 60);
+        }
+    }
+
+    return 0;
+}
+
+/**
+ * Reads the "breaks" sheet and returns:
+ * - map: { canonDriver -> { dateTimestamp -> totalBreakHours } }
+ * - driverTotals: { canonDriver -> totalBreakHours }
+ * - dailyTotals: { dateTimestamp -> totalBreakHours }
+ */
+function loadBreaksMap(ss, canonicalDrivers) {
+    if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet() || SpreadsheetApp.openById(TARGET_SHEET_ID);
+    let breaksSheet = ss.getSheetByName("breaks") || ss.getSheetByName("Breaks");
+    if (!breaksSheet) {
+        const allSheets = ss.getSheets();
+        for (let i = 0; i < allSheets.length; i++) {
+            if (allSheets[i].getName().toLowerCase().trim() === "breaks") {
+                breaksSheet = allSheets[i];
+                break;
+            }
+        }
+    }
+    if (!breaksSheet) return { map: {}, driverTotals: {}, dailyTotals: {} };
+
+    const lastRow = breaksSheet.getLastRow();
+    const lastCol = breaksSheet.getLastColumn();
+    if (lastRow < 2 || lastCol < 3) return { map: {}, driverTotals: {}, dailyTotals: {} };
+
+    const rawHeaders = breaksSheet.getRange(1, 1, 1, lastCol).getValues()[0];
+    const dispHeaders = breaksSheet.getRange(1, 1, 1, lastCol).getDisplayValues()[0];
+
+    let dateColIdx = -1, driverColIdx = -1, fromColIdx = -1, toColIdx = -1, periodColIdx = -1;
+    for (let c = 0; c < lastCol; c++) {
+        const h = (dispHeaders[c] || rawHeaders[c] || '').toString().toLowerCase().trim();
+        if (h.includes("date")) dateColIdx = c;
+        else if (h.includes("driver") || h.includes("name")) driverColIdx = c;
+        else if (h.includes("from") || h.includes("start")) fromColIdx = c;
+        else if (h.includes("to") || h.includes("end")) toColIdx = c;
+        else if (h.includes("period") || h.includes("duration") || h.includes("hour") || h.includes("break")) periodColIdx = c;
+    }
+
+    if (dateColIdx === -1) dateColIdx = 0;
+    if (driverColIdx === -1) driverColIdx = 1;
+    if (fromColIdx === -1) fromColIdx = 2;
+    if (toColIdx === -1) toColIdx = 3;
+    if (periodColIdx === -1) periodColIdx = 4;
+
+    const rawData = breaksSheet.getRange(2, 1, lastRow - 1, lastCol).getValues();
+    const dispData = breaksSheet.getRange(2, 1, lastRow - 1, lastCol).getDisplayValues();
+
+    const map = {};
+    const driverTotals = {};
+    const dailyTotals = {};
+
+    for (let r = 0; r < rawData.length; r++) {
+        const rawDriver = (rawData[r][driverColIdx] || dispData[r][driverColIdx] || '').toString().trim();
+        if (!rawDriver) continue;
+
+        const canonDriver = getCanonicalDriverName(rawDriver, canonicalDrivers);
+
+        const rawDate = rawData[r][dateColIdx];
+        const dispDate = dispData[r][dateColIdx];
+        const d = (rawDate instanceof Date) ? rawDate : (parseDate(rawDate) || parseDate(dispDate));
+        if (!d || isNaN(d.getTime())) continue;
+
+        const dateKey = new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+
+        const periodVal = rawData[r][periodColIdx];
+        const periodDisp = dispData[r][periodColIdx];
+        const fromVal = rawData[r][fromColIdx] || dispData[r][fromColIdx];
+        const toVal = rawData[r][toColIdx] || dispData[r][toColIdx];
+
+        const breakHours = parseBreakPeriodToHours(periodVal, periodDisp, fromVal, toVal);
+        if (breakHours <= 0) continue;
+
+        if (!map[canonDriver]) map[canonDriver] = {};
+        if (!map[rawDriver]) map[rawDriver] = {};
+
+        map[canonDriver][dateKey] = roundToTwo((map[canonDriver][dateKey] || 0) + breakHours);
+        map[rawDriver][dateKey] = roundToTwo((map[rawDriver][dateKey] || 0) + breakHours);
+
+        driverTotals[canonDriver] = roundToTwo((driverTotals[canonDriver] || 0) + breakHours);
+        driverTotals[rawDriver] = roundToTwo((driverTotals[rawDriver] || 0) + breakHours);
+
+        dailyTotals[dateKey] = roundToTwo((dailyTotals[dateKey] || 0) + breakHours);
+    }
+
+    return { map, driverTotals, dailyTotals };
+}
+
+/**
+ * Standalone function to sync and render the Breaks Hours table directly
+ * below the main table in the "Working hours" sheet.
+ * Reads existing dates and drivers directly from the sheet to guarantee exact alignment.
+ */
+function syncBreaksTable(ss) {
+    if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet() || SpreadsheetApp.openById(TARGET_SHEET_ID);
+    const hoursSheet = ss.getSheetByName("Working hours");
+    if (!hoursSheet) {
+        Logger.log("❌ 'Working hours' sheet not found.");
+        return;
+    }
+
+    const lastRow = hoursSheet.getLastRow();
+    const lastCol = hoursSheet.getLastColumn();
+    if (lastRow < 2 || lastCol < 2) return;
+
+    // 1. Find the bottom "Total Hours" row of the main table
+    const colAData = hoursSheet.getRange(1, 1, lastRow, 1).getDisplayValues();
+    let mainBottomRow = -1;
+    for (let r = 1; r < colAData.length; r++) {
+        const txt = (colAData[r][0] || '').toString().toLowerCase().trim();
+        if (txt.startsWith("total")) {
+            mainBottomRow = r + 1; // 1-based index
+            break;
+        }
+    }
+    if (mainBottomRow === -1) mainBottomRow = lastRow;
+
+    // 2. Find the "Total Hours" column in Row 1
+    const row1Data = hoursSheet.getRange(1, 1, 1, lastCol).getDisplayValues()[0];
+    let totalColNumber = lastCol;
+    for (let c = 1; c < lastCol; c++) {
+        const hText = (row1Data[c] || '').toString().toLowerCase().trim();
+        if (hText.includes("total")) {
+            totalColNumber = c + 1;
+            break;
+        }
+    }
+
+    const numDateCols = totalColNumber - 2;
+    if (numDateCols <= 0) return;
+
+    // 3. Read date columns directly from Row 1
+    const row1Raw = hoursSheet.getRange(1, 1, 1, totalColNumber).getValues()[0];
+    const allDateCols = [];
+    for (let c = 2; c < totalColNumber; c++) {
+        const disp = (row1Data[c - 1] || '').toString().trim();
+        const raw = row1Raw[c - 1];
+        const d = parseSheetDateHeader(disp, raw) || parseDate(disp);
+        allDateCols.push({
+            headerStr: disp,
+            dateKey: d ? new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime() : null
+        });
+    }
+
+    // 4. Read drivers from main table (rows 2 to mainBottomRow - 1)
+    const numDrivers = mainBottomRow - 2;
+    if (numDrivers <= 0) return;
+    const driverColData = hoursSheet.getRange(2, 1, numDrivers, 1).getDisplayValues();
+    const finalDrivers = [];
+    for (let r = 0; r < driverColData.length; r++) {
+        const dName = (driverColData[r][0] || '').toString().trim();
+        if (dName && !dName.toLowerCase().startsWith("total")) {
+            finalDrivers.push(dName);
+        }
+    }
+    if (finalDrivers.length === 0) return;
+
+    // 5. Seed canonical drivers from Settings
+    const settingsSheet = ss.getSheetByName("Settings");
+    const canonicalDrivers = [];
+    if (settingsSheet) {
+        const sData = settingsSheet.getDataRange().getValues();
+        for (let i = 1; i < sData.length; i++) {
+            const d = (sData[i][0] || "").toString().trim();
+            if (d && !canonicalDrivers.includes(d)) canonicalDrivers.push(d);
+        }
+    }
+
+    // 6. Load breaks map from 'breaks' sheet
+    const { map: breaksMap } = loadBreaksMap(ss, canonicalDrivers);
+
+    const totalCols = numDateCols + 2;
+    const lastDateColLetter = getColumnLetter(numDateCols + 1);
+
+    // Position: 2 empty rows after main table bottom row
+    const titleRow = mainBottomRow + 3;
+    const headerRow = titleRow + 1;
+    const firstDataRow = headerRow + 1;
+    const bottomRow = firstDataRow + finalDrivers.length;
+
+    // Ensure sheet has enough rows
+    const currentMaxRows = hoursSheet.getMaxRows();
+    if (currentMaxRows < bottomRow + 5) {
+        hoursSheet.insertRowsAfter(currentMaxRows, (bottomRow + 5) - currentMaxRows);
+    }
+
+    // Clear old area below main table before writing (break apart any merges first)
+    const curLastCol = Math.max(hoursSheet.getLastColumn(), totalCols);
+    try {
+        const clearRows = hoursSheet.getMaxRows() - titleRow + 1;
+        if (clearRows > 0) {
+            const clearRange = hoursSheet.getRange(titleRow, 1, clearRows, curLastCol);
+            clearRange.breakApart();
+            clearRange.clear();
+        }
+    } catch (e) {
+        Logger.log("Clear old breaks area: " + e.message);
+    }
+
+    // A. Title Block
+    const titleRange = hoursSheet.getRange(titleRow, 1, 1, totalCols);
+    try { titleRange.breakApart(); } catch (e) { }
+    try { titleRange.merge(); } catch (e) { }
+    titleRange.setValue("☕ BREAKS HOURS (Reference Only)")
+        .setFontWeight("bold")
+        .setFontSize(11)
+        .setBackground("#b45f06")
+        .setFontColor("white")
+        .setHorizontalAlignment("center")
+        .setVerticalAlignment("middle");
+
+    // B. Header Row
+    const headers = ["Driver"];
+    allDateCols.forEach(dc => headers.push(dc.headerStr));
+    headers.push("Total Breaks");
+
+    const headerRange = hoursSheet.getRange(headerRow, 1, 1, totalCols);
+    headerRange.setValues([headers])
+        .setFontWeight("bold")
+        .setBackground("#e69138")
+        .setFontColor("white")
+        .setHorizontalAlignment("center");
+    hoursSheet.getRange(headerRow, 1, 1, totalCols - 1).setNumberFormat("@");
+
+    // C. Driver Data Rows
+    const matrixRows = [];
+    finalDrivers.forEach((driver, idx) => {
+        const rIdx = firstDataRow + idx;
+        const row = [driver];
+        const canon = getCanonicalDriverName(driver, canonicalDrivers);
+
+        allDateCols.forEach(dc => {
+            let bVal = 0;
+            if (dc.dateKey) {
+                if (breaksMap[driver] && breaksMap[driver][dc.dateKey] !== undefined) {
+                    bVal = breaksMap[driver][dc.dateKey];
+                } else if (breaksMap[canon] && breaksMap[canon][dc.dateKey] !== undefined) {
+                    bVal = breaksMap[canon][dc.dateKey];
+                }
+            }
+            row.push(bVal > 0 ? roundToTwo(bVal) : 0);
+        });
+
+        row.push(`=SUM(B${rIdx}:${lastDateColLetter}${rIdx})`);
+        matrixRows.push(row);
+    });
+
+    hoursSheet.getRange(firstDataRow, 1, matrixRows.length, totalCols).setValues(matrixRows);
+
+    // D. Bottom Total Row
+    const bottomRowFormulas = ["Total Breaks"];
+    for (let c = 2; c <= numDateCols + 1; c++) {
+        const cLetter = getColumnLetter(c);
+        bottomRowFormulas.push(`=SUM(${cLetter}${firstDataRow}:${cLetter}${bottomRow - 1})`);
+    }
+    bottomRowFormulas.push(`=SUM(B${bottomRow}:${lastDateColLetter}${bottomRow})`);
+
+    const bottomRange = hoursSheet.getRange(bottomRow, 1, 1, totalCols);
+    bottomRange.setValues([bottomRowFormulas])
+        .setFontWeight("bold")
+        .setBackground("#fce5cd")
+        .setBorder(true, true, true, true, true, true, "black", SpreadsheetApp.BorderStyle.SOLID_THICK);
+    hoursSheet.getRange(bottomRow, 1).setHorizontalAlignment("left");
+
+    // E. Formatting
+    hoursSheet.getRange(firstDataRow, 2, finalDrivers.length + 1, numDateCols + 1)
+        .setNumberFormat("0.0")
+        .setHorizontalAlignment("center");
+
+    hoursSheet.getRange(firstDataRow, 1, finalDrivers.length, 1)
+        .setFontWeight("bold")
+        .setHorizontalAlignment("left");
+
+    hoursSheet.getRange(headerRow, 1, finalDrivers.length + 2, totalCols)
+        .setBorder(true, true, true, true, true, true, "black", SpreadsheetApp.BorderStyle.SOLID);
+
+    // F. Highlight break days > 0
+    try {
+        const breakDataRange = hoursSheet.getRange(firstDataRow, 2, finalDrivers.length, numDateCols);
+        const breakHighlightRule = SpreadsheetApp.newConditionalFormatRule()
+            .whenNumberGreaterThan(0)
+            .setBackground("#fff2cc")
+            .setFontColor("#b45f06")
+            .setRanges([breakDataRange])
+            .build();
+
+        const currentRules = hoursSheet.getConditionalFormatRules();
+        currentRules.push(breakHighlightRule);
+        hoursSheet.setConditionalFormatRules(currentRules);
+    } catch (e) { }
+
+    SpreadsheetApp.flush();
+    Logger.log("✅ syncBreaksTable completed successfully at row " + titleRow);
 }
 
 /**
@@ -986,13 +1379,20 @@ function getColumnLetter(colIndex) {
  * Main entry point — runs all reporting functions in the correct order.
  */
 function runDailyBalance() {
-    const ss = SpreadsheetApp.openById(TARGET_SHEET_ID);
+    const ss = SpreadsheetApp.getActiveSpreadsheet() || SpreadsheetApp.openById(TARGET_SHEET_ID);
 
     // 0. Sync working hours sheet first so downstream reports can use working hours data
     try {
         generateWorkingHoursSheet(ss);
     } catch (e) {
         Logger.log("Error in generateWorkingHoursSheet: " + e.toString() + "\n" + (e.stack || ""));
+    }
+
+    // 0b. Sync breaks table directly
+    try {
+        syncBreaksTable(ss);
+    } catch (e) {
+        Logger.log("Error in syncBreaksTable: " + e.toString() + "\n" + (e.stack || ""));
     }
 
     // 1. Update the main Summary sheet from Raw Data.
@@ -2889,6 +3289,21 @@ function parseDate(value) {
             let day = p0;
             if (month >= 0 && month < 12 && day >= 1 && day <= 31) {
                 return new Date(year, month, day);
+            }
+        }
+
+        // 4. Dot format: "DD.MM.YYYY" or "DD.MM.YY" (e.g. "01.09.26")
+        const dotParts = str.split(".");
+        if (dotParts.length === 3) {
+            const p0 = parseInt(dotParts[0], 10);
+            const p1 = parseInt(dotParts[1], 10);
+            let year = parseInt(dotParts[2], 10);
+            if (year < 100) year += 2000;
+            const day = p0;
+            const month = p1 - 1;
+            if (month >= 0 && month < 12 && day >= 1 && day <= 31) {
+                const d = new Date(year, month, day);
+                if (!isNaN(d.getTime())) return d;
             }
         }
 
