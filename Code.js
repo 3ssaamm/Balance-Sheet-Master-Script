@@ -227,7 +227,7 @@ function findColByLabel(headers, keywords, defaultIdx) {
  */
 function findMainSummaryCol(headers, keywords, defaultIdx) {
     if (!headers || !headers.length) return defaultIdx;
-    const maxCol = Math.min(headers.length, 9);
+    const maxCol = Math.min(headers.length, 10);
     for (let c = 0; c < maxCol; c++) {
         const h = (headers[c] || '').toString().toLowerCase().trim();
         for (const kw of keywords) {
@@ -1151,10 +1151,10 @@ function updateSummaryAndCharts(ss) {
         const summarySheet = ss.getSheetByName("Summary");
         if (summarySheet && summarySheet.getLastRow() >= 3) {
             const lastRow = summarySheet.getLastRow();
-            const lastCol = Math.min(summarySheet.getLastColumn(), 9);
+            const lastCol = Math.min(summarySheet.getLastColumn(), 10);
             const headers = summarySheet.getRange(2, 1, 1, lastCol).getDisplayValues()[0];
-            const tripsIdx = findMainSummaryCol(headers, ['trips', 'trip'], 5);
-            const cashIdx = findMainSummaryCol(headers, ['cash'], 6);
+            const tripsIdx = findMainSummaryCol(headers, ['trips', 'trip'], 6);
+            const cashIdx = findMainSummaryCol(headers, ['cash'], 7);
             const numCols = Math.max(tripsIdx, cashIdx) + 1;
             const rows = summarySheet.getRange(3, 1, lastRow - 2, numCols).getValues();
 
@@ -1351,7 +1351,7 @@ function updateSummaryAndCharts(ss) {
     });
 
     // --- Write Summary headers ---
-    const headers = ["Date", "Driver", "Credit", "Hours", "Avg Per Hour", "Trips", "Cash", "No Show", "Balance"];
+    const headers = ["Date", "Driver", "Credit", "Hours", "CPH", "DEPH", "Trips", "Cash", "No Show", "Balance"];
     summarySheet.getRange(2, 1, 1, headers.length).setValues([headers]);
 
     // Helper to get fare as decimal
@@ -1403,7 +1403,7 @@ function updateSummaryAndCharts(ss) {
         const trips = Number(row[4]) || 0;
         const dailyNoShow = Number(row[7]) || 0;
         const dailyHours = Number(row[8]) || 0;
-        const dailyAvgPerHour = dailyHours > 0 ? roundToTwo(dailyCredit / dailyHours) : 0;
+        const dailyCPH = dailyHours > 0 ? roundToTwo(dailyCredit / dailyHours) : 0;
 
         let dailyBalance = 0;
         if (fare === "80%-90%") {
@@ -1436,13 +1436,16 @@ function updateSummaryAndCharts(ss) {
             dailyBalance = Number(roundToTwo((dailyCredit * numericFare) - dailyCash)) || 0;
         }
 
-        // Summary rows: Date, Driver, Credit, Hours, Avg Per Hour, Trips, Cash, No Show, Balance
+        const dailyDEPH = dailyHours > 0 ? roundToTwo((dailyCash + dailyBalance) / dailyHours) : 0;
+
+        // Summary rows: Date, Driver, Credit, Hours, CPH, DEPH, Trips, Cash, No Show, Balance
         rowsToWrite.push([
             displayDate,
             row[1],
             dailyCredit,
             roundToTwo(dailyHours) || 0,
-            dailyAvgPerHour,
+            dailyCPH,
+            dailyDEPH,
             trips,
             Number(roundToTwo(dailyCash)) || 0,
             dailyNoShow,
@@ -1567,11 +1570,11 @@ function updateSummaryAndCharts(ss) {
     settingsSheet.autoResizeColumns(1, 2);
 
     // =================================================================
-    // --- Write aggregated stats to Summary (column K = one gap after 9-col main table) ---
+    // --- Write aggregated stats to Summary (column L = one gap after 10-col main table) ---
     // =================================================================
-    const startRow = 3, startCol = 11; // Column K (A-I = 9-col main table, J = 1-col gap)
+    const startRow = 3, startCol = 12; // Column L (A-J = 10-col main table, K = 1-col gap)
     // Clear old aggregate area
-    try { summarySheet.getRange(startRow, 10, 60, 12).clearContent(); } catch (e) { }
+    try { summarySheet.getRange(startRow, 11, 60, 12).clearContent(); } catch (e) { }
 
     const aggRange = summarySheet.getRange(startRow, startCol, aggRows.length, aggRows[0].length);
     aggRange.setValues(aggRows);
@@ -1580,10 +1583,10 @@ function updateSummaryAndCharts(ss) {
     aggRange.setFontSize(7);
     summarySheet.getRange(startRow, startCol, 1, aggRows[0].length).setFontWeight("bold");
 
-    // Compact column widths for columns K to S (cols 11 to 19)
-    summarySheet.setColumnWidth(startCol, 75); // Col K (Driver name)
+    // Compact column widths for columns L to T (cols 12 to 20)
+    summarySheet.setColumnWidth(startCol, 75); // Col L (Driver name)
     for (let c = startCol + 1; c < startCol + aggRows[0].length; c++) {
-        summarySheet.setColumnWidth(c, 55); // Cols L to S (Stats)
+        summarySheet.setColumnWidth(c, 55); // Cols M to T (Stats)
     }
 
     // --- Daily stats for chart (aggregate all drivers per day) ---
@@ -1854,10 +1857,10 @@ function generateWeeklySummary(ss) {
     const lastRowCurrent = summarySheet.getLastRow();
     let allRows = [];
     if (lastRowCurrent >= 3) {
-        const summaryHeaders = summarySheet.getRange(2, 1, 1, Math.min(summarySheet.getLastColumn(), 9)).getDisplayValues()[0];
+        const summaryHeaders = summarySheet.getRange(2, 1, 1, Math.min(summarySheet.getLastColumn(), 10)).getDisplayValues()[0];
         const curCreditCol = findMainSummaryCol(summaryHeaders, ['credit'], 2);
-        const curTripsCol = findMainSummaryCol(summaryHeaders, ['trips', 'trip'], 5);
-        const curCashCol = findMainSummaryCol(summaryHeaders, ['cash'], 6);
+        const curTripsCol = findMainSummaryCol(summaryHeaders, ['trips', 'trip'], 6);
+        const curCashCol = findMainSummaryCol(summaryHeaders, ['cash'], 7);
         const maxCol = Math.max(curCreditCol, curTripsCol, curCashCol) + 1;
 
         const rawRows = summarySheet.getRange(3, 1, lastRowCurrent - 2, maxCol).getValues();
@@ -1904,10 +1907,10 @@ function generateWeeklySummary(ss) {
                 const prevSpreadsheet = SpreadsheetApp.openById(prevFile.getId());
                 const prevSummarySheet = prevSpreadsheet.getSheetByName("Summary");
                 if (prevSummarySheet && prevSummarySheet.getLastRow() >= 3) {
-                    const prevHeaders = prevSummarySheet.getRange(2, 1, 1, Math.min(prevSummarySheet.getLastColumn(), 9)).getDisplayValues()[0];
+                    const prevHeaders = prevSummarySheet.getRange(2, 1, 1, Math.min(prevSummarySheet.getLastColumn(), 10)).getDisplayValues()[0];
                     const prevCreditCol = findMainSummaryCol(prevHeaders, ['credit'], 2);
-                    const prevTripsCol = findMainSummaryCol(prevHeaders, ['trips', 'trip'], 5);
-                    const prevCashCol = findMainSummaryCol(prevHeaders, ['cash'], 6);
+                    const prevTripsCol = findMainSummaryCol(prevHeaders, ['trips', 'trip'], 6);
+                    const prevCashCol = findMainSummaryCol(prevHeaders, ['cash'], 7);
                     const prevMaxCol = Math.max(prevCreditCol, prevTripsCol, prevCashCol) + 1;
                     const prevAllData = prevSummarySheet.getRange(3, 1, prevSummarySheet.getLastRow() - 2, prevMaxCol).getValues();
 
@@ -2542,12 +2545,12 @@ function generateAngelReport(ss) {
                 const prevSummarySheet = prevSpreadsheet.getSheetByName("Summary");
 
                 if (prevSummarySheet && prevSummarySheet.getLastRow() >= 3) {
-                    const prevHeaders = prevSummarySheet.getRange(2, 1, 1, Math.min(prevSummarySheet.getLastColumn(), 9)).getDisplayValues()[0];
+                    const prevHeaders = prevSummarySheet.getRange(2, 1, 1, Math.min(prevSummarySheet.getLastColumn(), 10)).getDisplayValues()[0];
                     const prevIndices = {
                         credit: findMainSummaryCol(prevHeaders, ['credit'], 2),
-                        trips: findMainSummaryCol(prevHeaders, ['trips', 'trip'], 5),
-                        cash: findMainSummaryCol(prevHeaders, ['cash'], 6),
-                        noShow: findMainSummaryCol(prevHeaders, ['no show', 'noshow'], 7)
+                        trips: findMainSummaryCol(prevHeaders, ['trips', 'trip'], 6),
+                        cash: findMainSummaryCol(prevHeaders, ['cash'], 7),
+                        noShow: findMainSummaryCol(prevHeaders, ['no show', 'noshow'], 8)
                     };
                     const prevData = prevSummarySheet.getRange(3, 1, prevSummarySheet.getLastRow() - 2, 11).getValues();
 
@@ -2569,12 +2572,12 @@ function generateAngelReport(ss) {
 
     // 4. --- Fetch Current Month Data ---
     if (lastRow >= 3) {
-        const curHeaders = summarySheet.getRange(2, 1, 1, Math.min(summarySheet.getLastColumn(), 9)).getDisplayValues()[0];
+        const curHeaders = summarySheet.getRange(2, 1, 1, Math.min(summarySheet.getLastColumn(), 10)).getDisplayValues()[0];
         const curIndices = {
             credit: findMainSummaryCol(curHeaders, ['credit'], 2),
-            trips: findMainSummaryCol(curHeaders, ['trips', 'trip'], 5),
-            cash: findMainSummaryCol(curHeaders, ['cash'], 6),
-            noShow: findMainSummaryCol(curHeaders, ['no show', 'noshow'], 7)
+            trips: findMainSummaryCol(curHeaders, ['trips', 'trip'], 6),
+            cash: findMainSummaryCol(curHeaders, ['cash'], 7),
+            noShow: findMainSummaryCol(curHeaders, ['no show', 'noshow'], 8)
         };
         const currentData = summarySheet.getRange(3, 1, lastRow - 2, 11).getValues();
 
