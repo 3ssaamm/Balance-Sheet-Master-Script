@@ -1610,10 +1610,10 @@ function updateSummaryAndCharts(ss) {
         .map(d => [d.date, roundToTwo(d.credit), d.trips, roundToTwo(d.cash), d.noShow, roundToTwo(d.hours)]);
 
     const dailyHeader = ["Date", "Total Credit", "Trips", "Cash", "No Show", "Total Hours"];
-    const dailyStartCol = 22; // Column V (Daily total summary table starts at Column V)
+    const dailyStartCol = 23; // Column W (Daily total summary table starts at Column W)
 
     // Clear old daily table and chart area starting from Column T (col 20)
-    summarySheet.getRange(2, 20, 100, 20).clearContent();
+    summarySheet.getRange(2, 20, 100, 25).clearContent();
     summarySheet.getRange(2, dailyStartCol, 1, dailyHeader.length).setValues([dailyHeader]).setFontWeight("bold");
 
     if (dailyRows.length > 0) {
@@ -1625,9 +1625,9 @@ function updateSummaryAndCharts(ss) {
     const allCharts = summarySheet.getCharts();
     allCharts.forEach(c => summarySheet.removeChart(c));
 
-    // Chart 1: Daily Total Credit Trend (line) — positioned NEXT TO the daily credit table (Col AC = 29)
+    // Chart 1: Daily Total Credit Trend (line) — positioned NEXT TO the daily credit table (Col AD = 30)
     if (dailyRows.length > 0) {
-        const dailyChartCol = dailyStartCol + 7; // Col 29 (AC)
+        const dailyChartCol = dailyStartCol + 7; // Col 30 (AD)
         let dailyChart = summarySheet.newChart()
             .setChartType(Charts.ChartType.LINE)
             .addRange(summarySheet.getRange(3, dailyStartCol, dailyRows.length, 1))
