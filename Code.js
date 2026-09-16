@@ -462,32 +462,24 @@ function generateWorkingHoursSheetFromMenu() {
     syncBreaksTable(ss);
     SpreadsheetApp.flush();
     try {
-        SpreadsheetApp.getUi().alert("✅ 'Working hours' and breaks table synced successfully!");
+        ss.toast("Working hours and breaks table synced!", "Balance Sheet", 3);
     } catch (e) { }
 }
 
 function syncBreaksTableFromMenu() {
+    let ss = null;
+    try { ss = SpreadsheetApp.getActiveSpreadsheet(); } catch (e) { }
+    if (!ss) ss = SpreadsheetApp.openById(TARGET_SHEET_ID);
     try {
-        const info = runSyncBreaksTable();
-        const msg = [
-            "✅ Breaks Table Synced!",
-            "",
-            "• Spreadsheet: " + info.spreadsheetName,
-            "• Sheet Tab: " + info.sheetName,
-            "• Breaks Title Row: Row " + info.titleRow + " ('" + info.writtenTitle + "')",
-            "• Color: " + info.writtenBg,
-            "• Driver Data Rows: Rows " + info.firstDataRow + " to " + (info.bottomRow - 1) + " (" + info.numDrivers + " drivers)",
-            "• Total Breaks Row: Row " + info.bottomRow,
-            (info.errors && info.errors.length > 0 ? "\n⚠️ STEP ERRORS:\n" + info.errors.join("\n") : "\nAll steps completed successfully!")
-        ].join("\n");
+        runSyncBreaksTable();
         try {
-            SpreadsheetApp.getUi().alert(msg);
-        } catch (uiErr) { }
+            ss.toast("Breaks table synced successfully!", "Balance Sheet", 3);
+        } catch (tErr) { }
     } catch (e) {
         Logger.log("Error syncing breaks table: " + e.message + "\n" + (e.stack || ""));
         try {
-            SpreadsheetApp.getUi().alert("⚠️ Error syncing breaks table:\n\n" + e.message + "\n\n" + (e.stack || ""));
-        } catch (uiErr) { }
+            ss.toast("Error syncing breaks: " + e.message, "Balance Sheet", 5);
+        } catch (tErr) { }
     }
 }
 
@@ -1327,11 +1319,20 @@ function syncBreaksTable(ss) {
             .setFontSize(11)
             .setBackground("#b45f06")
             .setFontColor("white")
-            .setHorizontalAlignment("center")
             .setVerticalAlignment("middle");
-        try {
-            titleRange.merge();
-        } catch (mErr) { }
+
+        const frozenCols = hoursSheet.getFrozenColumns();
+        if (frozenCols > 0 && frozenCols < totalCols) {
+            hoursSheet.getRange(titleRow, 1).setHorizontalAlignment("left");
+            try {
+                hoursSheet.getRange(titleRow, frozenCols + 1, 1, totalCols - frozenCols).merge();
+            } catch (mErr) { }
+        } else {
+            hoursSheet.getRange(titleRow, 1).setHorizontalAlignment("center");
+            try {
+                titleRange.merge();
+            } catch (mErr) { }
+        }
         SpreadsheetApp.flush();
     } catch (eA) {
         stepErrors.push("Step A (Title): " + eA.message);
