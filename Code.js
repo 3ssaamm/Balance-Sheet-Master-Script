@@ -478,9 +478,7 @@ function syncBreaksTableFromMenu() {
             "• Color: " + info.writtenBg,
             "• Driver Data Rows: Rows " + info.firstDataRow + " to " + (info.bottomRow - 1) + " (" + info.numDrivers + " drivers)",
             "• Total Breaks Row: Row " + info.bottomRow,
-            (info.errors && info.errors.length > 0 ? "\n⚠️ STEP ERRORS:\n" + info.errors.join("\n") : "\nAll steps completed successfully!"),
-            "",
-            "👉 Switched to '" + info.sheetName + "' and selected Cell A" + info.titleRow + "!"
+            (info.errors && info.errors.length > 0 ? "\n⚠️ STEP ERRORS:\n" + info.errors.join("\n") : "\nAll steps completed successfully!")
         ].join("\n");
         try {
             SpreadsheetApp.getUi().alert(msg);
@@ -1455,11 +1453,7 @@ function syncBreaksTable(ss) {
         hoursSheet.showRows(1, hoursSheet.getMaxRows());
     } catch (eH) { }
 
-    // Activate the sheet and select the title cell so the user's screen jumps directly to it
-    try {
-        hoursSheet.activate();
-        hoursSheet.setActiveRange(hoursSheet.getRange(titleRow, 1));
-    } catch (eI) { }
+    // (Do not activate or change the user's active sheet tab)
 
     SpreadsheetApp.flush();
 
