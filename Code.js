@@ -13,12 +13,13 @@ function onOpen() {
     try {
         const ui = SpreadsheetApp.getUi();
         ui.createMenu('⚙️ Balance Sheet')
+            .addItem('☕ Sync Breaks Table', 'syncBreaksTableFromMenu')
             .addItem('▶ Run Balance Report', 'runDailyBalance')
+            .addSeparator()
+            .addItem('🕒 Sync Working Hours Sheet', 'generateWorkingHoursSheetFromMenu')
             .addSeparator()
             .addItem('📥 Import: NET Data  (from "Raw Data - NET" sheet)', 'importNetData')
             .addItem('📥 Import: Trips Data  (from "Raw Data - Trips" sheet)', 'importTripsData')
-            .addItem('🕒 Sync Working Hours Sheet', 'generateWorkingHoursSheetFromMenu')
-            .addItem('☕ Sync Breaks Table', 'syncBreaksTableFromMenu')
             .addSeparator()
             .addItem('🔧 Setup Auto-Run Trigger', 'setupAutoRun')
             .addToUi();
@@ -437,8 +438,26 @@ function setupAutoRun() {
 // WORKING HOURS SHEET GENERATION & LOAD HELPERS
 // =================================================================
 
+function runSyncBreaksTable() {
+    Logger.log("=== Starting runSyncBreaksTable ===");
+    let ss = null;
+    try {
+        ss = SpreadsheetApp.getActiveSpreadsheet();
+    } catch (e) { }
+    if (!ss) {
+        ss = SpreadsheetApp.openById(TARGET_SHEET_ID);
+    }
+    Logger.log("Target Spreadsheet: " + ss.getName() + " (" + ss.getId() + ")");
+    const info = syncBreaksTable(ss);
+    SpreadsheetApp.flush();
+    Logger.log("=== Successfully synced breaks table at row " + info.titleRow + " ===");
+    return info;
+}
+
 function generateWorkingHoursSheetFromMenu() {
-    const ss = SpreadsheetApp.getActiveSpreadsheet() || SpreadsheetApp.openById(TARGET_SHEET_ID);
+    let ss = null;
+    try { ss = SpreadsheetApp.getActiveSpreadsheet(); } catch (e) { }
+    if (!ss) ss = SpreadsheetApp.openById(TARGET_SHEET_ID);
     generateWorkingHoursSheet(ss);
     syncBreaksTable(ss);
     SpreadsheetApp.flush();
@@ -449,16 +468,27 @@ function generateWorkingHoursSheetFromMenu() {
 
 function syncBreaksTableFromMenu() {
     try {
-        const ss = SpreadsheetApp.getActiveSpreadsheet() || SpreadsheetApp.openById(TARGET_SHEET_ID);
-        syncBreaksTable(ss);
-        SpreadsheetApp.flush();
+        const info = runSyncBreaksTable();
+        const msg = [
+            "✅ Breaks Table Synced!",
+            "",
+            "• Spreadsheet: " + info.spreadsheetName,
+            "• Sheet Tab: " + info.sheetName,
+            "• Breaks Title Row: Row " + info.titleRow + " ('" + info.writtenTitle + "')",
+            "• Color: " + info.writtenBg,
+            "• Driver Data Rows: Rows " + info.firstDataRow + " to " + (info.bottomRow - 1) + " (" + info.numDrivers + " drivers)",
+            "• Total Breaks Row: Row " + info.bottomRow,
+            (info.errors && info.errors.length > 0 ? "\n⚠️ STEP ERRORS:\n" + info.errors.join("\n") : "\nAll steps completed successfully!"),
+            "",
+            "👉 Switched to '" + info.sheetName + "' and selected Cell A" + info.titleRow + "!"
+        ].join("\n");
         try {
-            SpreadsheetApp.getUi().alert("✅ Breaks table synced successfully! Look below row 12 in 'Working hours'.");
+            SpreadsheetApp.getUi().alert(msg);
         } catch (uiErr) { }
     } catch (e) {
-        Logger.log("Error syncing breaks table: " + e.message);
+        Logger.log("Error syncing breaks table: " + e.message + "\n" + (e.stack || ""));
         try {
-            SpreadsheetApp.getUi().alert("⚠️ Error syncing breaks table: " + e.message);
+            SpreadsheetApp.getUi().alert("⚠️ Error syncing breaks table:\n\n" + e.message + "\n\n" + (e.stack || ""));
         } catch (uiErr) { }
     }
 }
@@ -759,7 +789,7 @@ function generateWorkingHoursSheet(ss) {
         SpreadsheetApp.flush();
     }
 
-    // STEP 3: Deduplicate any extra rows below the first bottom "Total Hours" row
+    // STEP 3: Identify the bottom "Total Hours" row of the main table
     let curLastRow = hoursSheet.getLastRow();
     let curLastCol = hoursSheet.getLastColumn();
     const colAData = hoursSheet.getRange(1, 1, curLastRow, 1).getDisplayValues();
@@ -767,15 +797,10 @@ function generateWorkingHoursSheet(ss) {
 
     for (let r = 1; r < colAData.length; r++) {
         const txt = (colAData[r][0] || '').toString().toLowerCase().trim();
-        if (txt.startsWith("total")) {
+        if (txt.startsWith("total") && !txt.includes("break")) {
             firstBottomTotalRow = r + 1; // 1-based index
             break;
         }
-    }
-
-    if (firstBottomTotalRow > -1 && curLastRow > firstBottomTotalRow) {
-        hoursSheet.deleteRows(firstBottomTotalRow + 1, curLastRow - firstBottomTotalRow);
-        SpreadsheetApp.flush();
     }
 
     // STEP 4: Now scan the cleaned sheet to find existing columns and drivers
@@ -987,13 +1012,6 @@ function applyWorkingHoursFormatting(hoursSheet, numDrivers, numDateCols, bottom
     for (let c = 1; c <= totalCols; c++) {
         if (hoursSheet.getColumnWidth(c) < 80) hoursSheet.setColumnWidth(c, 80);
     }
-
-    // Automatically sync breaks table below the main working hours table
-    try {
-        syncBreaksTable(ss);
-    } catch (e) {
-        Logger.log("Error syncing breaks table inside generateWorkingHoursSheet: " + e.message);
-    }
 }
 
 // =================================================================
@@ -1069,28 +1087,41 @@ function parseBreakPeriodToHours(periodVal, periodDisp, fromVal, toVal) {
 }
 
 /**
+ * Helper to find a sheet in a spreadsheet case-insensitively, trimming spaces.
+ */
+function findSheetCaseInsensitive(ss, name) {
+    if (!ss || !name) return null;
+    const direct = ss.getSheetByName(name);
+    if (direct) return direct;
+    const target = name.toLowerCase().replace(/\s+/g, ' ').trim();
+    const sheets = ss.getSheets();
+    for (let i = 0; i < sheets.length; i++) {
+        const sName = sheets[i].getName().toLowerCase().replace(/\s+/g, ' ').trim();
+        if (sName === target) return sheets[i];
+    }
+    return null;
+}
+
+/**
  * Reads the "breaks" sheet and returns:
  * - map: { canonDriver -> { dateTimestamp -> totalBreakHours } }
  * - driverTotals: { canonDriver -> totalBreakHours }
  * - dailyTotals: { dateTimestamp -> totalBreakHours }
  */
 function loadBreaksMap(ss, canonicalDrivers) {
-    if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet() || SpreadsheetApp.openById(TARGET_SHEET_ID);
-    let breaksSheet = ss.getSheetByName("breaks") || ss.getSheetByName("Breaks");
-    if (!breaksSheet) {
-        const allSheets = ss.getSheets();
-        for (let i = 0; i < allSheets.length; i++) {
-            if (allSheets[i].getName().toLowerCase().trim() === "breaks") {
-                breaksSheet = allSheets[i];
-                break;
-            }
-        }
+    if (!ss) {
+        try { ss = SpreadsheetApp.getActiveSpreadsheet(); } catch (e) { }
+        if (!ss) ss = SpreadsheetApp.openById(TARGET_SHEET_ID);
     }
-    if (!breaksSheet) return { map: {}, driverTotals: {}, dailyTotals: {} };
+    const breaksSheet = findSheetCaseInsensitive(ss, "breaks");
+    if (!breaksSheet) {
+        Logger.log("ℹ️ Breaks sheet not found, proceeding with 0 break hours.");
+        return { map: {}, driverTotals: {}, dailyTotals: {} };
+    }
 
     const lastRow = breaksSheet.getLastRow();
     const lastCol = breaksSheet.getLastColumn();
-    if (lastRow < 2 || lastCol < 3) return { map: {}, driverTotals: {}, dailyTotals: {} };
+    if (lastRow < 2 || lastCol < 2) return { map: {}, driverTotals: {}, dailyTotals: {} };
 
     const rawHeaders = breaksSheet.getRange(1, 1, 1, lastCol).getValues()[0];
     const dispHeaders = breaksSheet.getRange(1, 1, 1, lastCol).getDisplayValues()[0];
@@ -1160,16 +1191,31 @@ function loadBreaksMap(ss, canonicalDrivers) {
  * Reads existing dates and drivers directly from the sheet to guarantee exact alignment.
  */
 function syncBreaksTable(ss) {
-    if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet() || SpreadsheetApp.openById(TARGET_SHEET_ID);
-    const hoursSheet = ss.getSheetByName("Working hours");
+    if (!ss) {
+        try { ss = SpreadsheetApp.getActiveSpreadsheet(); } catch (e) { }
+        if (!ss) ss = SpreadsheetApp.openById(TARGET_SHEET_ID);
+    }
+    if (!ss) throw new Error("Could not access spreadsheet.");
+
+    let hoursSheet = null;
+    try {
+        const activeS = ss.getActiveSheet();
+        if (activeS && activeS.getName().toLowerCase().replace(/\s+/g, ' ').trim() === "working hours") {
+            hoursSheet = activeS;
+        }
+    } catch (e) { }
     if (!hoursSheet) {
-        Logger.log("❌ 'Working hours' sheet not found.");
-        return;
+        hoursSheet = findSheetCaseInsensitive(ss, "Working hours");
+    }
+    if (!hoursSheet) {
+        throw new Error("Sheet 'Working hours' was not found in spreadsheet '" + ss.getName() + "'. Available sheets: " + ss.getSheets().map(s => '"' + s.getName() + '"').join(", "));
     }
 
     const lastRow = hoursSheet.getLastRow();
     const lastCol = hoursSheet.getLastColumn();
-    if (lastRow < 2 || lastCol < 2) return;
+    if (lastRow < 2 || lastCol < 2) {
+        throw new Error("Working hours sheet has insufficient data (lastRow: " + lastRow + ", lastCol: " + lastCol + ").");
+    }
 
     // 1. Find the bottom "Total Hours" row of the main table
     const colAData = hoursSheet.getRange(1, 1, lastRow, 1).getDisplayValues();
@@ -1185,7 +1231,7 @@ function syncBreaksTable(ss) {
 
     // 2. Find the "Total Hours" column in Row 1
     const row1Data = hoursSheet.getRange(1, 1, 1, lastCol).getDisplayValues()[0];
-    let totalColNumber = lastCol;
+    let totalColNumber = -1;
     for (let c = 1; c < lastCol; c++) {
         const hText = (row1Data[c] || '').toString().toLowerCase().trim();
         if (hText.includes("total")) {
@@ -1193,9 +1239,12 @@ function syncBreaksTable(ss) {
             break;
         }
     }
+    if (totalColNumber === -1) totalColNumber = lastCol;
 
     const numDateCols = totalColNumber - 2;
-    if (numDateCols <= 0) return;
+    if (numDateCols <= 0) {
+        throw new Error("Could not find date columns in Row 1 of 'Working hours'. totalColNumber: " + totalColNumber + ", headers: " + row1Data.join(" | "));
+    }
 
     // 3. Read date columns directly from Row 1
     const row1Raw = hoursSheet.getRange(1, 1, 1, totalColNumber).getValues()[0];
@@ -1212,7 +1261,9 @@ function syncBreaksTable(ss) {
 
     // 4. Read drivers from main table (rows 2 to mainBottomRow - 1)
     const numDrivers = mainBottomRow - 2;
-    if (numDrivers <= 0) return;
+    if (numDrivers <= 0) {
+        throw new Error("No driver rows found between Row 1 and Total Hours row (" + mainBottomRow + ").");
+    }
     const driverColData = hoursSheet.getRange(2, 1, numDrivers, 1).getDisplayValues();
     const finalDrivers = [];
     for (let r = 0; r < driverColData.length; r++) {
@@ -1221,10 +1272,12 @@ function syncBreaksTable(ss) {
             finalDrivers.push(dName);
         }
     }
-    if (finalDrivers.length === 0) return;
+    if (finalDrivers.length === 0) {
+        throw new Error("Found 0 driver names in Column A between Row 2 and Row " + (mainBottomRow - 1) + ".");
+    }
 
     // 5. Seed canonical drivers from Settings
-    const settingsSheet = ss.getSheetByName("Settings");
+    const settingsSheet = findSheetCaseInsensitive(ss, "Settings");
     const canonicalDrivers = [];
     if (settingsSheet) {
         const sData = settingsSheet.getDataRange().getValues();
@@ -1235,7 +1288,13 @@ function syncBreaksTable(ss) {
     }
 
     // 6. Load breaks map from 'breaks' sheet
-    const { map: breaksMap } = loadBreaksMap(ss, canonicalDrivers);
+    let breaksMap = {};
+    try {
+        const bRes = loadBreaksMap(ss, canonicalDrivers);
+        breaksMap = (bRes && bRes.map) ? bRes.map : {};
+    } catch (e) {
+        Logger.log("Warning: loadBreaksMap encountered an error: " + e.message);
+    }
 
     const totalCols = numDateCols + 2;
     const lastDateColLetter = getColumnLetter(numDateCols + 1);
@@ -1252,95 +1311,118 @@ function syncBreaksTable(ss) {
         hoursSheet.insertRowsAfter(currentMaxRows, (bottomRow + 5) - currentMaxRows);
     }
 
-    // Clear old area below main table before writing (break apart any merges first)
     const curLastCol = Math.max(hoursSheet.getLastColumn(), totalCols);
+
+    // Unmerge any existing merges in the target table area without wiping contents
     try {
-        const clearRows = hoursSheet.getMaxRows() - titleRow + 1;
-        if (clearRows > 0) {
-            const clearRange = hoursSheet.getRange(titleRow, 1, clearRows, curLastCol);
-            clearRange.breakApart();
-            clearRange.clear();
-        }
-    } catch (e) {
-        Logger.log("Clear old breaks area: " + e.message);
+        hoursSheet.getRange(titleRow, 1, (bottomRow - titleRow + 1), curLastCol).breakApart();
+    } catch (e) { }
+
+    const stepErrors = [];
+
+    // A. Title Block (Row 15)
+    try {
+        hoursSheet.getRange(titleRow, 1).setValue("☕ BREAKS HOURS (Reference Only)");
+        const titleRange = hoursSheet.getRange(titleRow, 1, 1, totalCols);
+        titleRange
+            .setFontWeight("bold")
+            .setFontSize(11)
+            .setBackground("#b45f06")
+            .setFontColor("white")
+            .setHorizontalAlignment("center")
+            .setVerticalAlignment("middle");
+        try {
+            titleRange.merge();
+        } catch (mErr) { }
+        SpreadsheetApp.flush();
+    } catch (eA) {
+        stepErrors.push("Step A (Title): " + eA.message);
     }
 
-    // A. Title Block
-    const titleRange = hoursSheet.getRange(titleRow, 1, 1, totalCols);
-    try { titleRange.breakApart(); } catch (e) { }
-    try { titleRange.merge(); } catch (e) { }
-    titleRange.setValue("☕ BREAKS HOURS (Reference Only)")
-        .setFontWeight("bold")
-        .setFontSize(11)
-        .setBackground("#b45f06")
-        .setFontColor("white")
-        .setHorizontalAlignment("center")
-        .setVerticalAlignment("middle");
+    // B. Header Row (Row 16)
+    try {
+        const headers = ["Driver"];
+        allDateCols.forEach(dc => headers.push(dc.headerStr));
+        headers.push("Total Breaks");
 
-    // B. Header Row
-    const headers = ["Driver"];
-    allDateCols.forEach(dc => headers.push(dc.headerStr));
-    headers.push("Total Breaks");
+        const headerRange = hoursSheet.getRange(headerRow, 1, 1, headers.length);
+        headerRange.setValues([headers]);
+        headerRange.setFontWeight("bold")
+            .setBackground("#e69138")
+            .setFontColor("white")
+            .setHorizontalAlignment("center")
+            .setVerticalAlignment("middle");
+        SpreadsheetApp.flush();
+    } catch (eB) {
+        stepErrors.push("Step B (Header): " + eB.message);
+    }
 
-    const headerRange = hoursSheet.getRange(headerRow, 1, 1, totalCols);
-    headerRange.setValues([headers])
-        .setFontWeight("bold")
-        .setBackground("#e69138")
-        .setFontColor("white")
-        .setHorizontalAlignment("center");
-    hoursSheet.getRange(headerRow, 1, 1, totalCols - 1).setNumberFormat("@");
+    // C. Driver Data Rows (Rows 17 to 26)
+    try {
+        const matrixRows = [];
+        finalDrivers.forEach((driver, idx) => {
+            const rIdx = firstDataRow + idx;
+            const row = [driver];
+            const canon = getCanonicalDriverName(driver, canonicalDrivers);
 
-    // C. Driver Data Rows
-    const matrixRows = [];
-    finalDrivers.forEach((driver, idx) => {
-        const rIdx = firstDataRow + idx;
-        const row = [driver];
-        const canon = getCanonicalDriverName(driver, canonicalDrivers);
-
-        allDateCols.forEach(dc => {
-            let bVal = 0;
-            if (dc.dateKey) {
-                if (breaksMap[driver] && breaksMap[driver][dc.dateKey] !== undefined) {
-                    bVal = breaksMap[driver][dc.dateKey];
-                } else if (breaksMap[canon] && breaksMap[canon][dc.dateKey] !== undefined) {
-                    bVal = breaksMap[canon][dc.dateKey];
+            allDateCols.forEach(dc => {
+                let bVal = 0;
+                if (dc.dateKey) {
+                    if (breaksMap[driver] && breaksMap[driver][dc.dateKey] !== undefined) {
+                        bVal = breaksMap[driver][dc.dateKey];
+                    } else if (breaksMap[canon] && breaksMap[canon][dc.dateKey] !== undefined) {
+                        bVal = breaksMap[canon][dc.dateKey];
+                    }
                 }
-            }
-            row.push(bVal > 0 ? roundToTwo(bVal) : 0);
+                row.push(bVal > 0 ? roundToTwo(bVal) : 0);
+            });
+
+            row.push(`=SUM(B${rIdx}:${lastDateColLetter}${rIdx})`);
+            matrixRows.push(row);
         });
 
-        row.push(`=SUM(B${rIdx}:${lastDateColLetter}${rIdx})`);
-        matrixRows.push(row);
-    });
-
-    hoursSheet.getRange(firstDataRow, 1, matrixRows.length, totalCols).setValues(matrixRows);
-
-    // D. Bottom Total Row
-    const bottomRowFormulas = ["Total Breaks"];
-    for (let c = 2; c <= numDateCols + 1; c++) {
-        const cLetter = getColumnLetter(c);
-        bottomRowFormulas.push(`=SUM(${cLetter}${firstDataRow}:${cLetter}${bottomRow - 1})`);
+        const dataRange = hoursSheet.getRange(firstDataRow, 1, matrixRows.length, totalCols);
+        dataRange.setValues(matrixRows);
+        hoursSheet.getRange(firstDataRow, 1, matrixRows.length, 1)
+            .setFontWeight("bold")
+            .setHorizontalAlignment("left");
+        hoursSheet.getRange(firstDataRow, 2, matrixRows.length, numDateCols + 1)
+            .setNumberFormat("0.0")
+            .setHorizontalAlignment("center");
+        SpreadsheetApp.flush();
+    } catch (eC) {
+        stepErrors.push("Step C (Drivers): " + eC.message);
     }
-    bottomRowFormulas.push(`=SUM(B${bottomRow}:${lastDateColLetter}${bottomRow})`);
 
-    const bottomRange = hoursSheet.getRange(bottomRow, 1, 1, totalCols);
-    bottomRange.setValues([bottomRowFormulas])
-        .setFontWeight("bold")
-        .setBackground("#fce5cd")
-        .setBorder(true, true, true, true, true, true, "black", SpreadsheetApp.BorderStyle.SOLID_THICK);
-    hoursSheet.getRange(bottomRow, 1).setHorizontalAlignment("left");
+    // D. Bottom Total Row (Row 27)
+    try {
+        const bottomRowFormulas = ["Total Breaks"];
+        for (let c = 2; c <= numDateCols + 1; c++) {
+            const cLetter = getColumnLetter(c);
+            bottomRowFormulas.push(`=SUM(${cLetter}${firstDataRow}:${cLetter}${bottomRow - 1})`);
+        }
+        bottomRowFormulas.push(`=SUM(B${bottomRow}:${lastDateColLetter}${bottomRow})`);
 
-    // E. Formatting
-    hoursSheet.getRange(firstDataRow, 2, finalDrivers.length + 1, numDateCols + 1)
-        .setNumberFormat("0.0")
-        .setHorizontalAlignment("center");
+        const bottomRange = hoursSheet.getRange(bottomRow, 1, 1, totalCols);
+        bottomRange.setValues([bottomRowFormulas]);
+        bottomRange.setFontWeight("bold")
+            .setBackground("#fce5cd")
+            .setHorizontalAlignment("center")
+            .setBorder(true, true, true, true, true, true, "black", SpreadsheetApp.BorderStyle.SOLID_THICK);
+        hoursSheet.getRange(bottomRow, 1).setHorizontalAlignment("left");
+        hoursSheet.getRange(bottomRow, 2, 1, numDateCols + 1).setNumberFormat("0.0");
+        SpreadsheetApp.flush();
+    } catch (eD) {
+        stepErrors.push("Step D (Totals): " + eD.message);
+    }
 
-    hoursSheet.getRange(firstDataRow, 1, finalDrivers.length, 1)
-        .setFontWeight("bold")
-        .setHorizontalAlignment("left");
-
-    hoursSheet.getRange(headerRow, 1, finalDrivers.length + 2, totalCols)
-        .setBorder(true, true, true, true, true, true, "black", SpreadsheetApp.BorderStyle.SOLID);
+    // E. Grid borders around table
+    try {
+        hoursSheet.getRange(headerRow, 1, finalDrivers.length + 2, totalCols)
+            .setBorder(true, true, true, true, true, true, "black", SpreadsheetApp.BorderStyle.SOLID);
+    } catch (eE) {
+        stepErrors.push("Step E (Borders): " + eE.message);
+    }
 
     // F. Highlight break days > 0
     try {
@@ -1352,13 +1434,52 @@ function syncBreaksTable(ss) {
             .setRanges([breakDataRange])
             .build();
 
-        const currentRules = hoursSheet.getConditionalFormatRules();
+        const currentRules = hoursSheet.getConditionalFormatRules() || [];
         currentRules.push(breakHighlightRule);
         hoursSheet.setConditionalFormatRules(currentRules);
-    } catch (e) { }
+    } catch (eF) { }
+
+    // G. Clear ONLY leftover rows strictly below bottomRow (if any)
+    try {
+        const maxR = hoursSheet.getMaxRows();
+        if (maxR > bottomRow) {
+            const leftoverRows = maxR - bottomRow;
+            const leftoverRange = hoursSheet.getRange(bottomRow + 1, 1, leftoverRows, curLastCol);
+            leftoverRange.breakApart();
+            leftoverRange.clearContent().clearFormat();
+        }
+    } catch (eG) { }
+
+    // Ensure all rows in Working hours are unhidden and visible
+    try {
+        hoursSheet.showRows(1, hoursSheet.getMaxRows());
+    } catch (eH) { }
+
+    // Activate the sheet and select the title cell so the user's screen jumps directly to it
+    try {
+        hoursSheet.activate();
+        hoursSheet.setActiveRange(hoursSheet.getRange(titleRow, 1));
+    } catch (eI) { }
 
     SpreadsheetApp.flush();
-    Logger.log("✅ syncBreaksTable completed successfully at row " + titleRow);
+
+    const writtenVal = hoursSheet.getRange(titleRow, 1).getValue() || hoursSheet.getRange(titleRow, 1).getDisplayValue();
+    const writtenColor = hoursSheet.getRange(titleRow, 1).getBackground();
+    Logger.log("✅ syncBreaksTable completed at row " + titleRow + ": '" + writtenVal + "' (" + writtenColor + ")");
+
+    return {
+        sheetName: hoursSheet.getName(),
+        spreadsheetName: ss.getName(),
+        titleRow: titleRow,
+        headerRow: headerRow,
+        firstDataRow: firstDataRow,
+        bottomRow: bottomRow,
+        numDrivers: finalDrivers.length,
+        totalCols: totalCols,
+        writtenTitle: writtenVal,
+        writtenBg: writtenColor,
+        errors: stepErrors
+    };
 }
 
 /**
