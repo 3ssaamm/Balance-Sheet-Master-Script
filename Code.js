@@ -1873,7 +1873,7 @@ function updateSummaryAndCharts(ss) {
     });
 
     // --- Write Summary headers ---
-    const headers = ["Date", "Driver", "Credit", "Hours", "CPH", "DEPH", "Trips", "Cash", "No Show", "Balance"];
+    const headers = ["Date", "Driver", "Credit", "Hours", "Driver Avg/ Hour", "CPH", "Trips", "Cash", "No Show", "Balance"];
     summarySheet.getRange(2, 1, 1, headers.length).setValues([headers]);
 
     // Helper to get fare as decimal
@@ -1960,14 +1960,14 @@ function updateSummaryAndCharts(ss) {
 
         const dailyDEPH = dailyHours > 0 ? roundToTwo((dailyCash + dailyBalance) / dailyHours) : 0;
 
-        // Summary rows: Date, Driver, Credit, Hours, CPH, DEPH, Trips, Cash, No Show, Balance
+        // Summary rows: Date, Driver, Credit, Hours, Driver Avg/ Hour, CPH, Trips, Cash, No Show, Balance
         rowsToWrite.push([
             displayDate,
             row[1],
             dailyCredit,
             roundToTwo(dailyHours) || 0,
-            dailyCPH,
             dailyDEPH,
+            dailyCPH,
             trips,
             Number(roundToTwo(dailyCash)) || 0,
             dailyNoShow,
