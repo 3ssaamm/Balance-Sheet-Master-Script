@@ -16,7 +16,6 @@ function onOpen() {
             .addItem('▶ Run Balance Report', 'runDailyBalance')
             .addSeparator()
             .addItem('☕ Sync Breaks Table', 'syncBreaksTableFromMenu')
-            .addSeparator()
             .addItem('🕒 Sync Working Hours Sheet', 'generateWorkingHoursSheetFromMenu')
             .addSeparator()
             .addItem('📥 Import: NET Data  (from "Raw Data - NET" sheet)', 'importNetData')
