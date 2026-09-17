@@ -13,8 +13,9 @@ function onOpen() {
     try {
         const ui = SpreadsheetApp.getUi();
         ui.createMenu('⚙️ Balance Sheet')
-            .addItem('☕ Sync Breaks Table', 'syncBreaksTableFromMenu')
             .addItem('▶ Run Balance Report', 'runDailyBalance')
+            .addSeparator()
+            .addItem('☕ Sync Breaks Table', 'syncBreaksTableFromMenu')
             .addSeparator()
             .addItem('🕒 Sync Working Hours Sheet', 'generateWorkingHoursSheetFromMenu')
             .addSeparator()
