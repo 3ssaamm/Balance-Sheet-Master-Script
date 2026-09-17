@@ -1138,12 +1138,14 @@ function loadBreaksMap(ss, canonicalDrivers) {
     const map = {};
     const driverTotals = {};
     const dailyTotals = {};
+    const rawToCanon = {};
 
     for (let r = 0; r < rawData.length; r++) {
         const rawDriver = (rawData[r][driverColIdx] || dispData[r][driverColIdx] || '').toString().trim();
         if (!rawDriver) continue;
 
-        const canonDriver = getCanonicalDriverName(rawDriver, canonicalDrivers);
+        const canonDriver = getCanonicalDriverName(rawDriver, canonicalDrivers) || rawDriver;
+        rawToCanon[rawDriver] = canonDriver;
 
         const rawDate = rawData[r][dateColIdx];
         const dispDate = dispData[r][dateColIdx];
@@ -1161,15 +1163,19 @@ function loadBreaksMap(ss, canonicalDrivers) {
         if (breakHours <= 0) continue;
 
         if (!map[canonDriver]) map[canonDriver] = {};
-        if (!map[rawDriver]) map[rawDriver] = {};
-
         map[canonDriver][dateKey] = roundToTwo((map[canonDriver][dateKey] || 0) + breakHours);
-        map[rawDriver][dateKey] = roundToTwo((map[rawDriver][dateKey] || 0) + breakHours);
 
         driverTotals[canonDriver] = roundToTwo((driverTotals[canonDriver] || 0) + breakHours);
-        driverTotals[rawDriver] = roundToTwo((driverTotals[rawDriver] || 0) + breakHours);
-
         dailyTotals[dateKey] = roundToTwo((dailyTotals[dateKey] || 0) + breakHours);
+    }
+
+    // Link raw driver name aliases so lookups by raw or canonical driver return identical totals
+    for (const raw in rawToCanon) {
+        const canon = rawToCanon[raw];
+        if (raw !== canon && map[canon]) {
+            map[raw] = map[canon];
+            driverTotals[raw] = driverTotals[canon];
+        }
     }
 
     return { map, driverTotals, dailyTotals };
@@ -1367,10 +1373,10 @@ function syncBreaksTable(ss) {
             allDateCols.forEach(dc => {
                 let bVal = 0;
                 if (dc.dateKey) {
-                    if (breaksMap[driver] && breaksMap[driver][dc.dateKey] !== undefined) {
-                        bVal = breaksMap[driver][dc.dateKey];
-                    } else if (breaksMap[canon] && breaksMap[canon][dc.dateKey] !== undefined) {
+                    if (breaksMap[canon] && breaksMap[canon][dc.dateKey] !== undefined) {
                         bVal = breaksMap[canon][dc.dateKey];
+                    } else if (breaksMap[driver] && breaksMap[driver][dc.dateKey] !== undefined) {
+                        bVal = breaksMap[driver][dc.dateKey];
                     }
                 }
                 row.push(bVal > 0 ? roundToTwo(bVal) : 0);
