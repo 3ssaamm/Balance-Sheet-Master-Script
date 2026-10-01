@@ -3,7 +3,7 @@
 // =================================================================
 // Change this ID each time you switch to a new monthly balance file.
 // This is the ONLY line you need to update.
-const TARGET_SHEET_ID = "1kCE23R_uDKgRRukvxPNcusFFeD3yxivEjbaY5kHLE4M";
+const TARGET_SHEET_ID = "14jjwIW2ywsEXz0JAgxcaG43FKa4Nq8pezaTspigvbDE";
 
 // =================================================================
 // MENU — Appears at top of the Google Sheets menu bar when the
