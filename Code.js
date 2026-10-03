@@ -414,23 +414,42 @@ function getCanonicalDriverName(name, canonicalList) {
  * Installs the onChange trigger so the balance report auto-runs on data change.
  */
 function setupAutoRun() {
-    const ss = SpreadsheetApp.openById(TARGET_SHEET_ID);
+    let ss = null;
+    try {
+        ss = SpreadsheetApp.openById(TARGET_SHEET_ID);
+    } catch (e) {
+        ss = SpreadsheetApp.getActiveSpreadsheet();
+    }
+    if (!ss) {
+        Logger.log("❌ Target spreadsheet not found.");
+        return;
+    }
 
-    // Remove all existing triggers to prevent duplicates
-    ScriptApp.getProjectTriggers().forEach(t => ScriptApp.deleteTrigger(t));
+    // Remove existing triggers for runDailyBalance to prevent duplicates
+    ScriptApp.getProjectTriggers().forEach(t => {
+        if (t.getHandlerFunction() === 'runDailyBalance') {
+            ScriptApp.deleteTrigger(t);
+        }
+    });
 
-    // Install the auto-run trigger: re-runs balance report whenever data changes
+    // 1. Install onEdit trigger (fires when cell values are edited)
+    ScriptApp.newTrigger('runDailyBalance')
+        .forSpreadsheet(ss)
+        .onEdit()
+        .create();
+
+    // 2. Install onChange trigger (fires on structural changes like row/col inserts)
     ScriptApp.newTrigger('runDailyBalance')
         .forSpreadsheet(ss)
         .onChange()
         .create();
 
-    Logger.log("✅ Auto-run trigger installed for: " + ss.getName());
-    Logger.log("   • onChange → balance report re-runs automatically on data change");
-    Logger.log("");
-    Logger.log("To run imports manually, select the function from the dropdown in the Apps Script editor:");
-    Logger.log("   importNetData()   — merges 'Raw Data - NET' sheet into Raw Data");
-    Logger.log("   importTripsData() — merges 'Raw Data - Trips' sheet into Raw Data");
+    Logger.log("✅ Auto-run triggers installed for: " + ss.getName());
+    Logger.log("   • onEdit  → balance report re-runs on cell edits");
+    Logger.log("   • onChange → balance report re-runs on structural changes");
+    try {
+        ss.toast("Auto-run triggers installed! The sheet will update automatically on edits.", "Auto-Run Trigger", 5);
+    } catch (e) { }
 }
 
 
@@ -1501,47 +1520,68 @@ function getColumnLetter(colIndex) {
  * Main entry point — runs all reporting functions in the correct order.
  */
 function runDailyBalance() {
-    const ss = SpreadsheetApp.getActiveSpreadsheet() || SpreadsheetApp.openById(TARGET_SHEET_ID);
-
-    // 0. Sync working hours sheet first so downstream reports can use working hours data
+    let ss;
     try {
-        generateWorkingHoursSheet(ss);
+        ss = SpreadsheetApp.openById(TARGET_SHEET_ID);
     } catch (e) {
-        Logger.log("Error in generateWorkingHoursSheet: " + e.toString() + "\n" + (e.stack || ""));
+        ss = SpreadsheetApp.getActiveSpreadsheet();
+    }
+    if (!ss) return;
+
+    // Use LockService to prevent overlapping runs when multiple edits occur
+    const lock = LockService.getScriptLock();
+    if (!lock.tryLock(10000)) {
+        Logger.log("⚠️ Another report run is already in progress. Skipping.");
+        return;
     }
 
-    // 0b. Sync breaks table directly
     try {
-        syncBreaksTable(ss);
-    } catch (e) {
-        Logger.log("Error in syncBreaksTable: " + e.toString() + "\n" + (e.stack || ""));
-    }
+        // 0. Sync working hours sheet first so downstream reports can use working hours data
+        try {
+            generateWorkingHoursSheet(ss);
+        } catch (e) {
+            Logger.log("Error in generateWorkingHoursSheet: " + e.toString() + "\n" + (e.stack || ""));
+        }
 
-    // 1. Update the main Summary sheet from Raw Data.
-    updateSummaryAndCharts(ss);
+        // 0b. Sync breaks table directly
+        try {
+            syncBreaksTable(ss);
+        } catch (e) {
+            Logger.log("Error in syncBreaksTable: " + e.toString() + "\n" + (e.stack || ""));
+        }
 
-    // 2. Wait for all pending spreadsheet changes to apply.
-    SpreadsheetApp.flush();
+        // 1. Update the main Summary sheet from Raw Data.
+        try {
+            updateSummaryAndCharts(ss);
+        } catch (e) {
+            Logger.log("Error in updateSummaryAndCharts: " + e.toString() + "\n" + (e.stack || ""));
+        }
 
-    // 3. Generate the weekly summary.
-    try {
-        generateWeeklySummary(ss);
-    } catch (e) {
-        Logger.log("Error in generateWeeklySummary: " + e.toString() + "\n" + (e.stack || ""));
-    }
+        // 2. Wait for all pending spreadsheet changes to apply.
+        SpreadsheetApp.flush();
 
-    // 4. Generate the final Bonus report.
-    try {
-        generateBonusReport(ss);
-    } catch (e) {
-        Logger.log("Error in generateBonusReport: " + e.toString() + "\n" + (e.stack || ""));
-    }
+        // 3. Generate the weekly summary.
+        try {
+            generateWeeklySummary(ss);
+        } catch (e) {
+            Logger.log("Error in generateWeeklySummary: " + e.toString() + "\n" + (e.stack || ""));
+        }
 
-    // 5. Generate Angel's specific progressive report.
-    try {
-        generateAngelReport(ss);
-    } catch (e) {
-        Logger.log("Error in generateAngelReport: " + e.toString() + "\n" + (e.stack || ""));
+        // 4. Generate the final Bonus report.
+        try {
+            generateBonusReport(ss);
+        } catch (e) {
+            Logger.log("Error in generateBonusReport: " + e.toString() + "\n" + (e.stack || ""));
+        }
+
+        // 5. Generate Angel's specific progressive report.
+        try {
+            generateAngelReport(ss);
+        } catch (e) {
+            Logger.log("Error in generateAngelReport: " + e.toString() + "\n" + (e.stack || ""));
+        }
+    } finally {
+        lock.releaseLock();
     }
 }
 
