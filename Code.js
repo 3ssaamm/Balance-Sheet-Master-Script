@@ -243,7 +243,7 @@ function findMainSummaryCol(headers, keywords, defaultIdx) {
  * Reads a sheet containing one or more weekly tables stacked vertically.
  * Weekly tables:
  *  - Start at rows 1, 21, 41, 61, 81... (or any row where Column A is "Driver")
- *  - Header row: Column A is "Driver", followed by date columns (DD-MM-YY), then Total, Count, Driver NET
+ *  - Header row: Column A is "Driver", followed by date columns (YYYY-MM-DD or DD-MM-YY), then Total, Count, Driver NET
  *  - Row 2 of each table is a "Total" row (Column A = "Total")
  *  - Driver rows follow until an empty cell in Column A or the next table header
  *
@@ -504,7 +504,7 @@ function syncBreaksTableFromMenu() {
 
 /**
  * Safely parses a date header from a sheet (display value string + raw cell value).
- * Prioritizes DD-MM-YY display string to prevent Google Sheets US-locale Date object distortion.
+ * Supports YYYY-MM-DD (e.g. 2026-10-05) and DD-MM-YY display strings to prevent Google Sheets US-locale Date object distortion.
  */
 function parseSheetDateHeader(displayHeader, rawHeader) {
     if (displayHeader) {
@@ -2334,6 +2334,51 @@ function getSpreadsheetMonthAndYear(ss, allRows) {
         }
     }
 
+    // Priority 1b: Extract from Raw Data sheet date headers
+    try {
+        if (ss && typeof ss.getSheetByName === "function") {
+            const rawSheet = ss.getSheetByName("Raw Data");
+            if (rawSheet) {
+                const rawWeeks = parseRawDataWeeks(rawSheet);
+                if (rawWeeks.length > 0) {
+                    const monthCounts = {};
+                    const yearCounts = {};
+                    rawWeeks.forEach(w => {
+                        w.dateColumns.forEach(dc => {
+                            if (dc.date && !isNaN(dc.date.getTime())) {
+                                const m = dc.date.getMonth();
+                                const y = dc.date.getFullYear();
+                                monthCounts[m] = (monthCounts[m] || 0) + 1;
+                                yearCounts[y] = (yearCounts[y] || 0) + 1;
+                            }
+                        });
+                    });
+                    let bestMonth = -1, maxMonthCount = 0;
+                    for (const m in monthCounts) {
+                        if (monthCounts[m] > maxMonthCount) {
+                            maxMonthCount = monthCounts[m];
+                            bestMonth = parseInt(m, 10);
+                        }
+                    }
+                    let bestYear = -1, maxYearCount = 0;
+                    for (const y in yearCounts) {
+                        if (yearCounts[y] > maxYearCount) {
+                            maxYearCount = yearCounts[y];
+                            bestYear = parseInt(y, 10);
+                        }
+                    }
+                    if (bestMonth >= 0 && bestYear > 2000) {
+                        return {
+                            monthIndex: bestMonth,
+                            year: bestYear,
+                            monthName: monthNames[bestMonth]
+                        };
+                    }
+                }
+            }
+        }
+    } catch (eRawMonth) { }
+
     // Priority 2: Check spreadsheet name for any month name (full or short) and 4-digit year
     const ssName = (ss && typeof ss.getName === "function") ? ss.getName() : "";
     let foundMonthIndex = -1;
@@ -2359,6 +2404,14 @@ function getSpreadsheetMonthAndYear(ss, allRows) {
     const yearMatch = ssName.match(/\b(20\d\d)\b/);
     if (yearMatch) {
         foundYear = parseInt(yearMatch[1], 10);
+    }
+
+    // Check for YYYY-MM in sheet name (e.g. 2026-10)
+    if (foundMonthIndex === -1) {
+        const ymMatch = ssName.match(/\b20\d\d[-_](0?[1-9]|1[0-2])\b/);
+        if (ymMatch) {
+            foundMonthIndex = parseInt(ymMatch[1], 10) - 1;
+        }
     }
 
     const now = new Date();
@@ -3034,8 +3087,8 @@ function loadNoShowMap(ss, sheetName) {
 }
 
 /**
- * Parses DD-MM-YY date format from Raw Data headers.
- * Example: "01-06-26" → June 1, 2026
+ * Parses date format from Raw Data headers.
+ * Supports ISO "YYYY-MM-DD" (e.g. "2026-10-05" -> October 5, 2026), "DD-MM-YY", "DD-MM-YYYY", etc.
  */
 function parseDDMMYY(value) {
     if (!value) return null;
@@ -3394,15 +3447,23 @@ function formatDate(date) {
 }
 
 function parseDate(value) {
-    if (!value) return null;
-    if (value instanceof Date || Object.prototype.toString.call(value) === '[object Date]' || (typeof value === 'object' && typeof value.getTime === 'function')) {
+    if (!value && value !== 0) return null;
+    if (value instanceof Date || Object.prototype.toString.call(value) === '[object Date]' || (typeof value === 'object' && value !== null && typeof value.getTime === 'function')) {
         return new Date(value.getFullYear(), value.getMonth(), value.getDate());
     }
+    // Excel/Sheets serial day number (e.g. ~46000 for 2026 dates)
+    if (typeof value === 'number' && value > 30000 && value < 60000) {
+        const d = new Date(Math.round((value - 25569) * 86400 * 1000));
+        return new Date(d.getFullYear(), d.getMonth(), d.getDate());
+    }
     if (typeof value === "string") {
-        const str = value.trim();
+        let str = value.trim();
         if (!str) return null;
 
-        // 1. Strings with month names like "Tuesday, September 1, 2026"
+        // Normalize unicode hyphens/dashes to standard hyphen
+        str = str.replace(/[\u2010-\u2015\u2212]/g, '-');
+
+        // 1. Strings with month names like "Tuesday, September 1, 2026" or "October 5, 2026"
         if (/[a-zA-Z]/.test(str)) {
             const std = new Date(str);
             if (!isNaN(std.getTime())) {
@@ -3410,62 +3471,107 @@ function parseDate(value) {
             }
         }
 
-        // 2. Slash format: "MM/DD/YYYY" (from formatDate) or "DD/MM/YYYY"
-        const slashParts = str.split("/");
-        if (slashParts.length === 3) {
-            const p0 = parseInt(slashParts[0], 10);
-            const p1 = parseInt(slashParts[1], 10);
-            let year = parseInt(slashParts[2], 10);
-            if (year < 100) year += 2000;
-            let month, day;
-            if (p0 > 12) {
-                // p0 cannot be month, must be DD/MM/YYYY
-                day = p0;
-                month = p1 - 1;
-            } else if (p1 > 12) {
-                // p1 cannot be month, must be MM/DD/YYYY
-                month = p0 - 1;
-                day = p1;
-            } else {
-                // Default to standard MM/DD/YYYY as produced by formatDate
-                month = p0 - 1;
-                day = p1;
-            }
-            if (month >= 0 && month < 12 && day >= 1 && day <= 31) {
-                const d = new Date(year, month, day);
-                if (!isNaN(d.getTime())) return d;
-            }
-        }
+        // Split by delimiter: -, /, or .
+        let delimiter = null;
+        if (str.includes('-')) delimiter = '-';
+        else if (str.includes('/')) delimiter = '/';
+        else if (str.includes('.')) delimiter = '.';
 
-        // 3. Dash format: "DD-MM-YYYY", "DD-MM-YY", or "YYYY-MM-DD"
-        const dashParts = str.split("-");
-        if (dashParts.length === 3) {
-            const p0 = parseInt(dashParts[0], 10);
-            const p1 = parseInt(dashParts[1], 10);
-            const p2 = parseInt(dashParts[2], 10);
-            if (p0 > 1000) {
-                return new Date(p0, p1 - 1, p2);
-            }
-            let year = p2 < 100 ? p2 + 2000 : p2;
-            let month = p1 - 1;
-            let day = p0;
-            if (month >= 0 && month < 12 && day >= 1 && day <= 31) {
-                return new Date(year, month, day);
-            }
-        }
+        if (delimiter) {
+            const parts = str.split(delimiter);
+            if (parts.length === 3) {
+                const p0 = parseInt(parts[0], 10);
+                const p1 = parseInt(parts[1], 10);
+                const p2 = parseInt(parts[2], 10);
 
-        // 4. Dot format: "DD.MM.YYYY" or "DD.MM.YY" (e.g. "01.09.26")
-        const dotParts = str.split(".");
-        if (dotParts.length === 3) {
-            const p0 = parseInt(dotParts[0], 10);
-            const p1 = parseInt(dotParts[1], 10);
-            let year = parseInt(dotParts[2], 10);
-            if (year < 100) year += 2000;
-            const day = p0;
-            const month = p1 - 1;
-            if (month >= 0 && month < 12 && day >= 1 && day <= 31) {
-                const d = new Date(year, month, day);
-                if (!isNaN(d.getTime())) return d;
+                if (!isNaN(p0) && !isNaN(p1) && !isNaN(p2)) {
+                    // Case A: 4-digit year at start (YYYY-MM-DD or YYYY/MM/DD or YYYY.MM.DD)
+                    // e.g. "2026-10-05" -> Year: 2026, Month: 10 (October), Day: 5
+                    if (p0 >= 1000) {
+                        let year = p0;
+                        let month, day;
+                        if (p1 > 12 && p2 <= 12) {
+                            // YYYY-DD-MM fallback
+                            day = p1;
+                            month = p2 - 1;
+                        } else {
+                            // Standard ISO YYYY-MM-DD (p1 is Month, p2 is Day)
+                            month = p1 - 1;
+                            day = p2;
+                        }
+                        if (month >= 0 && month < 12 && day >= 1 && day <= 31) {
+                            const d = new Date(year, month, day);
+                            if (!isNaN(d.getTime())) return d;
+                        }
+                    }
+
+                    // Case B: 4-digit year at end (DD-MM-YYYY or MM/DD/YYYY)
+                    if (p2 >= 1000) {
+                        let year = p2;
+                        let month, day;
+                        if (p0 > 12 && p1 <= 12) {
+                            // DD-MM-YYYY
+                            day = p0;
+                            month = p1 - 1;
+                        } else if (p1 > 12 && p0 <= 12) {
+                            // MM-DD-YYYY
+                            month = p0 - 1;
+                            day = p1;
+                        } else {
+                            // Ambiguous: use delimiter convention
+                            if (delimiter === '/') {
+                                // Default MM/DD/YYYY (standard US / formatDate)
+                                month = p0 - 1;
+                                day = p1;
+                            } else {
+                                // Default DD-MM-YYYY or DD.MM.YYYY
+                                day = p0;
+                                month = p1 - 1;
+                            }
+                        }
+                        if (month >= 0 && month < 12 && day >= 1 && day <= 31) {
+                            const d = new Date(year, month, day);
+                            if (!isNaN(d.getTime())) return d;
+                        }
+                    }
+
+                    // Case C: 2-digit years
+                    // C1: YY-MM-DD (e.g. "26-10-05" -> year 2026, month 10, day 5)
+                    if (p0 >= 20 && p0 <= 50 && p2 < 20) {
+                        const year = 2000 + p0;
+                        const month = p1 - 1;
+                        const day = p2;
+                        if (month >= 0 && month < 12 && day >= 1 && day <= 31) {
+                            const d = new Date(year, month, day);
+                            if (!isNaN(d.getTime())) return d;
+                        }
+                    }
+
+                    // C2: DD-MM-YY (e.g. "05-10-26" -> day 5, month 10, year 2026) or MM/DD/YY
+                    if (p2 >= 20 && p2 <= 50) {
+                        const year = 2000 + p2;
+                        let month, day;
+                        if (p0 > 12 && p1 <= 12) {
+                            day = p0;
+                            month = p1 - 1;
+                        } else if (p1 > 12 && p0 <= 12) {
+                            month = p0 - 1;
+                            day = p1;
+                        } else {
+                            if (delimiter === '/') {
+                                month = p0 - 1;
+                                day = p1;
+                            } else {
+                                day = p0;
+                                month = p1 - 1;
+                            }
+                        }
+                        if (month >= 0 && month < 12 && day >= 1 && day <= 31) {
+                            const d = new Date(year, month, day);
+                            if (!isNaN(d.getTime())) return d;
+                        }
+                    }
+                }
             }
         }
 
