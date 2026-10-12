@@ -5,6 +5,107 @@
 // This is the ONLY line you need to update.
 const TARGET_SHEET_ID = "14jjwIW2ywsEXz0JAgxcaG43FKa4Nq8pezaTspigvbDE";
 
+var _ACTIVE_MONTH_NUM = 10; // Default: October (10)
+
+/**
+ * Detects the active month and year context from the spreadsheet name, sheet names, or system date.
+ */
+function getActiveMonthContext(ss) {
+    let spreadsheet = null;
+    let sheetNameHint = "";
+
+    if (ss) {
+        if (typeof ss.getParent === "function" && typeof ss.getLastRow === "function") {
+            // It's a Sheet object
+            try { sheetNameHint = ss.getName(); } catch (e) { }
+            try { spreadsheet = ss.getParent(); } catch (e) { }
+        } else if (typeof ss.getSheetByName === "function") {
+            // It's a Spreadsheet object
+            spreadsheet = ss;
+        }
+    }
+
+    if (!spreadsheet) {
+        try { spreadsheet = SpreadsheetApp.getActiveSpreadsheet(); } catch (e) { }
+        if (!spreadsheet) {
+            try { spreadsheet = SpreadsheetApp.openById(TARGET_SHEET_ID); } catch (e) { }
+        }
+    }
+
+    const monthNames = [
+        "January", "February", "March", "April", "May", "June",
+        "July", "August", "September", "October", "November", "December"
+    ];
+    const shortNames = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+    const ssName = (spreadsheet && typeof spreadsheet.getName === "function") ? spreadsheet.getName() : "";
+    let foundMonthIndex = -1;
+
+    // 1. Check spreadsheet name (e.g. "October - Drivers Daily Balance")
+    for (let i = 0; i < monthNames.length; i++) {
+        if (new RegExp("\\b" + monthNames[i] + "\\b", "i").test(ssName)) {
+            foundMonthIndex = i;
+            break;
+        }
+    }
+    if (foundMonthIndex === -1) {
+        for (let i = 0; i < shortNames.length; i++) {
+            if (new RegExp("\\b" + shortNames[i] + "\\b", "i").test(ssName)) {
+                foundMonthIndex = i;
+                break;
+            }
+        }
+    }
+    if (foundMonthIndex === -1) {
+        const ymMatch = ssName.match(/\\b20\\d\\d[-_](0?[1-9]|1[0-2])\\b/);
+        if (ymMatch) foundMonthIndex = parseInt(ymMatch[1], 10) - 1;
+    }
+
+    // 2. Check sheetNameHint if available
+    if (foundMonthIndex === -1 && sheetNameHint) {
+        for (let i = 0; i < monthNames.length; i++) {
+            if (new RegExp("\\b" + monthNames[i] + "\\b", "i").test(sheetNameHint)) {
+                foundMonthIndex = i;
+                break;
+            }
+        }
+    }
+
+    // 3. Check names of sheets within the spreadsheet
+    if (foundMonthIndex === -1 && spreadsheet && typeof spreadsheet.getSheets === "function") {
+        try {
+            const allSheets = spreadsheet.getSheets();
+            for (let s = 0; s < allSheets.length; s++) {
+                const sName = allSheets[s].getName();
+                for (let i = 0; i < monthNames.length; i++) {
+                    if (new RegExp("\\b" + monthNames[i] + "\\b", "i").test(sName)) {
+                        foundMonthIndex = i;
+                        break;
+                    }
+                }
+                if (foundMonthIndex !== -1) break;
+            }
+        } catch (eSheets) { }
+    }
+
+    let foundYear = -1;
+    const yearMatch = (ssName + " " + sheetNameHint).match(/\\b(20\\d\\d)\\b/);
+    if (yearMatch) foundYear = parseInt(yearMatch[1], 10);
+
+    const now = new Date();
+    const finalMonthIndex = foundMonthIndex >= 0 ? foundMonthIndex : now.getMonth();
+    const finalYear = foundYear > 2000 ? foundYear : now.getFullYear();
+
+    _ACTIVE_MONTH_NUM = finalMonthIndex + 1;
+
+    return {
+        monthIndex: finalMonthIndex,
+        monthNum: finalMonthIndex + 1,
+        year: finalYear,
+        monthName: monthNames[finalMonthIndex]
+    };
+}
+
 // =================================================================
 // MENU — Appears at top of the Google Sheets menu bar when the
 //         spreadsheet is opened.
@@ -272,6 +373,10 @@ function findMainSummaryCol(headers, keywords, defaultIdx) {
  */
 function parseRawDataWeeks(sheet) {
     if (!sheet) return [];
+    const ss = (sheet && typeof sheet.getParent === "function") ? sheet.getParent() : null;
+    const monthCtx = getActiveMonthContext(ss || sheet);
+    const targetMonthNum = monthCtx ? monthCtx.monthNum : _ACTIVE_MONTH_NUM;
+
     const data = sheet.getDataRange().getValues();
     if (data.length < 2) return [];
 
@@ -290,7 +395,7 @@ function parseRawDataWeeks(sheet) {
 
             const dateColumns = [];
             for (let c = 1; c < numHeaderCols; c++) {
-                const d = parseSheetDateHeader(headerRow[c], data[headerRowIdx][c]);
+                const d = parseSheetDateHeader(headerRow[c], data[headerRowIdx][c], targetMonthNum);
                 if (d) {
                     dateColumns.push({ colIdx: c, date: d, headerStr: headerRow[c] });
                 }
@@ -506,21 +611,68 @@ function syncBreaksTableFromMenu() {
  * Safely parses a date header from a sheet (display value string + raw cell value).
  * Supports YYYY-MM-DD (e.g. 2026-10-05) and DD-MM-YY display strings to prevent Google Sheets US-locale Date object distortion.
  */
-function parseSheetDateHeader(displayHeader, rawHeader) {
-    if (displayHeader) {
-        const disp = String(displayHeader).trim();
-        if (disp && !disp.toLowerCase().includes("total") && !disp.toLowerCase().includes("count") && !disp.toLowerCase().includes("net") && !disp.toLowerCase().includes("trip")) {
-            const d = parseDDMMYY(disp);
-            if (d && !isNaN(d.getTime())) return d;
+function parseSheetDateHeader(displayHeader, rawHeader, targetMonthNum) {
+    const activeM = (typeof targetMonthNum === 'number' && targetMonthNum >= 1 && targetMonthNum <= 12)
+        ? targetMonthNum
+        : _ACTIVE_MONTH_NUM;
+
+    const disp = displayHeader ? String(displayHeader).trim() : "";
+
+    // Ignore known non-date headers
+    if (disp) {
+        const lower = disp.toLowerCase();
+        if (lower === "driver" || lower === "total" || lower === "count" || lower === "net" ||
+            lower === "trip" || lower === "trips" || lower === "hours" || lower === "cash" ||
+            lower.includes("driver net") || lower.includes("total hours")) {
+            return null;
         }
     }
-    if (rawHeader instanceof Date) {
-        return new Date(rawHeader.getFullYear(), rawHeader.getMonth(), rawHeader.getDate());
+
+    // 1. Try parsing display value first with active month context
+    if (disp) {
+        const dDisp = parseDate(disp, activeM);
+        if (dDisp && !isNaN(dDisp.getTime())) {
+            // If the parsed date matches activeM, it's definitely the intended date!
+            if (activeM && (dDisp.getMonth() + 1 === activeM)) {
+                return dDisp;
+            }
+            // Even if not strictly activeM (e.g. cross-month week), if rawHeader is not a Date or is invalid, use dDisp
+            if (!(rawHeader instanceof Date)) {
+                return dDisp;
+            }
+        }
     }
+
+    // 2. Check rawHeader if it's already a native Date object
+    if (rawHeader instanceof Date && !isNaN(rawHeader.getTime())) {
+        const rawDate = new Date(rawHeader.getFullYear(), rawHeader.getMonth(), rawHeader.getDate());
+        // If rawHeader's month matches activeM, trust it
+        if (!activeM || (rawDate.getMonth() + 1 === activeM)) {
+            return rawDate;
+        }
+        // If rawHeader's month does NOT match activeM (e.g. Google Sheets locale parsed 10-05 as May 10 instead of Oct 5):
+        // If we had a parsed date from display header, prefer display header!
+        if (disp) {
+            const dDisp = parseDate(disp, activeM);
+            if (dDisp && !isNaN(dDisp.getTime())) {
+                return dDisp;
+            }
+        }
+        return rawDate;
+    }
+
+    // 3. If rawHeader is a string/number
     if (rawHeader) {
-        const d = parseDDMMYY(rawHeader);
-        if (d && !isNaN(d.getTime())) return d;
+        const dRaw = parseDate(rawHeader, activeM);
+        if (dRaw && !isNaN(dRaw.getTime())) return dRaw;
     }
+
+    // 4. Fallback to display header parsed date if any
+    if (disp) {
+        const dDisp = parseDate(disp, activeM);
+        if (dDisp && !isNaN(dDisp.getTime())) return dDisp;
+    }
+
     return null;
 }
 
@@ -533,6 +685,8 @@ function parseSheetDateHeader(displayHeader, rawHeader) {
 function loadWorkingHoursMap(ss) {
     const hoursSheet = ss.getSheetByName("Working hours");
     if (!hoursSheet) return { map: {}, driverTotalHours: {}, dailyTotalHours: {} };
+    const monthCtx = getActiveMonthContext(ss);
+    const targetMonthNum = monthCtx ? monthCtx.monthNum : _ACTIVE_MONTH_NUM;
 
     const data = hoursSheet.getDataRange().getValues();
     if (data.length < 2) return { map: {}, driverTotalHours: {}, dailyTotalHours: {} };
@@ -546,7 +700,7 @@ function loadWorkingHoursMap(ss) {
         const hText = (displayHeaders[c] || '').toString().toLowerCase().trim();
         if (hText.includes("total")) continue;
 
-        const d = parseSheetDateHeader(displayHeaders[c], rawHeaders[c]);
+        const d = parseSheetDateHeader(displayHeaders[c], rawHeaders[c], targetMonthNum);
         if (d && !isNaN(d.getTime())) dateCols[c] = d.getTime();
     }
 
@@ -1166,9 +1320,11 @@ function loadBreaksMap(ss, canonicalDrivers) {
         const canonDriver = getCanonicalDriverName(rawDriver, canonicalDrivers) || rawDriver;
         rawToCanon[rawDriver] = canonDriver;
 
+        const monthCtx = getActiveMonthContext(ss);
+        const targetMonthNum = monthCtx ? monthCtx.monthNum : _ACTIVE_MONTH_NUM;
         const rawDate = rawData[r][dateColIdx];
         const dispDate = dispData[r][dateColIdx];
-        const d = (rawDate instanceof Date) ? rawDate : (parseDate(rawDate) || parseDate(dispDate));
+        const d = parseSheetDateHeader(dispDate, rawDate, targetMonthNum) || parseDate(dispDate, targetMonthNum) || parseDate(rawDate, targetMonthNum);
         if (!d || isNaN(d.getTime())) continue;
 
         const dateKey = new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
@@ -1261,13 +1417,16 @@ function syncBreaksTable(ss) {
         throw new Error("Could not find date columns in Row 1 of 'Working hours'. totalColNumber: " + totalColNumber + ", headers: " + row1Data.join(" | "));
     }
 
+    const monthCtx = getActiveMonthContext(ss);
+    const targetMonthNum = monthCtx ? monthCtx.monthNum : _ACTIVE_MONTH_NUM;
+
     // 3. Read date columns directly from Row 1
     const row1Raw = hoursSheet.getRange(1, 1, 1, totalColNumber).getValues()[0];
     const allDateCols = [];
     for (let c = 2; c < totalColNumber; c++) {
         const disp = (row1Data[c - 1] || '').toString().trim();
         const raw = row1Raw[c - 1];
-        const d = parseSheetDateHeader(disp, raw) || parseDate(disp);
+        const d = parseSheetDateHeader(disp, raw, targetMonthNum) || parseDate(disp, targetMonthNum);
         allDateCols.push({
             headerStr: disp,
             dateKey: d ? new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime() : null
@@ -2297,7 +2456,49 @@ function getSpreadsheetMonthAndYear(ss, allRows) {
         "July", "August", "September", "October", "November", "December"
     ];
 
-    // Priority 1: Extract from valid dates in allRows
+    // Priority 1: Check spreadsheet name for explicit month name (e.g. "October - Drivers Daily Balance")
+    const ssName = (ss && typeof ss.getName === "function") ? ss.getName() : "";
+    let foundMonthIndex = -1;
+    for (let i = 0; i < monthNames.length; i++) {
+        const regex = new RegExp("\\b" + monthNames[i] + "\\b", "i");
+        if (regex.test(ssName)) {
+            foundMonthIndex = i;
+            break;
+        }
+    }
+    if (foundMonthIndex === -1) {
+        const shortNames = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+        for (let i = 0; i < shortNames.length; i++) {
+            const regex = new RegExp("\\b" + shortNames[i] + "\\b", "i");
+            if (regex.test(ssName)) {
+                foundMonthIndex = i;
+                break;
+            }
+        }
+    }
+    if (foundMonthIndex === -1) {
+        const ymMatch = ssName.match(/\b20\d\d[-_](0?[1-9]|1[0-2])\b/);
+        if (ymMatch) foundMonthIndex = parseInt(ymMatch[1], 10) - 1;
+    }
+
+    let foundYear = -1;
+    const yearMatch = ssName.match(/\b(20\d\d)\b/);
+    if (yearMatch) {
+        foundYear = parseInt(yearMatch[1], 10);
+    }
+
+    if (foundMonthIndex >= 0) {
+        const now = new Date();
+        const finalYear = foundYear > 2000 ? foundYear : now.getFullYear();
+        _ACTIVE_MONTH_NUM = foundMonthIndex + 1;
+        return {
+            monthIndex: foundMonthIndex,
+            year: finalYear,
+            monthName: monthNames[foundMonthIndex]
+        };
+    }
+
+    // Priority 2: Extract from valid dates in allRows
     if (Array.isArray(allRows) && allRows.length > 0) {
         const monthCounts = {};
         const yearCounts = {};
@@ -2326,6 +2527,7 @@ function getSpreadsheetMonthAndYear(ss, allRows) {
             }
         }
         if (bestMonth >= 0 && bestYear > 2000) {
+            _ACTIVE_MONTH_NUM = bestMonth + 1;
             return {
                 monthIndex: bestMonth,
                 year: bestYear,
@@ -2334,7 +2536,7 @@ function getSpreadsheetMonthAndYear(ss, allRows) {
         }
     }
 
-    // Priority 1b: Extract from Raw Data sheet date headers
+    // Priority 2b: Extract from Raw Data sheet date headers
     try {
         if (ss && typeof ss.getSheetByName === "function") {
             const rawSheet = ss.getSheetByName("Raw Data");
@@ -2368,6 +2570,7 @@ function getSpreadsheetMonthAndYear(ss, allRows) {
                         }
                     }
                     if (bestMonth >= 0 && bestYear > 2000) {
+                        _ACTIVE_MONTH_NUM = bestMonth + 1;
                         return {
                             monthIndex: bestMonth,
                             year: bestYear,
@@ -2379,44 +2582,11 @@ function getSpreadsheetMonthAndYear(ss, allRows) {
         }
     } catch (eRawMonth) { }
 
-    // Priority 2: Check spreadsheet name for any month name (full or short) and 4-digit year
-    const ssName = (ss && typeof ss.getName === "function") ? ss.getName() : "";
-    let foundMonthIndex = -1;
-    for (let i = 0; i < monthNames.length; i++) {
-        const regex = new RegExp("\\b" + monthNames[i] + "\\b", "i");
-        if (regex.test(ssName)) {
-            foundMonthIndex = i;
-            break;
-        }
-    }
-    if (foundMonthIndex === -1) {
-        const shortNames = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-        for (let i = 0; i < shortNames.length; i++) {
-            const regex = new RegExp("\\b" + shortNames[i] + "\\b", "i");
-            if (regex.test(ssName)) {
-                foundMonthIndex = i;
-                break;
-            }
-        }
-    }
-
-    let foundYear = -1;
-    const yearMatch = ssName.match(/\b(20\d\d)\b/);
-    if (yearMatch) {
-        foundYear = parseInt(yearMatch[1], 10);
-    }
-
-    // Check for YYYY-MM in sheet name (e.g. 2026-10)
-    if (foundMonthIndex === -1) {
-        const ymMatch = ssName.match(/\b20\d\d[-_](0?[1-9]|1[0-2])\b/);
-        if (ymMatch) {
-            foundMonthIndex = parseInt(ymMatch[1], 10) - 1;
-        }
-    }
-
     const now = new Date();
-    const finalMonthIndex = foundMonthIndex >= 0 ? foundMonthIndex : now.getMonth();
-    const finalYear = foundYear > 2000 ? foundYear : now.getFullYear();
+    const finalMonthIndex = now.getMonth();
+    const finalYear = now.getFullYear();
+
+    _ACTIVE_MONTH_NUM = finalMonthIndex + 1;
 
     return {
         monthIndex: finalMonthIndex,
@@ -3090,9 +3260,9 @@ function loadNoShowMap(ss, sheetName) {
  * Parses date format from Raw Data headers.
  * Supports ISO "YYYY-MM-DD" (e.g. "2026-10-05" -> October 5, 2026), "DD-MM-YY", "DD-MM-YYYY", etc.
  */
-function parseDDMMYY(value) {
+function parseDDMMYY(value, activeMonthNum) {
     if (!value) return null;
-    return parseDate(value);
+    return parseDate(value, activeMonthNum);
 }
 
 // =================================================================
@@ -3446,7 +3616,7 @@ function formatDate(date) {
     return `${mm}/${dd}/${yyyy}`;
 }
 
-function parseDate(value) {
+function parseDate(value, activeMonthNum) {
     if (!value && value !== 0) return null;
     if (value instanceof Date || Object.prototype.toString.call(value) === '[object Date]' || (typeof value === 'object' && value !== null && typeof value.getTime === 'function')) {
         return new Date(value.getFullYear(), value.getMonth(), value.getDate());
@@ -3462,6 +3632,11 @@ function parseDate(value) {
 
         // Normalize unicode hyphens/dashes to standard hyphen
         str = str.replace(/[\u2010-\u2015\u2212]/g, '-');
+
+        // Resolve activeMonthNum: parameter, or global _ACTIVE_MONTH_NUM
+        const targetMonth = (typeof activeMonthNum === 'number' && activeMonthNum >= 1 && activeMonthNum <= 12)
+            ? activeMonthNum
+            : _ACTIVE_MONTH_NUM;
 
         // 1. Strings with month names like "Tuesday, September 1, 2026" or "October 5, 2026"
         if (/[a-zA-Z]/.test(str)) {
@@ -3490,14 +3665,28 @@ function parseDate(value) {
                     if (p0 >= 1000) {
                         let year = p0;
                         let month, day;
-                        if (p1 > 12 && p2 <= 12) {
-                            // YYYY-DD-MM fallback
-                            day = p1;
-                            month = p2 - 1;
+                        if (targetMonth) {
+                            if (p1 === targetMonth && p2 !== targetMonth) {
+                                month = p1 - 1;
+                                day = p2;
+                            } else if (p2 === targetMonth && p1 !== targetMonth) {
+                                day = p1;
+                                month = p2 - 1;
+                            } else if (p1 > 12 && p2 <= 12) {
+                                day = p1;
+                                month = p2 - 1;
+                            } else {
+                                month = p1 - 1;
+                                day = p2;
+                            }
                         } else {
-                            // Standard ISO YYYY-MM-DD (p1 is Month, p2 is Day)
-                            month = p1 - 1;
-                            day = p2;
+                            if (p1 > 12 && p2 <= 12) {
+                                day = p1;
+                                month = p2 - 1;
+                            } else {
+                                month = p1 - 1;
+                                day = p2;
+                            }
                         }
                         if (month >= 0 && month < 12 && day >= 1 && day <= 31) {
                             const d = new Date(year, month, day);
@@ -3505,7 +3694,7 @@ function parseDate(value) {
                         }
                     }
 
-                    // Case B: 4-digit year at end (DD-MM-YYYY or MM/DD/YYYY)
+                    // Case B: 4-digit year at end (e.g. 10-05-2026 or 10/05/2026)
                     if (p2 >= 1000) {
                         let year = p2;
                         let month, day;
@@ -3517,17 +3706,24 @@ function parseDate(value) {
                             // MM-DD-YYYY
                             month = p0 - 1;
                             day = p1;
-                        } else {
-                            // Ambiguous: use delimiter convention
-                            if (delimiter === '/') {
-                                // Default MM/DD/YYYY (standard US / formatDate)
+                        } else if (targetMonth) {
+                            if (p0 === targetMonth && p1 !== targetMonth) {
+                                // MM-DD-YYYY matches active month
                                 month = p0 - 1;
                                 day = p1;
-                            } else {
-                                // Default DD-MM-YYYY or DD.MM.YYYY
+                            } else if (p1 === targetMonth && p0 !== targetMonth) {
+                                // DD-MM-YYYY matches active month
                                 day = p0;
                                 month = p1 - 1;
+                            } else {
+                                // Default US convention MM-DD-YYYY or MM/DD/YYYY
+                                month = p0 - 1;
+                                day = p1;
                             }
+                        } else {
+                            // Default US convention MM-DD-YYYY or MM/DD/YYYY
+                            month = p0 - 1;
+                            day = p1;
                         }
                         if (month >= 0 && month < 12 && day >= 1 && day <= 31) {
                             const d = new Date(year, month, day);
@@ -3539,32 +3735,58 @@ function parseDate(value) {
                     // C1: YY-MM-DD (e.g. "26-10-05" -> year 2026, month 10, day 5)
                     if (p0 >= 20 && p0 <= 50 && p2 < 20) {
                         const year = 2000 + p0;
-                        const month = p1 - 1;
-                        const day = p2;
+                        let month, day;
+                        if (targetMonth) {
+                            if (p1 === targetMonth && p2 !== targetMonth) {
+                                month = p1 - 1;
+                                day = p2;
+                            } else if (p2 === targetMonth && p1 !== targetMonth) {
+                                day = p1;
+                                month = p2 - 1;
+                            } else {
+                                month = p1 - 1;
+                                day = p2;
+                            }
+                        } else {
+                            month = p1 - 1;
+                            day = p2;
+                        }
                         if (month >= 0 && month < 12 && day >= 1 && day <= 31) {
                             const d = new Date(year, month, day);
                             if (!isNaN(d.getTime())) return d;
                         }
                     }
 
-                    // C2: DD-MM-YY (e.g. "05-10-26" -> day 5, month 10, year 2026) or MM/DD/YY
+                    // C2: 2-digit year at end (e.g. "10-05-26" -> month 10, day 5, year 2026, or "05-10-26")
                     if (p2 >= 20 && p2 <= 50) {
                         const year = 2000 + p2;
                         let month, day;
                         if (p0 > 12 && p1 <= 12) {
+                            // p0 can only be day (e.g. 25-10-26)
                             day = p0;
                             month = p1 - 1;
                         } else if (p1 > 12 && p0 <= 12) {
+                            // p1 can only be day (e.g. 10-25-26)
                             month = p0 - 1;
                             day = p1;
-                        } else {
-                            if (delimiter === '/') {
+                        } else if (targetMonth) {
+                            if (p0 === targetMonth && p1 !== targetMonth) {
+                                // p0 is the active month! (e.g. 10-05-26 in October -> Oct 5)
                                 month = p0 - 1;
                                 day = p1;
-                            } else {
+                            } else if (p1 === targetMonth && p0 !== targetMonth) {
+                                // p1 is the active month! (e.g. 05-10-26 in October -> Oct 5)
                                 day = p0;
                                 month = p1 - 1;
+                            } else {
+                                // Default US format MM-DD-YY
+                                month = p0 - 1;
+                                day = p1;
                             }
+                        } else {
+                            // Default US format MM-DD-YY
+                            month = p0 - 1;
+                            day = p1;
                         }
                         if (month >= 0 && month < 12 && day >= 1 && day <= 31) {
                             const d = new Date(year, month, day);
