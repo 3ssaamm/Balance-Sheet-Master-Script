@@ -9,28 +9,38 @@ const DAILY_EXTRACTS_FOLDER_ID = "1wTRKJMQ07vGT4ZzzoXWFz92hLoWRkVvw";
 var _ACTIVE_MONTH_NUM = 10; // Default: October (10)
 
 /**
+ * Safely resolves the active spreadsheet without throwing if TARGET_SHEET_ID is invalid.
+ */
+function getSafeSpreadsheet(ss) {
+    if (ss) {
+        if (typeof ss.getParent === "function" && typeof ss.getLastRow === "function") {
+            try { return ss.getParent(); } catch (e) { }
+        }
+        if (typeof ss.getSheetByName === "function") {
+            return ss;
+        }
+    }
+    try {
+        const active = SpreadsheetApp.getActiveSpreadsheet();
+        if (active) return active;
+    } catch (e) { }
+    try {
+        if (TARGET_SHEET_ID && TARGET_SHEET_ID.length === 44) {
+            return SpreadsheetApp.openById(TARGET_SHEET_ID);
+        }
+    } catch (e) { }
+    return null;
+}
+
+/**
  * Detects the active month and year context from the spreadsheet name, sheet names, or system date.
  */
 function getActiveMonthContext(ss) {
-    let spreadsheet = null;
+    let spreadsheet = getSafeSpreadsheet(ss);
     let sheetNameHint = "";
 
-    if (ss) {
-        if (typeof ss.getParent === "function" && typeof ss.getLastRow === "function") {
-            // It's a Sheet object
-            try { sheetNameHint = ss.getName(); } catch (e) { }
-            try { spreadsheet = ss.getParent(); } catch (e) { }
-        } else if (typeof ss.getSheetByName === "function") {
-            // It's a Spreadsheet object
-            spreadsheet = ss;
-        }
-    }
-
-    if (!spreadsheet) {
-        try { spreadsheet = SpreadsheetApp.getActiveSpreadsheet(); } catch (e) { }
-        if (!spreadsheet) {
-            try { spreadsheet = SpreadsheetApp.openById(TARGET_SHEET_ID); } catch (e) { }
-        }
+    if (ss && typeof ss.getParent === "function" && typeof ss.getLastRow === "function") {
+        try { sheetNameHint = ss.getName(); } catch (e) { }
     }
 
     const monthNames = [
@@ -58,7 +68,7 @@ function getActiveMonthContext(ss) {
         }
     }
     if (foundMonthIndex === -1) {
-        const ymMatch = ssName.match(/\\b20\\d\\d[-_](0?[1-9]|1[0-2])\\b/);
+        const ymMatch = ssName.match(/\b20\d\d[-_](0?[1-9]|1[0-2])\b/);
         if (ymMatch) foundMonthIndex = parseInt(ymMatch[1], 10) - 1;
     }
 
@@ -90,12 +100,38 @@ function getActiveMonthContext(ss) {
     }
 
     let foundYear = -1;
-    const yearMatch = (ssName + " " + sheetNameHint).match(/\\b(20\\d\\d)\\b/);
+    const yearMatch = (ssName + " " + sheetNameHint).match(/\b(20\d\d)\b/);
     if (yearMatch) foundYear = parseInt(yearMatch[1], 10);
+
+    // 4. If year not found in title, inspect the Summary sheet date column
+    if (foundYear === -1 && spreadsheet && typeof spreadsheet.getSheetByName === "function") {
+        try {
+            const sumSheet = spreadsheet.getSheetByName("Summary");
+            if (sumSheet && sumSheet.getLastRow() >= 3) {
+                const sampleVals = sumSheet.getRange(3, 1, Math.min(15, sumSheet.getLastRow() - 2), 1).getValues();
+                for (let r = 0; r < sampleVals.length; r++) {
+                    const cellVal = sampleVals[r][0];
+                    if (cellVal instanceof Date && !isNaN(cellVal.getTime())) {
+                        const y = cellVal.getFullYear();
+                        if (y >= 2020 && y <= 2035) {
+                            foundYear = y;
+                            break;
+                        }
+                    } else if (cellVal) {
+                        const m = cellVal.toString().match(/\b(20\d\d)\b/);
+                        if (m) {
+                            foundYear = parseInt(m[1], 10);
+                            break;
+                        }
+                    }
+                }
+            }
+        } catch (eYear) { }
+    }
 
     const now = new Date();
     const finalMonthIndex = foundMonthIndex >= 0 ? foundMonthIndex : now.getMonth();
-    const finalYear = foundYear > 2000 ? foundYear : now.getFullYear();
+    const finalYear = foundYear > 2000 ? foundYear : (now.getFullYear() < 2026 ? 2026 : now.getFullYear());
 
     _ACTIVE_MONTH_NUM = finalMonthIndex + 1;
 
@@ -416,12 +452,10 @@ function extractDailyRecordsFromGrid(grid, fileName, activeMonthNum) {
  * Filters strictly to the active month (October).
  */
 function loadDailyExtracts(ss) {
-    if (!ss) {
-        try { ss = SpreadsheetApp.openById(TARGET_SHEET_ID); } catch (e) { ss = SpreadsheetApp.getActiveSpreadsheet(); }
-    }
+    ss = getSafeSpreadsheet(ss);
     const monthCtx = getActiveMonthContext(ss);
     const targetMonthNum = monthCtx ? monthCtx.monthNum : _ACTIVE_MONTH_NUM;
-    const targetYear = monthCtx ? monthCtx.year : 2026;
+    const targetYear = (monthCtx && monthCtx.year > 2000) ? monthCtx.year : 2026;
 
     let folder;
     try {
@@ -900,12 +934,7 @@ function getCanonicalDriverName(name, canonicalList) {
  * so intrusive onEdit/onChange script triggers that wipe the sheet on slight edits are removed.
  */
 function setupAutoRun() {
-    let ss = null;
-    try {
-        ss = SpreadsheetApp.openById(TARGET_SHEET_ID);
-    } catch (e) {
-        ss = SpreadsheetApp.getActiveSpreadsheet();
-    }
+    let ss = getSafeSpreadsheet();
     if (!ss) {
         Logger.log("❌ Target spreadsheet not found.");
         return;
@@ -935,13 +964,8 @@ function setupAutoRun() {
 
 function runSyncBreaksTable() {
     Logger.log("=== Starting runSyncBreaksTable ===");
-    let ss = null;
-    try {
-        ss = SpreadsheetApp.getActiveSpreadsheet();
-    } catch (e) { }
-    if (!ss) {
-        ss = SpreadsheetApp.openById(TARGET_SHEET_ID);
-    }
+    let ss = getSafeSpreadsheet();
+    if (!ss) throw new Error("Could not access spreadsheet.");
     Logger.log("Target Spreadsheet: " + ss.getName() + " (" + ss.getId() + ")");
     const info = syncBreaksTable(ss);
     SpreadsheetApp.flush();
@@ -950,9 +974,8 @@ function runSyncBreaksTable() {
 }
 
 function generateWorkingHoursSheetFromMenu() {
-    let ss = null;
-    try { ss = SpreadsheetApp.getActiveSpreadsheet(); } catch (e) { }
-    if (!ss) ss = SpreadsheetApp.openById(TARGET_SHEET_ID);
+    let ss = getSafeSpreadsheet();
+    if (!ss) return;
     generateWorkingHoursSheet(ss);
     syncBreaksTable(ss);
     SpreadsheetApp.flush();
@@ -962,9 +985,8 @@ function generateWorkingHoursSheetFromMenu() {
 }
 
 function syncBreaksTableFromMenu() {
-    let ss = null;
-    try { ss = SpreadsheetApp.getActiveSpreadsheet(); } catch (e) { }
-    if (!ss) ss = SpreadsheetApp.openById(TARGET_SHEET_ID);
+    let ss = getSafeSpreadsheet();
+    if (!ss) return;
     try {
         runSyncBreaksTable();
         try {
@@ -1622,10 +1644,7 @@ function findSheetCaseInsensitive(ss, name) {
  * - dailyTotals: { dateTimestamp -> totalBreakHours }
  */
 function loadBreaksMap(ss, canonicalDrivers) {
-    if (!ss) {
-        try { ss = SpreadsheetApp.getActiveSpreadsheet(); } catch (e) { }
-        if (!ss) ss = SpreadsheetApp.openById(TARGET_SHEET_ID);
-    }
+    ss = getSafeSpreadsheet(ss);
     const breaksSheet = findSheetCaseInsensitive(ss, "breaks");
     if (!breaksSheet) {
         Logger.log("ℹ️ Breaks sheet not found, proceeding with 0 break hours.");
@@ -1712,10 +1731,7 @@ function loadBreaksMap(ss, canonicalDrivers) {
  * Reads existing dates and drivers directly from the sheet to guarantee exact alignment.
  */
 function syncBreaksTable(ss) {
-    if (!ss) {
-        try { ss = SpreadsheetApp.getActiveSpreadsheet(); } catch (e) { }
-        if (!ss) ss = SpreadsheetApp.openById(TARGET_SHEET_ID);
-    }
+    ss = getSafeSpreadsheet(ss);
     if (!ss) throw new Error("Could not access spreadsheet.");
 
     let hoursSheet = null;
@@ -2029,17 +2045,19 @@ function getColumnLetter(colIndex) {
  * Main entry point — runs all reporting functions in the correct order.
  */
 function runDailyBalance() {
-    let ss;
-    try {
-        ss = SpreadsheetApp.openById(TARGET_SHEET_ID);
-    } catch (e) {
-        ss = SpreadsheetApp.getActiveSpreadsheet();
-    }
+    let ss = getSafeSpreadsheet();
     if (!ss) return;
+
+    try {
+        ss.toast("🔄 Reading daily extracts from Google Drive...", "Balance Sheet", 5);
+    } catch (e) { }
 
     // Use LockService to prevent overlapping runs when multiple edits occur
     const lock = LockService.getScriptLock();
-    if (!lock.tryLock(10000)) {
+    if (!lock.tryLock(15000)) {
+        try {
+            ss.toast("⚠️ Another report run is in progress. Please wait a moment.", "Balance Sheet", 5);
+        } catch (e) { }
         Logger.log("⚠️ Another report run is already in progress. Skipping.");
         return;
     }
@@ -2097,6 +2115,10 @@ function runDailyBalance() {
         } catch (e) {
             Logger.log("Error in generateAngelReport: " + e.toString() + "\n" + (e.stack || ""));
         }
+
+        try {
+            ss.toast("✅ Balance report complete! Tolls and formulas updated.", "Balance Sheet", 10);
+        } catch (e) { }
     } finally {
         lock.releaseLock();
     }
@@ -2129,6 +2151,9 @@ function updateSummaryAndCharts(ss, dailyData) {
     }
     if (!dailyData || !dailyData.records || dailyData.records.length === 0) {
         Logger.log("⚠️ No daily extract records found to build Summary.");
+        try {
+            ss.toast("⚠️ No daily extract files found for this month in Google Drive folder.", "Balance Sheet", 10);
+        } catch (e) { }
         return;
     }
 
@@ -2609,9 +2634,21 @@ function getSpreadsheetMonthAndYear(ss, allRows) {
         foundYear = parseInt(yearMatch[1], 10);
     }
 
+    // If year not in title, scan allRows or Summary sheet
+    if (foundYear === -1 && Array.isArray(allRows) && allRows.length > 0) {
+        for (let i = 0; i < allRows.length; i++) {
+            const rawDate = allRows[i][0];
+            const d = parseDate(rawDate);
+            if (d && !isNaN(d.getTime()) && d.getFullYear() > 2000) {
+                foundYear = d.getFullYear();
+                break;
+            }
+        }
+    }
+
     if (foundMonthIndex >= 0) {
         const now = new Date();
-        const finalYear = foundYear > 2000 ? foundYear : now.getFullYear();
+        const finalYear = foundYear > 2000 ? foundYear : (now.getFullYear() < 2026 ? 2026 : now.getFullYear());
         _ACTIVE_MONTH_NUM = foundMonthIndex + 1;
         return {
             monthIndex: foundMonthIndex,
