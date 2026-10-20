@@ -155,9 +155,6 @@ function onOpen() {
             .addSeparator()
             .addItem('☕ Sync Breaks Table', 'syncBreaksTableFromMenu')
             .addItem('🕒 Sync Working Hours Sheet', 'generateWorkingHoursSheetFromMenu')
-            .addSeparator()
-            .addItem('🔧 Enable Auto-Run (Every 2 Hours)', 'setupAutoRun')
-            .addItem('⏹️ Disable Auto-Run', 'disableAutoRun')
             .addToUi();
     } catch (e) {
         // onOpen() cannot be run from the Apps Script editor.
@@ -985,54 +982,23 @@ function getCanonicalDriverName(name, canonicalList) {
 
 
 /**
- * Installs an automatic background trigger to check Google Drive for new daily extracts every 2 hours.
- * Note: Manual spreadsheet edits update live via native formulas without needing any onEdit triggers.
+ * Removes all background triggers for runDailyBalance.
+ * All updates are performed manually via menu item '▶ Run Balance Report' or live spreadsheet formulas.
  */
-function setupAutoRun() {
-    let ss = getSafeSpreadsheet();
-    if (!ss) {
-        Logger.log("❌ Target spreadsheet not found.");
-        return;
-    }
-
-    // Remove existing triggers for runDailyBalance to prevent duplicates
-    let removedCount = 0;
-    ScriptApp.getProjectTriggers().forEach(t => {
-        if (t.getHandlerFunction() === 'runDailyBalance') {
-            ScriptApp.deleteTrigger(t);
-            removedCount++;
-        }
-    });
-
-    // Install time-driven trigger: checks Drive folder for new daily extracts every 2 hours
-    ScriptApp.newTrigger('runDailyBalance')
-        .timeBased()
-        .everyHours(2)
-        .create();
-
-    Logger.log("✅ Auto-run trigger installed: checks Google Drive every 2 hours.");
+function removeAllAutoRunTriggers() {
     try {
-        ss.toast("✅ Auto-Run enabled! Checking Google Drive for new daily files every 2 hours. (Spreadsheet edits update live via formulas).", "Balance Sheet", 7);
-    } catch (e) { }
-}
-
-/**
- * Removes all background auto-run triggers for runDailyBalance.
- */
-function disableAutoRun() {
-    let ss = getSafeSpreadsheet();
-    let removedCount = 0;
-    ScriptApp.getProjectTriggers().forEach(t => {
-        if (t.getHandlerFunction() === 'runDailyBalance') {
-            ScriptApp.deleteTrigger(t);
-            removedCount++;
+        let removedCount = 0;
+        ScriptApp.getProjectTriggers().forEach(t => {
+            if (t.getHandlerFunction() === 'runDailyBalance') {
+                ScriptApp.deleteTrigger(t);
+                removedCount++;
+            }
+        });
+        if (removedCount > 0) {
+            Logger.log("✅ Cleaned up " + removedCount + " auto-run trigger(s).");
         }
-    });
-    Logger.log("Removed " + removedCount + " triggers.");
-    if (ss) {
-        try {
-            ss.toast("⏹️ Auto-run disabled. You can run reports manually from the menu.", "Balance Sheet", 5);
-        } catch (e) { }
+    } catch (e) {
+        Logger.log("ℹ️ Note on trigger cleanup: " + e.message);
     }
 }
 
@@ -2130,6 +2096,9 @@ function runDailyBalance() {
     try {
         ss.toast("🔄 Reading daily extracts from Google Drive...", "Balance Sheet", 5);
     } catch (e) { }
+
+    // Ensure no background auto-run triggers exist
+    removeAllAutoRunTriggers();
 
     // Use LockService to prevent overlapping runs when multiple edits occur
     const lock = LockService.getScriptLock();
