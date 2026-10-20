@@ -202,7 +202,12 @@ function unescapeXml(str) {
  * Works natively in Google Apps Script without converting to Google Sheets or calling external APIs.
  */
 function parseXlsxBlob(blob) {
-    const unzipped = Utilities.unzip(blob);
+    let unzipped;
+    try {
+        unzipped = Utilities.unzip(blob.setContentType("application/zip"));
+    } catch (e) {
+        unzipped = Utilities.unzip(Utilities.newBlob(blob.getBytes(), "application/zip", "temp.zip"));
+    }
     let sharedStringsXml = null;
     let sheetXml = null;
 
