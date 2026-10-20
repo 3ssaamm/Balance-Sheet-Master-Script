@@ -297,22 +297,50 @@ function parsePeriodLine(text, activeMonthNum) {
 }
 
 /**
- * Attempts to parse a date from the file name as a fallback.
+ * Attempts to parse date / period from file name.
+ * Handles formats like:
+ * - AYOAH_GO_Drivers_2026-10-19_to_2026-10-19.xlsx (single day: 2026-10-19)
+ * - AYOAH_GO_Drivers_2026-10-01_to_2026-10-07.xlsx (multi day: 2026-10-01 to 2026-10-07)
+ * - 2026-10-19.xlsx
+ * - 10-19-2026.xlsx
  */
 function parseDateFromFileName(fileName, activeMonthNum) {
     if (!fileName) return null;
     const clean = fileName.replace(/[\u2010-\u2015\u2212]/g, '-');
-    const isoMatch = clean.match(/\b(20\d\d)[-_](0?[1-9]|1[0-2])[-_](0?[1-9]|[12]\d|3[01])\b/);
-    if (isoMatch) {
-        return new Date(parseInt(isoMatch[1], 10), parseInt(isoMatch[2], 10) - 1, parseInt(isoMatch[3], 10));
+
+    // 1. Check for range: "<YYYY-MM-DD>_to_<YYYY-MM-DD>"
+    const rangeMatch = clean.match(/(20\d\d)[-_](1[0-2]|0?[1-9])[-_](3[01]|[12]\d|0?[1-9])(?:_to_|[\s\-_]+to[\s\-_]+)(20\d\d)[-_](1[0-2]|0?[1-9])[-_](3[01]|[12]\d|0?[1-9])/i);
+    if (rangeMatch) {
+        const d1 = new Date(parseInt(rangeMatch[1], 10), parseInt(rangeMatch[2], 10) - 1, parseInt(rangeMatch[3], 10));
+        const d2 = new Date(parseInt(rangeMatch[4], 10), parseInt(rangeMatch[5], 10) - 1, parseInt(rangeMatch[6], 10));
+        return {
+            date: d1,
+            isMultiDay: d1.getTime() !== d2.getTime(),
+            periodStr: rangeMatch[0]
+        };
     }
-    const usMatch = clean.match(/\b(0?[1-9]|1[0-2])[-_](0?[1-9]|[12]\d|3[01])[-_](20\d\d|\d\d)\b/);
+
+    // 2. Check single ISO date (2026-10-19)
+    const isoMatch = clean.match(/(20\d\d)[-_](1[0-2]|0?[1-9])[-_](3[01]|[12]\d|0?[1-9])/);
+    if (isoMatch) {
+        const d = new Date(parseInt(isoMatch[1], 10), parseInt(isoMatch[2], 10) - 1, parseInt(isoMatch[3], 10));
+        return { date: d, isMultiDay: false, periodStr: isoMatch[0] };
+    }
+
+    // 3. Check US date (10-19-2026)
+    const usMatch = clean.match(/(1[0-2]|0?[1-9])[-_](3[01]|[12]\d|0?[1-9])[-_](20\d\d|\d\d)/);
     if (usMatch) {
         let yr = parseInt(usMatch[3], 10);
         if (yr < 100) yr += 2000;
-        return new Date(yr, parseInt(usMatch[1], 10) - 1, parseInt(usMatch[2], 10));
+        const d = new Date(yr, parseInt(usMatch[1], 10) - 1, parseInt(usMatch[2], 10));
+        return { date: d, isMultiDay: false, periodStr: formatDate(d) };
     }
-    return parseDate(fileName, activeMonthNum);
+
+    const fallbackDate = parseDate(clean.replace(/_/g, ' '), activeMonthNum);
+    if (fallbackDate) {
+        return { date: fallbackDate, isMultiDay: false, periodStr: formatDate(fallbackDate) };
+    }
+    return null;
 }
 
 /**
@@ -324,6 +352,8 @@ function extractDailyRecordsFromGrid(grid, fileName, activeMonthNum) {
     if (!grid || grid.length === 0) {
         return { error: "Empty worksheet" };
     }
+
+    const fnDateInfo = parseDateFromFileName(fileName, activeMonthNum);
 
     // 1. Search top 15 rows for Period line
     let fileDate = null;
@@ -348,8 +378,10 @@ function extractDailyRecordsFromGrid(grid, fileName, activeMonthNum) {
         }
     }
 
-    if (!fileDate) {
-        fileDate = parseDateFromFileName(fileName, activeMonthNum);
+    if (!fileDate && fnDateInfo) {
+        fileDate = fnDateInfo.date;
+        isMultiDay = fnDateInfo.isMultiDay;
+        periodStr = fnDateInfo.periodStr;
     }
 
     if (!fileDate) {
@@ -464,23 +496,41 @@ function loadDailyExtracts(ss) {
         throw new Error("Could not access Drive folder (" + DAILY_EXTRACTS_FOLDER_ID + "): " + e.message);
     }
 
-    const files = folder.getFiles();
     const candidateFiles = [];
 
-    while (files.hasNext()) {
-        const file = files.next();
-        const fName = file.getName();
-        const lower = fName.toLowerCase();
-        if (lower.endsWith(".xlsx") || lower.endsWith(".xls") || lower.includes("payables") || lower.includes("driver")) {
-            candidateFiles.push({
-                file: file,
-                id: file.getId(),
-                name: fName,
-                lastUpdated: file.getLastUpdated().getTime(),
-                lastUpdatedDate: file.getLastUpdated()
-            });
+    function collectCandidateFiles(targetFolder, depth) {
+        if (!targetFolder || depth > 3) return;
+        try {
+            const files = targetFolder.getFiles();
+            while (files.hasNext()) {
+                const file = files.next();
+                const fName = file.getName();
+                const lower = fName.toLowerCase();
+                if (lower.endsWith(".xlsx") || lower.endsWith(".xls") || lower.includes("payables") || lower.includes("driver")) {
+                    candidateFiles.push({
+                        file: file,
+                        id: file.getId(),
+                        name: fName,
+                        lastUpdated: file.getLastUpdated().getTime(),
+                        lastUpdatedDate: file.getLastUpdated()
+                    });
+                }
+            }
+        } catch (eFiles) {
+            Logger.log("Error reading files from folder " + (targetFolder ? targetFolder.getName() : "") + ": " + eFiles.message);
+        }
+
+        try {
+            const subfolders = targetFolder.getFolders();
+            while (subfolders.hasNext()) {
+                collectCandidateFiles(subfolders.next(), depth + 1);
+            }
+        } catch (eSubs) {
+            Logger.log("Error reading subfolders: " + eSubs.message);
         }
     }
+
+    collectCandidateFiles(folder, 0);
 
     if (candidateFiles.length === 0) {
         Logger.log("⚠️ No extract files found in Drive folder: " + DAILY_EXTRACTS_FOLDER_ID);
@@ -496,12 +546,12 @@ function loadDailyExtracts(ss) {
         const cf = candidateFiles[i];
         let parseResult = null;
 
-        const cacheKey = "EXTRACT_CACHE_" + cf.id;
+        const cacheKey = "EXTRACT_CACHE_V2_" + cf.id;
         try {
             const cachedStr = props.getProperty(cacheKey);
             if (cachedStr) {
                 const cachedObj = JSON.parse(cachedStr);
-                if (cachedObj && cachedObj.lastUpdated === cf.lastUpdated) {
+                if (cachedObj && cachedObj.lastUpdated === cf.lastUpdated && Array.isArray(cachedObj.records)) {
                     cachedObj.date = new Date(cachedObj.dateKey);
                     parseResult = cachedObj;
                 }
