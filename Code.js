@@ -2318,8 +2318,8 @@ function updateSummaryAndCharts(ss, dailyData) {
     // --- Headers: 10 Columns (Date, Driver, Credit, Hours, Driver Avg/ Hour, CPH, Trips, Cash, Tolls, Balance) ---
     const headers = ["Date", "Driver", "Credit", "Hours", "Driver Avg/ Hour", "CPH", "Trips", "Cash", "Tolls", "Balance"];
     
-    // Clear previous headers & data across columns 1-35 to erase former No Show columns
-    summarySheet.getRange(2, 1, 1, 35).clearContent();
+    // Clear previous headers & data across columns 1-45 to erase former layouts
+    summarySheet.getRange(2, 1, 1, 45).clearContent();
     summarySheet.getRange(2, 1, 1, headers.length).setValues([headers])
         .setFontWeight("bold")
         .setBackground("#3c78d8")
@@ -2491,15 +2491,21 @@ function updateSummaryAndCharts(ss, dailyData) {
     summarySheet.getRange(4, statsStartCol + 5, uniqueDrivers.length, 1).setNumberFormat("0.0");       // Total Hours (Q)
     summarySheet.getRange(4, statsStartCol + 6, uniqueDrivers.length, 3).setNumberFormat("$#,##0.00"); // Avg Per Hour, NET, Avg Per Day (R, S, T)
 
+    summarySheet.setColumnWidth(11, 25);            // Col K (gap after Main Table)
     summarySheet.setColumnWidth(statsStartCol, 75); // Col L (Driver)
     for (let c = statsStartCol + 1; c < statsStartCol + statsHeaders.length; c++) {
-        summarySheet.setColumnWidth(c, 55);
+        summarySheet.setColumnWidth(c, 55);         // Cols M to T (Stats helper)
     }
 
+    // Buffer columns under/after 700px driver charts to ensure Daily Summary is never overlapped
+    summarySheet.setColumnWidth(21, 100);           // Col U
+    summarySheet.setColumnWidth(22, 100);           // Col V
+    summarySheet.setColumnWidth(23, 40);            // Col W (gap before Daily Summary table)
+
     // =================================================================
-    // DAILY SUMMARY TABLE (Formula-First, Col V = 22 to Col AA = 27)
+    // DAILY SUMMARY TABLE (Formula-First, Col X = 24 to Col AC = 29)
     // =================================================================
-    const dailyStartCol = 22; // Column V (Col 21 = U gap)
+    const dailyStartCol = 24; // Column X (Cols 21-23 = buffer/gap preventing chart overlap)
     const dailyHeaders = ["Date", "Total Credit", "Tolls", "Trips", "Cash", "Total Hours"];
     const dailyTableRows = [];
 
@@ -2516,7 +2522,8 @@ function updateSummaryAndCharts(ss, dailyData) {
         ]);
     });
 
-    try { summarySheet.getRange(2, dailyStartCol, 100, dailyHeaders.length + 5).clearContent(); } catch (e) { }
+    // Clear old daily table and chart area across columns 21-45 to remove any leftover data
+    try { summarySheet.getRange(2, 21, 100, 25).clearContent(); } catch (e) { }
     summarySheet.getRange(2, dailyStartCol, 1, dailyHeaders.length).setValues([dailyHeaders]).setFontWeight("bold");
 
     if (dailyTableRows.length > 0) {
@@ -2528,15 +2535,24 @@ function updateSummaryAndCharts(ss, dailyData) {
         summarySheet.getRange(3, dailyStartCol + 5, dailyTableRows.length, 1).setNumberFormat("0.0");       // Hours
     }
 
+    // Set neat column widths for Daily Summary Table
+    summarySheet.setColumnWidth(dailyStartCol, 110);     // Col X (Date)
+    summarySheet.setColumnWidth(dailyStartCol + 1, 90);  // Col Y (Total Credit)
+    summarySheet.setColumnWidth(dailyStartCol + 2, 70);  // Col Z (Tolls)
+    summarySheet.setColumnWidth(dailyStartCol + 3, 55);  // Col AA (Trips)
+    summarySheet.setColumnWidth(dailyStartCol + 4, 80);  // Col AB (Cash)
+    summarySheet.setColumnWidth(dailyStartCol + 5, 80);  // Col AC (Total Hours)
+    summarySheet.setColumnWidth(dailyStartCol + 6, 25);  // Col AD (gap before Trend Chart)
+
     // =================================================================
     // CHARTS
     // =================================================================
     const allCharts = summarySheet.getCharts();
     allCharts.forEach(c => summarySheet.removeChart(c));
 
-    // Chart 1: Daily Total Credit Trend (line) — Col 29 (AC, gap at Col 28 = AB)
+    // Chart 1: Daily Total Credit Trend (line) — Col 31 (AE, gap at Col 30 = AD)
     if (dailyTableRows.length > 0) {
-        const dailyChartCol = dailyStartCol + 7; // Col 29 (AC)
+        const dailyChartCol = dailyStartCol + 7; // Col 31 (AE)
         const dailyChart = summarySheet.newChart()
             .setChartType(Charts.ChartType.LINE)
             .addRange(summarySheet.getRange(3, dailyStartCol, dailyTableRows.length, 1))
@@ -2573,7 +2589,7 @@ function updateSummaryAndCharts(ss, dailyData) {
             .setOption("titleTextStyle", { bold: true, fontSize: 24 })
             .setOption("colors", ["#1f77b4"]).setOption("legend", { position: "none" })
             .setOption("vAxis", { title: "Credit" })
-            .setOption("width", 740)
+            .setOption("width", 700)
             .setOption("height", 450)
             .setPosition(3, statsStartCol, 0, 0).build();
         summarySheet.insertChart(chartCredit);
@@ -2586,7 +2602,7 @@ function updateSummaryAndCharts(ss, dailyData) {
             .setOption("titleTextStyle", { bold: true, fontSize: 24 })
             .setOption("colors", ["#8c564b"]).setOption("legend", { position: "none" })
             .setOption("vAxis", { title: "Trips" })
-            .setOption("width", 740)
+            .setOption("width", 700)
             .setOption("height", 450)
             .setPosition(26, statsStartCol, 0, 0).build();
         summarySheet.insertChart(chartTrips);
@@ -2599,7 +2615,7 @@ function updateSummaryAndCharts(ss, dailyData) {
             .setOption("titleTextStyle", { bold: true, fontSize: 24 })
             .setOption("colors", ["#ff7f0e"]).setOption("legend", { position: "none" })
             .setOption("vAxis", { title: "Hours" })
-            .setOption("width", 740)
+            .setOption("width", 700)
             .setOption("height", 450)
             .setPosition(49, statsStartCol, 0, 0).build();
         summarySheet.insertChart(chartHours);
@@ -2612,12 +2628,9 @@ function updateSummaryAndCharts(ss, dailyData) {
             .setOption("titleTextStyle", { bold: true, fontSize: 24 })
             .setOption("colors", ["#d62728"]).setOption("legend", { position: "none" })
             .setOption("vAxis", { title: "Daily Credit" })
-            .setOption("titleTextStyle", { bold: true, fontSize: 24 })
-            .setOption("colors", ["#d62728"]).setOption("legend", { position: "none" })
-            .setOption("vAxis", { title: "Daily Credit" })
-            .setOption("width", 740)
+            .setOption("width", 700)
             .setOption("height", 450)
-            .setPosition(95, statsStartCol, 0, 0).build();
+            .setPosition(72, statsStartCol, 0, 0).build();
         summarySheet.insertChart(chartAvgDay);
     }
 }
