@@ -156,7 +156,8 @@ function onOpen() {
             .addItem('☕ Sync Breaks Table', 'syncBreaksTableFromMenu')
             .addItem('🕒 Sync Working Hours Sheet', 'generateWorkingHoursSheetFromMenu')
             .addSeparator()
-            .addItem('🔧 Setup Auto-Run Trigger', 'setupAutoRun')
+            .addItem('🔧 Enable Auto-Run (Every 2 Hours)', 'setupAutoRun')
+            .addItem('⏹️ Disable Auto-Run', 'disableAutoRun')
             .addToUi();
     } catch (e) {
         // onOpen() cannot be run from the Apps Script editor.
@@ -984,9 +985,8 @@ function getCanonicalDriverName(name, canonicalList) {
 
 
 /**
- * Ensures clean trigger state.
- * Under Formula-First architecture, native equations update dynamically on edits,
- * so intrusive onEdit/onChange script triggers that wipe the sheet on slight edits are removed.
+ * Installs an automatic background trigger to check Google Drive for new daily extracts every 2 hours.
+ * Note: Manual spreadsheet edits update live via native formulas without needing any onEdit triggers.
  */
 function setupAutoRun() {
     let ss = getSafeSpreadsheet();
@@ -995,7 +995,7 @@ function setupAutoRun() {
         return;
     }
 
-    // Remove existing triggers for runDailyBalance to prevent full-sheet rebuilds on minor edits
+    // Remove existing triggers for runDailyBalance to prevent duplicates
     let removedCount = 0;
     ScriptApp.getProjectTriggers().forEach(t => {
         if (t.getHandlerFunction() === 'runDailyBalance') {
@@ -1004,12 +1004,36 @@ function setupAutoRun() {
         }
     });
 
-    Logger.log("✅ Removed " + removedCount + " auto-run triggers.");
-    Logger.log("   • The sheet now uses live formulas that update automatically on edits without wiping.");
-    Logger.log("   • To refresh daily extracts from Google Drive, click '⚙️ Balance Sheet -> ▶ Run Balance Report'.");
+    // Install time-driven trigger: checks Drive folder for new daily extracts every 2 hours
+    ScriptApp.newTrigger('runDailyBalance')
+        .timeBased()
+        .everyHours(2)
+        .create();
+
+    Logger.log("✅ Auto-run trigger installed: checks Google Drive every 2 hours.");
     try {
-        ss.toast("Formula-First active: live formulas update on edits. Use menu to pull new Drive files.", "Balance Sheet", 6);
+        ss.toast("✅ Auto-Run enabled! Checking Google Drive for new daily files every 2 hours. (Spreadsheet edits update live via formulas).", "Balance Sheet", 7);
     } catch (e) { }
+}
+
+/**
+ * Removes all background auto-run triggers for runDailyBalance.
+ */
+function disableAutoRun() {
+    let ss = getSafeSpreadsheet();
+    let removedCount = 0;
+    ScriptApp.getProjectTriggers().forEach(t => {
+        if (t.getHandlerFunction() === 'runDailyBalance') {
+            ScriptApp.deleteTrigger(t);
+            removedCount++;
+        }
+    });
+    Logger.log("Removed " + removedCount + " triggers.");
+    if (ss) {
+        try {
+            ss.toast("⏹️ Auto-run disabled. You can run reports manually from the menu.", "Balance Sheet", 5);
+        } catch (e) { }
+    }
 }
 
 
@@ -3099,7 +3123,7 @@ function generateWeeklySummary(ss, dailyData) {
 
                 const tableEnd = totR;
 
-                // Chart 1: Total Credit by Driver (Col J = col 10, width 480px, height 310px)
+                // Chart 1: Total Credit by Driver (Col J = col 10, width 470px, height 310px)
                 try {
                     const chart1 = weeklySheet.newChart().asColumnChart()
                         .setPosition(startRow - 1, 10, 0, 0)
@@ -3110,7 +3134,7 @@ function generateWeeklySummary(ss, dailyData) {
                         .setOption("legend", { position: "none" })
                         .setOption("hAxis", { title: "Driver" })
                         .setOption("vAxis", { title: "Total Credit" })
-                        .setOption("width", 480)
+                        .setOption("width", 470)
                         .setOption("height", 310)
                         .build();
                     weeklySheet.insertChart(chart1);
@@ -3118,10 +3142,10 @@ function generateWeeklySummary(ss, dailyData) {
                     Logger.log("Error inserting Chart 1 for week " + displayedWeekCounter + ": " + eChart1);
                 }
 
-                // Chart 2: Trips by Driver (Col O = col 15, width 480px, height 310px)
+                // Chart 2: Trips by Driver (Col P = col 16, width 470px, height 310px)
                 try {
                     const chart2 = weeklySheet.newChart().asColumnChart()
-                        .setPosition(startRow - 1, 15, 0, 0)
+                        .setPosition(startRow - 1, 16, 0, 0)
                         .addRange(weeklySheet.getRange(currentRow - 1, 1, tableData.length + 1, 1)) // Driver Names
                         .addRange(weeklySheet.getRange(currentRow - 1, 4, tableData.length + 1, 1)) // Trips
                         .setNumHeaders(1)
@@ -3130,7 +3154,7 @@ function generateWeeklySummary(ss, dailyData) {
                         .setOption("legend", { position: "none" })
                         .setOption("hAxis", { title: "Driver" })
                         .setOption("vAxis", { title: "Trips" })
-                        .setOption("width", 480)
+                        .setOption("width", 470)
                         .setOption("height", 310)
                         .build();
                     weeklySheet.insertChart(chart2);
@@ -3150,10 +3174,26 @@ function generateWeeklySummary(ss, dailyData) {
             .setHorizontalAlignment("center")
             .setBackground("#f9f9f9");
     } else {
-        weeklySheet.autoResizeColumns(1, 8);
-        for (let col = 1; col <= 8; col++) {
-            weeklySheet.setColumnWidth(col, Math.max(weeklySheet.getColumnWidth(col) + 15, 110));
+        // Set column widths to match exact user layout
+        weeklySheet.setColumnWidth(1, 120); // Col A: Driver
+        weeklySheet.setColumnWidth(2, 105); // Col B: Total Credit
+        weeklySheet.setColumnWidth(3, 80);  // Col C: Tolls
+        weeklySheet.setColumnWidth(4, 55);  // Col D: Trips
+        weeklySheet.setColumnWidth(5, 95);  // Col E: Total Cash
+        weeklySheet.setColumnWidth(6, 80);  // Col F: Total Hours
+        weeklySheet.setColumnWidth(7, 95);  // Col G: Avg Per Hour
+        weeklySheet.setColumnWidth(8, 100); // Col H: Balance
+
+        weeklySheet.setColumnWidth(9, 25);  // Col I: gap between Table and Chart 1
+        for (let c = 10; c <= 14; c++) {
+            weeklySheet.setColumnWidth(c, 95); // Cols J-N under Chart 1 (5 * 95 = 475px)
         }
+
+        weeklySheet.setColumnWidth(15, 25); // Col O: gap between Chart 1 and Chart 2
+        for (let c = 16; c <= 19; c++) {
+            weeklySheet.setColumnWidth(c, 115); // Cols P-S under Chart 2 (4 * 115 = 460px)
+        }
+        weeklySheet.setColumnWidth(20, 25); // Col T: gap after Chart 2
     }
 }
 
