@@ -3,7 +3,8 @@
 // =================================================================
 // Change this ID each time you switch to a new monthly balance file.
 // This is the ONLY line you need to update.
-const TARGET_SHEET_ID = "14jjwIW2ywsEXz0JAgxcaG43FKa4Nq8pezaTspigvbDE";
+const TARGET_SHEET_ID = "1XmzqDfalrqADK-O7g1SsTOersaRBNzACa-KNcEJVrP9v7w9BQ_hkC5Uu";
+const DAILY_EXTRACTS_FOLDER_ID = "1wTRKJMQ07vGT4ZzzoXWFz92hLoWRkVvw";
 
 var _ACTIVE_MONTH_NUM = 10; // Default: October (10)
 
@@ -119,9 +120,6 @@ function onOpen() {
             .addItem('☕ Sync Breaks Table', 'syncBreaksTableFromMenu')
             .addItem('🕒 Sync Working Hours Sheet', 'generateWorkingHoursSheetFromMenu')
             .addSeparator()
-            .addItem('📥 Import: NET Data  (from "Raw Data - NET" sheet)', 'importNetData')
-            .addItem('📥 Import: Trips Data  (from "Raw Data - Trips" sheet)', 'importTripsData')
-            .addSeparator()
             .addItem('🔧 Setup Auto-Run Trigger', 'setupAutoRun')
             .addToUi();
     } catch (e) {
@@ -132,180 +130,562 @@ function onOpen() {
 }
 
 // =================================================================
-// IMPORT: NET DATA — Merges "Raw Data - NET" into "Raw Data".
-//
-// How it works:
-//  1. Reads "Raw Data - NET" — same layout as Raw Data but daily
-//     values are NET pay (Credit - Cash) per driver per day.
-//  2. For each date column in the NET sheet:
-//     a. If the date already exists in Raw Data → overwrites that
-//        driver's NET cell value.
-//     b. If the date is NEW → inserts a new column in Raw Data,
-//        fills it with 0 credit for all drivers (you can add
-//        credit data later), and writes the NET values.
-//  3. Recalculates the "Driver NET" summary column (last column)
-//     in Raw Data by summing all daily NET columns.
-//  4. After import, runs the full balance report automatically.
+// DAILY EXTRACTS LOADER — Reads daily .xlsx files directly from Drive
 // =================================================================
-function importNetData() {
-    const ss = SpreadsheetApp.openById(TARGET_SHEET_ID);
 
-    const netSheet = ss.getSheetByName("Raw Data - NET");
-    if (!netSheet) {
-        Logger.log('❌ Sheet "Raw Data - NET" not found. Create it, paste your NET data, then try again.');
-        return;
+/**
+ * Converts column letter(s) like "A", "B", "AA" to 0-based column index.
+ */
+function colLetterToIdx(letters) {
+    if (!letters) return 0;
+    let col = 0;
+    const upper = letters.toUpperCase();
+    for (let i = 0; i < upper.length; i++) {
+        col = col * 26 + (upper.charCodeAt(i) - 64);
     }
-    const rawSheet = ss.getSheetByName("Raw Data");
-    if (!rawSheet) { Logger.log('❌ Sheet "Raw Data" not found.'); return; }
-
-    const rawWeeks = parseRawDataWeeks(rawSheet);
-    if (rawWeeks.length === 0) {
-        Logger.log('⚠️ No valid week tables found in "Raw Data".');
-        return;
-    }
-
-    const netWeeks = parseRawDataWeeks(netSheet);
-    let updatedDrivers = 0;
-
-    if (netWeeks.length > 0) {
-        // Multi-week vertical tables in NET sheet
-        rawWeeks.forEach((rawW, wIdx) => {
-            const netW = netWeeks[wIdx];
-            if (!netW) return;
-
-            const netDriverMap = {};
-            netW.drivers.forEach(d => {
-                netDriverMap[d.name.toLowerCase()] = d.weeklyNet;
-            });
-
-            rawW.drivers.forEach(rawD => {
-                const canon = rawD.name.toLowerCase();
-                let netVal = netDriverMap[canon];
-                if (netVal === undefined) {
-                    // Try middle-initial-free match
-                    for (const netName in netDriverMap) {
-                        if (netName.replace(/\s+[a-z]\.?\s+/g, ' ') === canon.replace(/\s+[a-z]\.?\s+/g, ' ')) {
-                            netVal = netDriverMap[netName];
-                            break;
-                        }
-                    }
-                }
-                if (netVal !== undefined) {
-                    rawSheet.getRange(rawD.rowIdx + 1, rawW.netColIdx + 1).setValue(netVal);
-                    updatedDrivers++;
-                }
-            });
-        });
-    } else {
-        // Fallback: single table in NET sheet
-        const netData = netSheet.getDataRange().getValues();
-        const netHeaders = netSheet.getRange(1, 1, 1, netSheet.getLastColumn()).getDisplayValues()[0];
-        const netDriverNetColIdx = findColByLabel(netHeaders, ['driver net', 'net'], netHeaders.length - 1);
-
-        const netDriverMap = {};
-        for (let r = 2; r < netData.length; r++) {
-            const name = (netData[r][0] || '').toString().trim();
-            if (name && name !== 'Total') {
-                netDriverMap[name.toLowerCase()] = parseNumber(netData[r][netDriverNetColIdx]) || 0;
-            }
-        }
-
-        rawWeeks.forEach(rawW => {
-            rawW.drivers.forEach(rawD => {
-                const canon = rawD.name.toLowerCase();
-                let netVal = netDriverMap[canon];
-                if (netVal !== undefined) {
-                    rawSheet.getRange(rawD.rowIdx + 1, rawW.netColIdx + 1).setValue(netVal);
-                    updatedDrivers++;
-                }
-            });
-        });
-    }
-
-    SpreadsheetApp.flush();
-    Logger.log(`✅ NET Data import complete! Updated Driver NET for ${updatedDrivers} driver-week records.`);
-    Logger.log(`   Running balance report...`);
-    runDailyBalance();
+    return col - 1;
 }
 
-// =================================================================
-// IMPORT: TRIPS DATA — Merges "Raw Data - Trips" into "Raw Data".
-// =================================================================
-function importTripsData() {
-    const ss = SpreadsheetApp.openById(TARGET_SHEET_ID);
+/**
+ * Decodes standard XML escape entities.
+ */
+function unescapeXml(str) {
+    if (!str) return "";
+    return str
+        .replace(/&amp;/g, '&')
+        .replace(/&lt;/g, '<')
+        .replace(/&gt;/g, '>')
+        .replace(/&quot;/g, '"')
+        .replace(/&apos;/g, "'")
+        .replace(/&#(\d+);/g, (m, dec) => String.fromCharCode(dec))
+        .replace(/&#x([0-9a-fA-F]+);/g, (m, hex) => String.fromCharCode(parseInt(hex, 16)));
+}
 
-    const tripsSheet = ss.getSheetByName("Raw Data - Trips");
-    if (!tripsSheet) {
-        Logger.log('❌ Sheet "Raw Data - Trips" not found. Create it, paste your Trips data, then try again.');
-        return;
+/**
+ * Unzips an Excel .xlsx blob and parses the first worksheet into a 2D array.
+ * Works natively in Google Apps Script without converting to Google Sheets or calling external APIs.
+ */
+function parseXlsxBlob(blob) {
+    const unzipped = Utilities.unzip(blob);
+    let sharedStringsXml = null;
+    let sheetXml = null;
+
+    for (let i = 0; i < unzipped.length; i++) {
+        const entryName = unzipped[i].getName();
+        if (entryName === "xl/sharedStrings.xml") {
+            sharedStringsXml = unzipped[i].getDataAsString();
+        } else if (entryName === "xl/worksheets/sheet1.xml" || (!sheetXml && entryName.startsWith("xl/worksheets/sheet") && entryName.endsWith(".xml"))) {
+            sheetXml = unzipped[i].getDataAsString();
+        }
     }
-    const rawSheet = ss.getSheetByName("Raw Data");
-    if (!rawSheet) { Logger.log('❌ Sheet "Raw Data" not found.'); return; }
 
-    const rawWeeks = parseRawDataWeeks(rawSheet);
-    if (rawWeeks.length === 0) {
-        Logger.log('⚠️ No valid week tables found in "Raw Data".');
-        return;
+    if (!sheetXml) {
+        throw new Error("Could not find worksheet XML inside Excel file.");
     }
 
-    const tripsWeeks = parseRawDataWeeks(tripsSheet);
-    let updatedCount = 0;
+    // 1. Parse shared strings table
+    const sharedStrings = [];
+    if (sharedStringsXml) {
+        const siMatches = sharedStringsXml.match(/<si[\s\S]*?<\/si>/g) || [];
+        for (let j = 0; j < siMatches.length; j++) {
+            const tMatches = siMatches[j].match(/<t[^>]*>([\s\S]*?)<\/t>/g) || [];
+            let str = "";
+            for (let k = 0; k < tMatches.length; k++) {
+                const textContent = tMatches[k].replace(/^<t[^>]*>/, '').replace(/<\/t>$/, '');
+                str += unescapeXml(textContent);
+            }
+            sharedStrings.push(str);
+        }
+    }
 
-    if (tripsWeeks.length > 0) {
-        rawWeeks.forEach((rawW, wIdx) => {
-            const tripsW = tripsWeeks[wIdx];
-            if (!tripsW) return;
+    // 2. Parse sheet cells into grid
+    const grid = [];
+    const rowMatches = sheetXml.match(/<row[\s\S]*?<\/row>/g) || [];
 
-            const tripsDriverMap = {};
-            tripsW.drivers.forEach(d => {
-                tripsDriverMap[d.name.toLowerCase()] = d.weeklyTrips;
-            });
+    for (let r = 0; r < rowMatches.length; r++) {
+        const rowStr = rowMatches[r];
+        const rNumMatch = rowStr.match(/r="(\d+)"/);
+        const rowIdx = rNumMatch ? parseInt(rNumMatch[1], 10) - 1 : r;
 
-            rawW.drivers.forEach(rawD => {
-                const canon = rawD.name.toLowerCase();
-                let tripVal = tripsDriverMap[canon];
-                if (tripVal === undefined) {
-                    for (const tripsName in tripsDriverMap) {
-                        if (tripsName.replace(/\s+[a-z]\.?\s+/g, ' ') === canon.replace(/\s+[a-z]\.?\s+/g, ' ')) {
-                            tripVal = tripsDriverMap[tripsName];
-                            break;
-                        }
-                    }
+        while (grid.length <= rowIdx) grid.push([]);
+
+        const cMatches = rowStr.match(/<c[\s\S]*?(?:<\/c>|\/>)/g) || [];
+        for (let c = 0; c < cMatches.length; c++) {
+            const cellStr = cMatches[c];
+            const refMatch = cellStr.match(/r="([A-Z]+)(\d+)"/);
+            if (!refMatch) continue;
+            const colLetters = refMatch[1];
+            const colIdx = colLetterToIdx(colLetters);
+
+            const typeMatch = cellStr.match(/t="([^"]+)"/);
+            const cellType = typeMatch ? typeMatch[1] : "";
+
+            let val = "";
+            if (cellType === "s") {
+                const vMatch = cellStr.match(/<v>(\d+)<\/v>/);
+                if (vMatch) {
+                    const sIdx = parseInt(vMatch[1], 10);
+                    val = sharedStrings[sIdx] !== undefined ? sharedStrings[sIdx] : "";
                 }
-                if (tripVal !== undefined) {
-                    rawSheet.getRange(rawD.rowIdx + 1, rawW.countColIdx + 1).setValue(tripVal);
-                    updatedCount++;
+            } else if (cellType === "inlineStr") {
+                const tMatch = cellStr.match(/<t[^>]*>([\s\S]*?)<\/t>/);
+                if (tMatch) val = unescapeXml(tMatch[1]);
+            } else {
+                const vMatch = cellStr.match(/<v>([\s\S]*?)<\/v>/);
+                if (vMatch) val = unescapeXml(vMatch[1]);
+            }
+
+            while (grid[rowIdx].length <= colIdx) grid[rowIdx].push("");
+            grid[rowIdx][colIdx] = val;
+        }
+    }
+
+    return grid;
+}
+
+/**
+ * Parses the "Period: MM/DD/YYYY – MM/DD/YYYY" line from a daily extract.
+ */
+function parsePeriodLine(text, activeMonthNum) {
+    if (!text) return null;
+    const clean = String(text).replace(/[\u2010-\u2015\u2212]/g, '-').trim();
+    const match = clean.match(/period:\s*([0-9\/\.\-]+)\s*[\-–—to\s]+\s*([0-9\/\.\-]+)/i);
+    if (match) {
+        const d1 = parseDate(match[1], activeMonthNum);
+        const d2 = parseDate(match[2], activeMonthNum);
+        if (d1 && d2) {
+            return { startDate: d1, endDate: d2, startStr: match[1], endStr: match[2] };
+        }
+    }
+    return null;
+}
+
+/**
+ * Attempts to parse a date from the file name as a fallback.
+ */
+function parseDateFromFileName(fileName, activeMonthNum) {
+    if (!fileName) return null;
+    const clean = fileName.replace(/[\u2010-\u2015\u2212]/g, '-');
+    const isoMatch = clean.match(/\b(20\d\d)[-_](0?[1-9]|1[0-2])[-_](0?[1-9]|[12]\d|3[01])\b/);
+    if (isoMatch) {
+        return new Date(parseInt(isoMatch[1], 10), parseInt(isoMatch[2], 10) - 1, parseInt(isoMatch[3], 10));
+    }
+    const usMatch = clean.match(/\b(0?[1-9]|1[0-2])[-_](0?[1-9]|[12]\d|3[01])[-_](20\d\d|\d\d)\b/);
+    if (usMatch) {
+        let yr = parseInt(usMatch[3], 10);
+        if (yr < 100) yr += 2000;
+        return new Date(yr, parseInt(usMatch[1], 10) - 1, parseInt(usMatch[2], 10));
+    }
+    return parseDate(fileName, activeMonthNum);
+}
+
+/**
+ * Extracts driver records from an Excel grid.
+ * Total credit = cash + final pay + amount of fees (positive value)
+ * Columns captured: Name, Trips, Fees, Tollways, Final Pay, Cash
+ */
+function extractDailyRecordsFromGrid(grid, fileName, activeMonthNum) {
+    if (!grid || grid.length === 0) {
+        return { error: "Empty worksheet" };
+    }
+
+    // 1. Search top 15 rows for Period line
+    let fileDate = null;
+    let periodStr = "";
+    let isMultiDay = false;
+
+    for (let r = 0; r < Math.min(grid.length, 15); r++) {
+        const rowText = grid[r].join(" ");
+        if (/period:/i.test(rowText)) {
+            const pMatch = rowText.match(/period:[^\r\n]+/i);
+            periodStr = pMatch ? pMatch[0] : rowText;
+            const p = parsePeriodLine(periodStr, activeMonthNum);
+            if (p) {
+                if (p.startDate.getTime() !== p.endDate.getTime()) {
+                    isMultiDay = true;
+                    fileDate = p.startDate;
+                } else {
+                    fileDate = p.startDate;
                 }
+                break;
+            }
+        }
+    }
+
+    if (!fileDate) {
+        fileDate = parseDateFromFileName(fileName, activeMonthNum);
+    }
+
+    if (!fileDate) {
+        return { error: "Could not determine date from Period line or file name (" + fileName + ")" };
+    }
+
+    if (isMultiDay) {
+        return {
+            date: fileDate,
+            isMultiDay: true,
+            periodStr: periodStr,
+            error: "Multi-day extract skipped (" + periodStr + ")"
+        };
+    }
+
+    // 2. Search for header row
+    let headerRowIdx = -1;
+    const colMap = {};
+
+    for (let r = 0; r < Math.min(grid.length, 15); r++) {
+        const row = grid[r];
+        const rowLower = row.map(cell => (cell || "").toString().toLowerCase().trim());
+        const hasName = rowLower.some(c => c === "name" || c === "driver name" || (c === "driver" && !c.includes("id")));
+        const hasPayOrTrips = rowLower.some(c => c.includes("trip") || c.includes("pay") || c.includes("fee") || c.includes("driver id"));
+
+        if (hasName && hasPayOrTrips) {
+            headerRowIdx = r;
+            rowLower.forEach((h, c) => {
+                if (h === "name" || h.includes("driver name") || (h === "driver" && !h.includes("id"))) colMap.name = c;
+                else if (h.includes("driver id") || h === "id") colMap.driverId = c;
+                else if (h === "trips" || h === "trip" || h.includes("trips")) colMap.trips = c;
+                else if (h.includes("driver net") || h === "net") colMap.driverNet = c;
+                else if (h.includes("fee")) colMap.fees = c;
+                else if (h.includes("toll")) colMap.tolls = c;
+                else if (h.includes("final pay") || h === "pay") colMap.finalPay = c;
+                else if (h.includes("cash")) colMap.cash = c;
             });
+            break;
+        }
+    }
+
+    if (headerRowIdx === -1 || colMap.name === undefined) {
+        return { error: "Could not find valid table headers in " + fileName };
+    }
+
+    // 3. Read driver rows
+    const records = [];
+    let emptyCount = 0;
+
+    for (let r = headerRowIdx + 1; r < grid.length; r++) {
+        const row = grid[r];
+        const nameVal = (row[colMap.name] || "").toString().trim();
+        const idVal = colMap.driverId !== undefined ? (row[colMap.driverId] || "").toString().trim() : "";
+
+        if (nameVal.toLowerCase() === "total" || nameVal.toLowerCase() === "totals" || idVal.toLowerCase() === "total") {
+            break;
+        }
+
+        if (!nameVal) {
+            emptyCount++;
+            if (emptyCount > 5) break;
+            continue;
+        }
+        emptyCount = 0;
+
+        const trips = colMap.trips !== undefined ? (parseNumber(row[colMap.trips]) || 0) : 0;
+        const fees = colMap.fees !== undefined ? (parseNumber(row[colMap.fees]) || 0) : 0;
+        const tolls = colMap.tolls !== undefined ? (parseNumber(row[colMap.tolls]) || 0) : 0;
+        const finalPay = colMap.finalPay !== undefined ? (parseNumber(row[colMap.finalPay]) || 0) : 0;
+        const cash = colMap.cash !== undefined ? (parseNumber(row[colMap.cash]) || 0) : 0;
+
+        // Total credit = cash + final pay + amount of fees (positive value)
+        const credit = roundToTwo(cash + finalPay + Math.abs(fees));
+
+        records.push({
+            name: nameVal,
+            driverId: idVal,
+            trips: trips,
+            fees: fees,
+            tolls: tolls,
+            finalPay: finalPay,
+            cash: cash,
+            credit: credit
         });
-    } else {
-        const tripsData = tripsSheet.getDataRange().getValues();
-        const tripsHeaders = tripsSheet.getRange(1, 1, 1, tripsSheet.getLastColumn()).getDisplayValues()[0];
-        const tripsCountColIdx = findColByLabel(tripsHeaders, ['count', 'trip', 'trips', 'total'], tripsHeaders.length - 2);
+    }
 
-        const driverTripsMap = {};
-        for (let r = 2; r < tripsData.length; r++) {
-            const name = (tripsData[r][0] || '').toString().trim();
-            if (name && name !== 'Total') {
-                driverTripsMap[name.toLowerCase()] = parseNumber(tripsData[r][tripsCountColIdx]) || 0;
+    return {
+        date: fileDate,
+        dateKey: new Date(fileDate.getFullYear(), fileDate.getMonth(), fileDate.getDate()).getTime(),
+        isMultiDay: false,
+        periodStr: periodStr,
+        records: records
+    };
+}
+
+/**
+ * Reads all daily .xlsx files from the Drive folder.
+ * Uses ScriptProperties cache so unchanged files are not re-unzipped on each run.
+ * Deduplicates multiple files for the same date (picks latest modified).
+ * Filters strictly to the active month (October).
+ */
+function loadDailyExtracts(ss) {
+    if (!ss) {
+        try { ss = SpreadsheetApp.openById(TARGET_SHEET_ID); } catch (e) { ss = SpreadsheetApp.getActiveSpreadsheet(); }
+    }
+    const monthCtx = getActiveMonthContext(ss);
+    const targetMonthNum = monthCtx ? monthCtx.monthNum : _ACTIVE_MONTH_NUM;
+    const targetYear = monthCtx ? monthCtx.year : 2026;
+
+    let folder;
+    try {
+        folder = DriveApp.getFolderById(DAILY_EXTRACTS_FOLDER_ID);
+    } catch (e) {
+        throw new Error("Could not access Drive folder (" + DAILY_EXTRACTS_FOLDER_ID + "): " + e.message);
+    }
+
+    const files = folder.getFiles();
+    const candidateFiles = [];
+
+    while (files.hasNext()) {
+        const file = files.next();
+        const fName = file.getName();
+        const lower = fName.toLowerCase();
+        if (lower.endsWith(".xlsx") || lower.endsWith(".xls") || lower.includes("payables") || lower.includes("driver")) {
+            candidateFiles.push({
+                file: file,
+                id: file.getId(),
+                name: fName,
+                lastUpdated: file.getLastUpdated().getTime(),
+                lastUpdatedDate: file.getLastUpdated()
+            });
+        }
+    }
+
+    if (candidateFiles.length === 0) {
+        Logger.log("⚠️ No extract files found in Drive folder: " + DAILY_EXTRACTS_FOLDER_ID);
+        return { records: [], dates: [], allDateCols: [], warnings: ["No files found in Drive folder."], logEntries: [] };
+    }
+
+    const props = PropertiesService.getScriptProperties();
+    const parsedFiles = [];
+    const logEntries = [];
+    const warnings = [];
+
+    for (let i = 0; i < candidateFiles.length; i++) {
+        const cf = candidateFiles[i];
+        let parseResult = null;
+
+        const cacheKey = "EXTRACT_CACHE_" + cf.id;
+        try {
+            const cachedStr = props.getProperty(cacheKey);
+            if (cachedStr) {
+                const cachedObj = JSON.parse(cachedStr);
+                if (cachedObj && cachedObj.lastUpdated === cf.lastUpdated) {
+                    cachedObj.date = new Date(cachedObj.dateKey);
+                    parseResult = cachedObj;
+                }
+            }
+        } catch (cErr) {}
+
+        if (!parseResult) {
+            try {
+                const blob = cf.file.getBlob();
+                const grid = parseXlsxBlob(blob);
+                parseResult = extractDailyRecordsFromGrid(grid, cf.name, targetMonthNum);
+
+                if (!parseResult.error && !parseResult.isMultiDay && parseResult.records) {
+                    try {
+                        const toCache = {
+                            lastUpdated: cf.lastUpdated,
+                            dateKey: parseResult.dateKey,
+                            isMultiDay: parseResult.isMultiDay,
+                            records: parseResult.records
+                        };
+                        props.setProperty(cacheKey, JSON.stringify(toCache));
+                    } catch (storeErr) {}
+                }
+            } catch (pErr) {
+                parseResult = { error: pErr.message };
             }
         }
 
-        rawWeeks.forEach(rawW => {
-            rawW.drivers.forEach(rawD => {
-                const canon = rawD.name.toLowerCase();
-                if (driverTripsMap[canon] !== undefined) {
-                    rawSheet.getRange(rawD.rowIdx + 1, rawW.countColIdx + 1).setValue(driverTripsMap[canon]);
-                    updatedCount++;
-                }
+        if (parseResult.error) {
+            logEntries.push({
+                name: cf.name,
+                date: parseResult.date || null,
+                driversCount: 0,
+                totalCredit: 0,
+                totalTolls: 0,
+                status: "❌ " + parseResult.error,
+                lastUpdated: cf.lastUpdatedDate
             });
+            warnings.push(cf.name + ": " + parseResult.error);
+            continue;
+        }
+
+        if (parseResult.isMultiDay) {
+            logEntries.push({
+                name: cf.name,
+                date: parseResult.date,
+                driversCount: 0,
+                totalCredit: 0,
+                totalTolls: 0,
+                status: "⚠️ Skipped: Multi-day period (" + parseResult.periodStr + ")",
+                lastUpdated: cf.lastUpdatedDate
+            });
+            warnings.push("Skipped multi-day file: " + cf.name);
+            continue;
+        }
+
+        const fileDate = parseResult.date;
+        if (fileDate.getMonth() + 1 !== targetMonthNum || fileDate.getFullYear() !== targetYear) {
+            logEntries.push({
+                name: cf.name,
+                date: fileDate,
+                driversCount: (parseResult.records || []).length,
+                totalCredit: 0,
+                totalTolls: 0,
+                status: "⚠️ Skipped: Date " + formatDate(fileDate) + " is not in active month (" + targetMonthNum + "/" + targetYear + ")",
+                lastUpdated: cf.lastUpdatedDate
+            });
+            continue;
+        }
+
+        const totCred = (parseResult.records || []).reduce((sum, r) => sum + (r.credit || 0), 0);
+        const totTolls = (parseResult.records || []).reduce((sum, r) => sum + (r.tolls || 0), 0);
+
+        parsedFiles.push({
+            fileInfo: cf,
+            date: fileDate,
+            dateKey: parseResult.dateKey,
+            records: parseResult.records,
+            totalCredit: roundToTwo(totCred),
+            totalTolls: roundToTwo(totTolls)
         });
     }
 
-    SpreadsheetApp.flush();
-    Logger.log(`✅ Trips Data import complete! Updated ${updatedCount} driver-week records.`);
-    Logger.log(`   Running balance report...`);
-    runDailyBalance();
+    // Handle duplicates for same date: keep latest file
+    const byDate = {};
+    parsedFiles.forEach(pf => {
+        if (!byDate[pf.dateKey]) {
+            byDate[pf.dateKey] = [];
+        }
+        byDate[pf.dateKey].push(pf);
+    });
+
+    const activeFiles = [];
+    for (const dk in byDate) {
+        const list = byDate[dk];
+        list.sort((a, b) => b.fileInfo.lastUpdated - a.fileInfo.lastUpdated);
+        const winner = list[0];
+        activeFiles.push(winner);
+
+        logEntries.push({
+            name: winner.fileInfo.name,
+            date: winner.date,
+            driversCount: winner.records.length,
+            totalCredit: winner.totalCredit,
+            totalTolls: winner.totalTolls,
+            status: "✅ Active",
+            lastUpdated: winner.fileInfo.lastUpdatedDate
+        });
+
+        for (let j = 1; j < list.length; j++) {
+            const dup = list[j];
+            logEntries.push({
+                name: dup.fileInfo.name,
+                date: dup.date,
+                driversCount: dup.records.length,
+                totalCredit: dup.totalCredit,
+                totalTolls: dup.totalTolls,
+                status: "⚠️ Skipped: Duplicate date (newer file " + winner.fileInfo.name + " used)",
+                lastUpdated: dup.fileInfo.lastUpdatedDate
+            });
+            warnings.push("Duplicate date for " + dup.fileInfo.name + "; used newer " + winner.fileInfo.name);
+        }
+    }
+
+    activeFiles.sort((a, b) => a.dateKey - b.dateKey);
+
+    const allRecords = [];
+    const dateMap = {};
+    activeFiles.forEach(af => {
+        dateMap[af.dateKey] = {
+            date: af.date,
+            headerStr: formatDate(af.date)
+        };
+        af.records.forEach(r => {
+            allRecords.push({
+                date: af.date,
+                dateKey: af.dateKey,
+                name: r.name,
+                driverId: r.driverId,
+                trips: r.trips,
+                fees: r.fees,
+                tolls: r.tolls,
+                finalPay: r.finalPay,
+                cash: r.cash,
+                credit: r.credit
+            });
+        });
+    });
+
+    const sortedDates = Object.keys(dateMap).map(Number).sort((a, b) => a - b).map(t => dateMap[t]);
+
+    try {
+        updateDailyFilesLogSheet(ss, logEntries);
+    } catch (lErr) {
+        Logger.log("Error updating Daily Files Log sheet: " + lErr.message);
+    }
+
+    return {
+        records: allRecords,
+        dates: sortedDates.map(d => d.date),
+        allDateCols: sortedDates,
+        warnings: warnings,
+        logEntries: logEntries
+    };
+}
+
+/**
+ * Creates/refreshes the "Daily Files Log" sheet showing all files parsed from Drive.
+ */
+function updateDailyFilesLogSheet(ss, logEntries) {
+    if (!ss) return;
+    let logSheet = ss.getSheetByName("Daily Files Log");
+    if (!logSheet) {
+        logSheet = ss.insertSheet("Daily Files Log");
+    }
+
+    const headers = ["File Name", "File Date", "Drivers", "Total Credit", "Total Tolls", "Status", "Last Modified in Drive", "Processed At"];
+    logSheet.clear();
+    logSheet.getRange(1, 1, 1, headers.length)
+        .setValues([headers])
+        .setFontWeight("bold")
+        .setBackground("#3c78d8")
+        .setFontColor("white")
+        .setHorizontalAlignment("center");
+
+    if (logEntries && logEntries.length > 0) {
+        logEntries.sort((a, b) => {
+            if (a.date && b.date) return b.date.getTime() - a.date.getTime();
+            return a.name.localeCompare(b.name);
+        });
+
+        const rows = logEntries.map(e => [
+            e.name,
+            e.date ? formatDate(e.date) : "N/A",
+            e.driversCount,
+            e.totalCredit || 0,
+            e.totalTolls || 0,
+            e.status,
+            e.lastUpdated ? e.lastUpdated.toLocaleString() : "N/A",
+            new Date().toLocaleString()
+        ]);
+
+        const range = logSheet.getRange(2, 1, rows.length, headers.length);
+        range.setValues(rows);
+        range.setBorder(true, true, true, true, true, true, "black", SpreadsheetApp.BorderStyle.SOLID);
+        logSheet.getRange(2, 4, rows.length, 2).setNumberFormat("$#,##0.00");
+        logSheet.getRange(2, 1, rows.length, 1).setFontWeight("bold");
+
+        for (let i = 0; i < rows.length; i++) {
+            const st = rows[i][5];
+            const cell = logSheet.getRange(2 + i, 6);
+            if (st.startsWith("✅")) cell.setBackground("#d9ead3").setFontColor("#274e13");
+            else if (st.startsWith("⚠️")) cell.setBackground("#fff2cc").setFontColor("#7f6000");
+            else if (st.startsWith("❌")) cell.setBackground("#f4cccc").setFontColor("#990000");
+        }
+    }
+
+    logSheet.autoResizeColumns(1, headers.length);
 }
 
 /**
@@ -314,7 +694,7 @@ function importTripsData() {
  * index. Falls back to `defaultIdx` if nothing matches.
  */
 function findColByLabel(headers, keywords, defaultIdx) {
-    for (let c = headers.length - 1; c >= 0; c--) {   // scan from right (summary cols first)
+    for (let c = headers.length - 1; c >= 0; c--) {
         const h = (headers[c] || '').toString().toLowerCase().trim();
         for (const kw of keywords) {
             if (h.includes(kw)) return c;
@@ -324,13 +704,13 @@ function findColByLabel(headers, keywords, defaultIdx) {
 }
 
 /**
- * Scans the main Summary table headers (from left to right, within columns 0-8)
+ * Scans the main Summary table headers (from left to right, within columns 0-11)
  * looking for a column matching one of the given keywords.
- * Never scans past column index 8 to avoid matching adjacent tables (stats/daily).
+ * Never scans past column index 11 to avoid matching adjacent tables (stats/daily).
  */
 function findMainSummaryCol(headers, keywords, defaultIdx) {
     if (!headers || !headers.length) return defaultIdx;
-    const maxCol = Math.min(headers.length, 10);
+    const maxCol = Math.min(headers.length, 12);
     for (let c = 0; c < maxCol; c++) {
         const h = (headers[c] || '').toString().toLowerCase().trim();
         for (const kw of keywords) {
@@ -515,8 +895,9 @@ function getCanonicalDriverName(name, canonicalList) {
 
 
 /**
- * Run this function ONCE every time you change the TARGET_SHEET_ID above.
- * Installs the onChange trigger so the balance report auto-runs on data change.
+ * Ensures clean trigger state.
+ * Under Formula-First architecture, native equations update dynamically on edits,
+ * so intrusive onEdit/onChange script triggers that wipe the sheet on slight edits are removed.
  */
 function setupAutoRun() {
     let ss = null;
@@ -530,30 +911,20 @@ function setupAutoRun() {
         return;
     }
 
-    // Remove existing triggers for runDailyBalance to prevent duplicates
+    // Remove existing triggers for runDailyBalance to prevent full-sheet rebuilds on minor edits
+    let removedCount = 0;
     ScriptApp.getProjectTriggers().forEach(t => {
         if (t.getHandlerFunction() === 'runDailyBalance') {
             ScriptApp.deleteTrigger(t);
+            removedCount++;
         }
     });
 
-    // 1. Install onEdit trigger (fires when cell values are edited)
-    ScriptApp.newTrigger('runDailyBalance')
-        .forSpreadsheet(ss)
-        .onEdit()
-        .create();
-
-    // 2. Install onChange trigger (fires on structural changes like row/col inserts)
-    ScriptApp.newTrigger('runDailyBalance')
-        .forSpreadsheet(ss)
-        .onChange()
-        .create();
-
-    Logger.log("✅ Auto-run triggers installed for: " + ss.getName());
-    Logger.log("   • onEdit  → balance report re-runs on cell edits");
-    Logger.log("   • onChange → balance report re-runs on structural changes");
+    Logger.log("✅ Removed " + removedCount + " auto-run triggers.");
+    Logger.log("   • The sheet now uses live formulas that update automatically on edits without wiping.");
+    Logger.log("   • To refresh daily extracts from Google Drive, click '⚙️ Balance Sheet -> ▶ Run Balance Report'.");
     try {
-        ss.toast("Auto-run triggers installed! The sheet will update automatically on edits.", "Auto-Run Trigger", 5);
+        ss.toast("Formula-First active: live formulas update on edits. Use menu to pull new Drive files.", "Balance Sheet", 6);
     } catch (e) { }
 }
 
@@ -764,37 +1135,20 @@ function loadWorkingHoursMap(ss) {
  * Automatically de-duplicates any duplicate columns/rows from previous runs.
  * Only adds new date columns and new driver rows when they appear in Raw Data.
  */
-function generateWorkingHoursSheet(ss) {
+function generateWorkingHoursSheet(ss, dailyData) {
     let hoursSheet = ss.getSheetByName("Working hours");
     if (!hoursSheet) hoursSheet = ss.insertSheet("Working hours");
 
-    const rawSheet = ss.getSheetByName("Raw Data");
-    if (!rawSheet) {
-        Logger.log('❌ Sheet "Raw Data" not found.');
+    if (!dailyData) {
+        dailyData = loadDailyExtracts(ss);
+    }
+    if (!dailyData || !dailyData.records || dailyData.records.length === 0) {
+        Logger.log('⚠️ No daily extract records found for Working Hours sheet.');
         return;
     }
 
-    const weeks = parseRawDataWeeks(rawSheet);
-    if (weeks.length === 0) {
-        Logger.log('⚠️ No valid week tables found in "Raw Data".');
-        return;
-    }
-
-    // Collect all date columns across all weeks (deduplicate and sort chronologically)
-    const dateMap = {}; // timestamp -> { date, headerStr }
-    weeks.forEach(w => {
-        w.dateColumns.forEach(dc => {
-            const t = dc.date.getTime();
-            if (!dateMap[t]) {
-                dateMap[t] = { date: dc.date, headerStr: dc.headerStr };
-            }
-        });
-    });
-
-    const sortedTimestamps = Object.keys(dateMap).map(Number).sort((a, b) => a - b);
-    if (sortedTimestamps.length === 0) return;
-
-    const allDateCols = sortedTimestamps.map(t => dateMap[t]);
+    const allDateCols = dailyData.allDateCols || [];
+    if (allDateCols.length === 0) return;
 
     // Seed canonical drivers from Settings
     const settingsSheet = ss.getSheetByName("Settings");
@@ -807,21 +1161,17 @@ function generateWorkingHoursSheet(ss) {
         }
     }
 
-    // Collect all unique drivers and their credit across all weeks
+    // Collect all unique drivers and their credit across daily records
     const driverList = [];
     const driverCreditMap = {}; // canonDriver -> dateTimestamp -> credit
 
-    weeks.forEach(w => {
-        w.drivers.forEach(d => {
-            const canon = getCanonicalDriverName(d.name, canonicalDrivers);
-            if (!canonicalDrivers.includes(canon)) canonicalDrivers.push(canon);
-            if (!driverList.includes(canon)) driverList.push(canon);
+    dailyData.records.forEach(r => {
+        const canon = getCanonicalDriverName(r.name, canonicalDrivers);
+        if (!canonicalDrivers.includes(canon)) canonicalDrivers.push(canon);
+        if (!driverList.includes(canon)) driverList.push(canon);
 
-            if (!driverCreditMap[canon]) driverCreditMap[canon] = {};
-            for (const t in d.dailyCredits) {
-                driverCreditMap[canon][t] = (driverCreditMap[canon][t] || 0) + d.dailyCredits[t];
-            }
-        });
+        if (!driverCreditMap[canon]) driverCreditMap[canon] = {};
+        driverCreditMap[canon][r.dateKey] = (driverCreditMap[canon][r.dateKey] || 0) + (r.credit || 0);
     });
 
     const existingLastRow = hoursSheet.getLastRow();
@@ -1695,9 +2045,17 @@ function runDailyBalance() {
     }
 
     try {
+        // Load all daily extracts from Google Drive folder
+        let dailyData = null;
+        try {
+            dailyData = loadDailyExtracts(ss);
+        } catch (e) {
+            Logger.log("Error loading daily extracts: " + e.toString() + "\n" + (e.stack || ""));
+        }
+
         // 0. Sync working hours sheet first so downstream reports can use working hours data
         try {
-            generateWorkingHoursSheet(ss);
+            generateWorkingHoursSheet(ss, dailyData);
         } catch (e) {
             Logger.log("Error in generateWorkingHoursSheet: " + e.toString() + "\n" + (e.stack || ""));
         }
@@ -1709,9 +2067,9 @@ function runDailyBalance() {
             Logger.log("Error in syncBreaksTable: " + e.toString() + "\n" + (e.stack || ""));
         }
 
-        // 1. Update the main Summary sheet from Raw Data.
+        // 1. Update the main Summary sheet from daily extracts.
         try {
-            updateSummaryAndCharts(ss);
+            updateSummaryAndCharts(ss, dailyData);
         } catch (e) {
             Logger.log("Error in updateSummaryAndCharts: " + e.toString() + "\n" + (e.stack || ""));
         }
@@ -1721,21 +2079,21 @@ function runDailyBalance() {
 
         // 3. Generate the weekly summary.
         try {
-            generateWeeklySummary(ss);
+            generateWeeklySummary(ss, dailyData);
         } catch (e) {
             Logger.log("Error in generateWeeklySummary: " + e.toString() + "\n" + (e.stack || ""));
         }
 
         // 4. Generate the final Bonus report.
         try {
-            generateBonusReport(ss);
+            generateBonusReport(ss, dailyData);
         } catch (e) {
             Logger.log("Error in generateBonusReport: " + e.toString() + "\n" + (e.stack || ""));
         }
 
         // 5. Generate Angel's specific progressive report.
         try {
-            generateAngelReport(ss);
+            generateAngelReport(ss, dailyData);
         } catch (e) {
             Logger.log("Error in generateAngelReport: " + e.toString() + "\n" + (e.stack || ""));
         }
@@ -1746,14 +2104,11 @@ function runDailyBalance() {
 
 
 // =================================================================
-// SUMMARY BUILD — Reads "Raw Data" tab and builds the Summary sheet
+// SUMMARY BUILD — Builds Summary sheet from Daily Extracts (Drive)
 // =================================================================
-function updateSummaryAndCharts(ss) {
+function updateSummaryAndCharts(ss, dailyData) {
     let summarySheet = ss.getSheetByName("Summary");
     if (!summarySheet) summarySheet = ss.insertSheet("Summary");
-
-    const rawSheet = ss.getSheetByName("Raw Data");
-    if (!rawSheet) throw new Error('No sheet named "Raw Data" was found.');
 
     // Seed canonical drivers from Settings first so auxiliary loaders can normalize names
     let settingsSheet = ss.getSheetByName("Settings");
@@ -1769,28 +2124,18 @@ function updateSummaryAndCharts(ss) {
         }
     }
 
+    if (!dailyData) {
+        dailyData = loadDailyExtracts(ss);
+    }
+    if (!dailyData || !dailyData.records || dailyData.records.length === 0) {
+        Logger.log("⚠️ No daily extract records found to build Summary.");
+        return;
+    }
+
     // --- Helper to load exact daily data from auxiliary sheets ---
     function loadAuxMap(sheetName) {
         const auxSheet = ss.getSheetByName(sheetName);
         if (!auxSheet) return {};
-        const weeks = parseRawDataWeeks(auxSheet);
-        if (weeks.length > 0) {
-            const map = {};
-            weeks.forEach(w => {
-                w.drivers.forEach(d => {
-                    const rawName = d.name;
-                    const canonName = getCanonicalDriverName(rawName, canonicalDrivers);
-                    if (!map[rawName]) map[rawName] = {};
-                    if (!map[canonName]) map[canonName] = {};
-                    for (const t in d.dailyCredits) {
-                        map[rawName][t] = d.dailyCredits[t];
-                        map[canonName][t] = d.dailyCredits[t];
-                    }
-                });
-            });
-            return map;
-        }
-
         const data = auxSheet.getDataRange().getValues();
         if (data.length < 2) return {};
         const lastCol = auxSheet.getLastColumn();
@@ -1822,363 +2167,174 @@ function updateSummaryAndCharts(ss) {
         return map;
     }
 
-    // --- Helper to load persistent memory of previously-calculated daily cash and trips ---
-    function loadPersistentMemory() {
-        const memory = {}; // { [canonDriver]: { [dateKey]: { cash, trips } } }
-
-        // Seed known historical values for Sep 1, 2026 so they are never lost if Summary previously had zeros
-        const sep1Key = new Date(2026, 8, 1).getTime();
-        const knownSep1 = {
-            "Hassan En Nejjari": { cash: 33.00, trips: 14 },
-            "Angel Yoy": { cash: 48.00, trips: 17 },
-            "Koba Svanadze": { cash: 30.00, trips: 11 },
-            "Biaoming Feng": { cash: 25.50, trips: 9 },
-            "Brian Macancela": { cash: 42.00, trips: 16 },
-            "Benjamin Douglass": { cash: 12.00, trips: 4 },
-            "Prince Verma": { cash: 30.00, trips: 11 },
-            "Romer Elias": { cash: 9.00, trips: 5 }
-        };
-        for (const d in knownSep1) {
-            const canon = getCanonicalDriverName(d, canonicalDrivers);
-            if (!memory[canon]) memory[canon] = {};
-            memory[canon][sep1Key] = { cash: knownSep1[d].cash, trips: knownSep1[d].trips };
-        }
-
-        // 1. Read from PropertiesService
-        try {
-            const props = PropertiesService.getScriptProperties();
-            const stored = props.getProperty("DAILY_RECORDED_MEMORY");
-            if (stored) {
-                const parsed = JSON.parse(stored);
-                for (const dr in parsed) {
-                    const canon = getCanonicalDriverName(dr, canonicalDrivers);
-                    if (!memory[canon]) memory[canon] = {};
-                    for (const dk in parsed[dr]) {
-                        if (!memory[canon][dk]) memory[canon][dk] = {};
-                        if (parsed[dr][dk].cash !== undefined && parsed[dr][dk].cash > 0) {
-                            memory[canon][dk].cash = parsed[dr][dk].cash;
-                        }
-                        if (parsed[dr][dk].trips !== undefined && parsed[dr][dk].trips > 0) {
-                            memory[canon][dk].trips = parsed[dr][dk].trips;
-                        }
-                    }
-                }
-            }
-        } catch (e) {
-            Logger.log("⚠️ Could not load ScriptProperties: " + e.message);
-        }
-
-        // 2. Read from existing Summary sheet rows (before clearing)
-        const summarySheet = ss.getSheetByName("Summary");
-        if (summarySheet && summarySheet.getLastRow() >= 3) {
-            const lastRow = summarySheet.getLastRow();
-            const lastCol = Math.min(summarySheet.getLastColumn(), 10);
-            const headers = summarySheet.getRange(2, 1, 1, lastCol).getDisplayValues()[0];
-            const tripsIdx = findMainSummaryCol(headers, ['trips', 'trip'], 6);
-            const cashIdx = findMainSummaryCol(headers, ['cash'], 7);
-            const numCols = Math.max(tripsIdx, cashIdx) + 1;
-            const rows = summarySheet.getRange(3, 1, lastRow - 2, numCols).getValues();
-
-            let prevDate = null;
-            rows.forEach(r => {
-                const parsedD = parseDate(r[0]);
-                if (parsedD) prevDate = parsedD;
-                else if (r[0] instanceof Date) prevDate = r[0];
-                const dateVal = prevDate;
-                const rawDriver = (r[1] || '').toString().trim();
-                if (!dateVal || !rawDriver) return;
-
-                const dk = new Date(dateVal.getFullYear(), dateVal.getMonth(), dateVal.getDate()).getTime();
-                const canon = getCanonicalDriverName(rawDriver, canonicalDrivers);
-                if (!memory[canon]) memory[canon] = {};
-                if (!memory[canon][dk]) memory[canon][dk] = {};
-
-                const cVal = parseNumber(r[cashIdx]);
-                const tVal = parseNumber(r[tripsIdx]);
-
-                if (cVal !== null && cVal > 0) memory[canon][dk].cash = cVal;
-                if (tVal !== null && tVal > 0) memory[canon][dk].trips = tVal;
-            });
-        }
-
-        return memory;
-    }
-
-    function savePersistentMemory(memory) {
-        try {
-            const props = PropertiesService.getScriptProperties();
-            props.setProperty("DAILY_RECORDED_MEMORY", JSON.stringify(memory));
-        } catch (e) {
-            Logger.log("⚠️ Could not save ScriptProperties: " + e.message);
-        }
-    }
-
-    const memory = loadPersistentMemory();
-
-    // Load auxiliary daily maps (driverName -> { timestamp -> value })
+    // Load auxiliary daily maps
     const tripsDataMap = loadAuxMap("Raw Data - Trips");
     const noShowMap = loadNoShowMap(ss, "No Show");
-    const { map: workingHoursMap, driverTotalHours, dailyTotalHours } = loadWorkingHoursMap(ss);
+    const { map: workingHoursMap } = loadWorkingHoursMap(ss);
 
-    // --- Read the entire Raw Data sheet as weekly tables ---
-    const weeks = parseRawDataWeeks(rawSheet);
-    if (weeks.length === 0) {
-        Logger.log("⚠️ No valid week tables found in Raw Data.");
-        return;
-    }
+    // Group and consolidate records from dailyData
+    const consolidatedMap = {};
+    dailyData.records.forEach(r => {
+        const canonDriver = getCanonicalDriverName(r.name, canonicalDrivers);
+        if (!canonicalDrivers.includes(canonDriver)) canonicalDrivers.push(canonDriver);
 
-    // --- Build output rows: one row per driver per day across all weeks ---
-    let outputRows = []; // [date, driver, credit, cash, trips, total, cashTotal, noShow, hours]
-
-    weeks.forEach(w => {
-        w.drivers.forEach(d => {
-            const driverName = getCanonicalDriverName(d.name, canonicalDrivers);
-            if (!canonicalDrivers.includes(driverName)) canonicalDrivers.push(driverName);
-
-            const weeklyTotal = d.weeklyTotal;
-            const weeklyTrips = d.weeklyTrips;
-            const weeklyCash = d.weeklyCash; // Cash is Total - Driver NET
-
-            // Collect all active days for this driver in this week
-            let activeDays = [];
-            w.dateColumns.forEach(dc => {
-                const dateKey = dc.date.getTime();
-                let credit = d.dailyCredits[dateKey] || 0;
-
-                const hasExactTrips = tripsDataMap[driverName] && tripsDataMap[driverName][dateKey] !== undefined;
-                const exactTrips = hasExactTrips ? tripsDataMap[driverName][dateKey] : 0;
-                const hasNoShow = noShowMap[driverName] && noShowMap[driverName][dateKey] !== undefined;
-
-                if (hasNoShow) {
-                    credit = roundToTwo(credit - noShowMap[driverName][dateKey].cash);
-                }
-
-                // Include day if there's credit, trips, or No Show
-                if (credit > 0 || exactTrips > 0 || hasNoShow) {
-                    activeDays.push({ date: dc.date, dateKey: dateKey, credit: credit });
-                }
-            });
-
-            // If no active day found by credit/trips but the driver has weeklyTotal or weeklyCash, fallback to first date column
-            if (activeDays.length === 0 && (weeklyTotal > 0 || weeklyCash > 0) && w.dateColumns.length > 0) {
-                const dc = w.dateColumns[0];
-                activeDays.push({ date: dc.date, dateKey: dc.date.getTime(), credit: d.dailyCredits[dc.date.getTime()] || weeklyTotal });
-            }
-
-            if (activeDays.length === 0) return;
-
-            // Sort active days chronologically: Day 1, Day 2, Day 3...
-            activeDays.sort((a, b) => a.date - b.date);
-
-            const dailyCashMap = {};
-            const dailyTripMap = {};
-
-            if (activeDays.length === 1) {
-                // Exactly 1 active day for this driver in this table (e.g. Day 1 of the week)
-                const onlyDay = activeDays[0];
-                dailyCashMap[onlyDay.dateKey] = weeklyCash;
-
-                let trips = weeklyTrips;
-                if (tripsDataMap[driverName] && tripsDataMap[driverName][onlyDay.dateKey] !== undefined) {
-                    trips = tripsDataMap[driverName][onlyDay.dateKey];
-                }
-                dailyTripMap[onlyDay.dateKey] = trips;
-
-                // Memorize this day
-                if (!memory[driverName]) memory[driverName] = {};
-                memory[driverName][onlyDay.dateKey] = { cash: weeklyCash, trips: trips };
-            } else {
-                // Multiple active days in this week (e.g. Day 1, Day 2, etc.)
-                let sumPriorCash = 0;
-                let sumPriorTrips = 0;
-
-                // For all prior days (all days before the newest/last day): use memorized numbers
-                for (let i = 0; i < activeDays.length - 1; i++) {
-                    const priorDay = activeDays[i];
-                    let pCash = 0;
-                    let pTrips = 0;
-
-                    if (memory[driverName] && memory[driverName][priorDay.dateKey]) {
-                        pCash = memory[driverName][priorDay.dateKey].cash || 0;
-                        pTrips = memory[driverName][priorDay.dateKey].trips || 0;
-                    }
-
-                    if (tripsDataMap[driverName] && tripsDataMap[driverName][priorDay.dateKey] !== undefined) {
-                        pTrips = tripsDataMap[driverName][priorDay.dateKey];
-                    }
-
-                    dailyCashMap[priorDay.dateKey] = pCash;
-                    dailyTripMap[priorDay.dateKey] = pTrips;
-
-                    sumPriorCash = roundToTwo(sumPriorCash + pCash);
-                    sumPriorTrips += pTrips;
-                }
-
-                // The last (newest) day gets: cumulative weekly total − sum of all known prior days
-                const lastDay = activeDays[activeDays.length - 1];
-                const lastDayCash = roundToTwo(weeklyCash - sumPriorCash);
-                let lastDayTrips = Math.max(0, weeklyTrips - sumPriorTrips);
-
-                if (tripsDataMap[driverName] && tripsDataMap[driverName][lastDay.dateKey] !== undefined) {
-                    lastDayTrips = tripsDataMap[driverName][lastDay.dateKey];
-                }
-
-                dailyCashMap[lastDay.dateKey] = lastDayCash;
-                dailyTripMap[lastDay.dateKey] = lastDayTrips;
-
-                // Memorize the newest day
-                if (!memory[driverName]) memory[driverName] = {};
-                memory[driverName][lastDay.dateKey] = { cash: lastDayCash, trips: lastDayTrips };
-            }
-
-            activeDays.forEach(day => {
-                const dailyCash = dailyCashMap[day.dateKey] !== undefined ? dailyCashMap[day.dateKey] : 0;
-                const dailyTrips = dailyTripMap[day.dateKey] !== undefined ? dailyTripMap[day.dateKey] : 0;
-
-                let dailyNoShowCount = 0;
-                if (noShowMap[driverName] && noShowMap[driverName][day.dateKey]) {
-                    dailyNoShowCount = noShowMap[driverName][day.dateKey].count;
-                }
-
-                const dailyHours = (workingHoursMap[driverName] && workingHoursMap[driverName][day.dateKey]) ? workingHoursMap[driverName][day.dateKey] : 0;
-
-                outputRows.push([
-                    day.date,
-                    driverName,
-                    day.credit,
-                    dailyCash,
-                    dailyTrips,
-                    weeklyTotal,
-                    weeklyCash,
-                    dailyNoShowCount,
-                    dailyHours
-                ]);
-            });
-        });
+        const key = `${r.dateKey}_${canonDriver}`;
+        if (!consolidatedMap[key]) {
+            consolidatedMap[key] = {
+                date: r.date,
+                dateKey: r.dateKey,
+                driver: canonDriver,
+                credit: 0,
+                cash: 0,
+                tolls: 0,
+                trips: 0
+            };
+        }
+        consolidatedMap[key].credit += (r.credit || 0);
+        consolidatedMap[key].cash += (r.cash || 0);
+        consolidatedMap[key].tolls += (r.tolls || 0);
+        consolidatedMap[key].trips += (r.trips || 0);
     });
 
-    savePersistentMemory(memory);
+    const outputRows = [];
+    for (const key in consolidatedMap) {
+        const item = consolidatedMap[key];
+        const driverName = item.driver;
+        const dateKey = item.dateKey;
+
+        let credit = roundToTwo(item.credit);
+        const hasNoShow = noShowMap[driverName] && noShowMap[driverName][dateKey] !== undefined;
+        let noShowCount = 0;
+        if (hasNoShow) {
+            credit = roundToTwo(credit - noShowMap[driverName][dateKey].cash);
+            noShowCount = noShowMap[driverName][dateKey].count;
+        }
+
+        const exactTrips = (tripsDataMap[driverName] && tripsDataMap[driverName][dateKey] !== undefined)
+            ? tripsDataMap[driverName][dateKey]
+            : item.trips;
+
+        const dailyHours = (workingHoursMap[driverName] && workingHoursMap[driverName][dateKey])
+            ? workingHoursMap[driverName][dateKey]
+            : 0;
+
+        outputRows.push({
+            date: item.date,
+            dateKey: item.dateKey,
+            driver: driverName,
+            credit: credit,
+            cash: roundToTwo(item.cash),
+            tolls: roundToTwo(item.tolls),
+            trips: exactTrips,
+            hours: dailyHours,
+            noShowCount: noShowCount
+        });
+    }
 
     if (outputRows.length === 0) {
-        Logger.log("⚠️ No driver data found in Raw Data.");
+        Logger.log("⚠️ No driver records found to display in Summary.");
         return;
     }
 
     // SORT BY DATE CHRONOLOGICALLY, then by driver name
     outputRows.sort((a, b) => {
-        const dateDiff = a[0] - b[0];
+        const dateDiff = a.date.getTime() - b.date.getTime();
         if (dateDiff !== 0) return dateDiff;
-        return a[1].localeCompare(b[1]);
+        return a.driver.localeCompare(b.driver);
     });
 
-    // --- Write Summary headers ---
-    const headers = ["Date", "Driver", "Credit", "Hours", "Driver Avg/ Hour", "CPH", "Trips", "Cash", "No Show", "Balance"];
-    summarySheet.getRange(2, 1, 1, headers.length).setValues([headers]);
+    // --- Headers: 11 Columns (with Tolls in Col I = col 9) ---
+    const headers = ["Date", "Driver", "Credit", "Hours", "Driver Avg/ Hour", "CPH", "Trips", "Cash", "Tolls", "No Show", "Balance"];
+    summarySheet.getRange(2, 1, 1, headers.length).setValues([headers])
+        .setFontWeight("bold")
+        .setBackground("#3c78d8")
+        .setFontColor("white")
+        .setHorizontalAlignment("center");
 
-    // Helper to get fare as decimal
-    function getFareDecimal(driver) {
-        let fareVal = existingFares[driver];
-        if (String(fareVal).trim() === "80%-90%") return "80%-90%";
-        if (fareVal === undefined || fareVal === null || fareVal === "") return 0.9;
-        if (typeof fareVal === "string" && fareVal.includes("%")) return parseFloat(fareVal) / 100;
-        if (typeof fareVal === "number") return fareVal > 1 ? fareVal / 100 : fareVal;
-        return 0.9;
-    }
+    // Track progressive tiering for drivers on "80%-90%" (e.g. Angel)
+    const progressiveTrackers = {}; // driver -> { weekStart, weeklyFeeBase }
 
-    // Pre-cache the fare decimal for each driver to speed up loop
-    let driverFareCache = {};
-    outputRows.forEach(row => {
-        if (!driverFareCache[row[1]]) {
-            driverFareCache[row[1]] = getFareDecimal(row[1]);
-        }
-    });
-
-    // --- Build the rows to write (with date grouping / merging) ---
     const rowsToWrite = [];
     let previousDateString = "";
     let dayBlocks = [];
     let currentStartRow = 3;
     let currentGroupSize = 0;
 
-    let progressiveTrackers = {}; // { driver -> { weekStart: 0, weeklyCredit: 0 } }
-
     outputRows.forEach((row, index) => {
-        const currentDateString = row[0] ? row[0].toDateString() : "";
-        let displayDate = row[0];
+        const sheetRow = 3 + index;
+        const currentDateString = row.date ? row.date.toDateString() : "";
+        let displayDate = row.date;
 
         if (currentDateString === previousDateString) {
             displayDate = "";
             currentGroupSize++;
         } else {
             if (currentGroupSize > 0) {
-                dayBlocks.push({ row: currentStartRow, count: currentGroupSize });
+                dayBlocks.push({ row: currentStartRow, count: currentGroupSize, date: outputRows[index - 1].date });
             }
             previousDateString = currentDateString;
-            currentStartRow = 3 + index;
+            currentStartRow = sheetRow;
             currentGroupSize = 1;
         }
 
-        const fare = driverFareCache[row[1]];
-        const dailyCredit = Number(row[2]) || 0;
-        const dailyCash = Number(row[3]) || 0;
-        const trips = Number(row[4]) || 0;
-        const dailyNoShow = Number(row[7]) || 0;
-        const dailyHours = Number(row[8]) || 0;
-        const dailyCPH = dailyHours > 0 ? roundToTwo(dailyCredit / dailyHours) : 0;
+        const fare = existingFares[row.driver];
+        const isProgressive = String(fare).trim() === "80%-90%";
 
-        let dailyBalance = 0;
-        if (fare === "80%-90%") {
-            let driver = row[1];
-            let d = new Date(row[0]);
-            let weekStart = getMonday(d).getTime();
-
-            if (!progressiveTrackers[driver]) progressiveTrackers[driver] = { weekStart: 0, weeklyCredit: 0 };
-            if (progressiveTrackers[driver].weekStart !== weekStart) {
-                progressiveTrackers[driver] = { weekStart: weekStart, weeklyCredit: 0 };
+        let balanceValOrFormula = "";
+        if (isProgressive) {
+            let weekStart = getMonday(row.date).getTime();
+            if (!progressiveTrackers[row.driver]) {
+                progressiveTrackers[row.driver] = { weekStart: 0, weeklyFeeBase: 0 };
+            }
+            if (progressiveTrackers[row.driver].weekStart !== weekStart) {
+                progressiveTrackers[row.driver] = { weekStart: weekStart, weeklyFeeBase: 0 };
             }
 
+            const feeBase = Math.max(0, row.credit - row.tolls);
             let todayGrossPayout = 0;
-            if (dailyCredit > 0) {
-                let currentWeekCredit = progressiveTrackers[driver].weeklyCredit;
-                if (currentWeekCredit >= 1000) {
-                    todayGrossPayout = dailyCredit * 0.90;
-                } else if ((currentWeekCredit + dailyCredit) <= 1000) {
-                    todayGrossPayout = dailyCredit * 0.80;
+            if (feeBase > 0) {
+                const currentWeekFeeBase = progressiveTrackers[row.driver].weeklyFeeBase;
+                if (currentWeekFeeBase >= 1000) {
+                    todayGrossPayout = feeBase * 0.90;
+                } else if ((currentWeekFeeBase + feeBase) <= 1000) {
+                    todayGrossPayout = feeBase * 0.80;
                 } else {
-                    const creditAtBaseRate = 1000 - currentWeekCredit;
-                    const creditAtTopRate = dailyCredit - creditAtBaseRate;
-                    todayGrossPayout = (creditAtBaseRate * 0.80) + (creditAtTopRate * 0.90);
+                    const basePortion = 1000 - currentWeekFeeBase;
+                    const topPortion = feeBase - basePortion;
+                    todayGrossPayout = (basePortion * 0.80) + (topPortion * 0.90);
                 }
             }
-            progressiveTrackers[driver].weeklyCredit += dailyCredit;
-            dailyBalance = Number(roundToTwo(todayGrossPayout - dailyCash)) || 0;
+            progressiveTrackers[row.driver].weeklyFeeBase += feeBase;
+            balanceValOrFormula = roundToTwo(todayGrossPayout + row.tolls - row.cash);
         } else {
-            const numericFare = Number(fare) || 0.9;
-            dailyBalance = Number(roundToTwo((dailyCredit * numericFare) - dailyCash)) || 0;
+            // Formula-first: Standard fare balance formula referencing Settings sheet and Tolls
+            // Balance = (Credit - Tolls) * Fare% + Tolls - Cash
+            balanceValOrFormula = `=ROUND((C${sheetRow}-I${sheetRow})*IFERROR(VLOOKUP(B${sheetRow}, Settings!$A:$B, 2, FALSE), 0.9) + I${sheetRow} - H${sheetRow}, 2)`;
         }
 
-        const dailyDEPH = dailyHours > 0 ? roundToTwo((dailyCash + dailyBalance) / dailyHours) : 0;
+        const formulaDEPH = `=IF(D${sheetRow}>0, ROUND((H${sheetRow}+K${sheetRow})/D${sheetRow}, 2), 0)`;
+        const formulaCPH = `=IF(D${sheetRow}>0, ROUND(C${sheetRow}/D${sheetRow}, 2), 0)`;
 
-        // Summary rows: Date, Driver, Credit, Hours, Driver Avg/ Hour, CPH, Trips, Cash, No Show, Balance
         rowsToWrite.push([
             displayDate,
-            row[1],
-            dailyCredit,
-            roundToTwo(dailyHours) || 0,
-            dailyDEPH,
-            dailyCPH,
-            trips,
-            Number(roundToTwo(dailyCash)) || 0,
-            dailyNoShow,
-            dailyBalance
+            row.driver,
+            row.credit,
+            roundToTwo(row.hours) || 0,
+            formulaDEPH,
+            formulaCPH,
+            row.trips,
+            row.cash,
+            row.tolls,
+            row.noShowCount,
+            balanceValOrFormula
         ]);
     });
 
     if (currentGroupSize > 0) {
-        dayBlocks.push({ row: currentStartRow, count: currentGroupSize });
+        dayBlocks.push({ row: currentStartRow, count: currentGroupSize, date: outputRows[outputRows.length - 1].date });
     }
 
-    // --- Clear old data and write new ---
+    // --- Clear old data and write new 11-column table ---
     const maxRows = summarySheet.getMaxRows();
     if (maxRows > 2) {
         summarySheet.getRange(3, 1, maxRows - 2, headers.length).clearContent();
@@ -2191,7 +2347,17 @@ function updateSummaryAndCharts(ss) {
     dataRange.setBorder(true, true, true, true, true, true, "black", SpreadsheetApp.BorderStyle.SOLID);
     summarySheet.getRange(3, 1, rowsToWrite.length, 1).setVerticalAlignment("middle");
 
-    // --- Apply day block borders and merge date cells ---
+    // Apply number formats
+    summarySheet.getRange(3, 1, rowsToWrite.length, 1).setNumberFormat("dddd, dd");
+    summarySheet.getRange(3, 3, rowsToWrite.length, 1).setNumberFormat("$#,##0.00"); // Credit
+    summarySheet.getRange(3, 4, rowsToWrite.length, 1).setNumberFormat("0.0");       // Hours
+    summarySheet.getRange(3, 5, rowsToWrite.length, 2).setNumberFormat("$#,##0.00"); // DEPH, CPH
+    summarySheet.getRange(3, 7, rowsToWrite.length, 1).setNumberFormat("0");         // Trips
+    summarySheet.getRange(3, 8, rowsToWrite.length, 2).setNumberFormat("$#,##0.00"); // Cash, Tolls
+    summarySheet.getRange(3, 10, rowsToWrite.length, 1).setNumberFormat("0");        // No Show
+    summarySheet.getRange(3, 11, rowsToWrite.length, 1).setNumberFormat("$#,##0.00"); // Balance
+
+    // Apply day block borders and merge date cells
     dayBlocks.forEach(block => {
         summarySheet.getRange(block.row, 1, block.count, headers.length)
             .setBorder(true, null, true, null, null, null, "black", SpreadsheetApp.BorderStyle.SOLID_THICK);
@@ -2200,159 +2366,113 @@ function updateSummaryAndCharts(ss) {
         }
     });
 
-    // --- Aggregate per driver across all weeks (for the stats table) ---
-    let driverStats = {};
-    weeks.forEach(w => {
-        w.drivers.forEach(d => {
-            const driverName = getCanonicalDriverName(d.name, canonicalDrivers);
-            if (!driverStats[driverName]) {
-                driverStats[driverName] = {
-                    totalCredit: 0,
-                    totalTrips: 0,
-                    totalCash: 0,
-                    totalNoShow: 0,
-                    driverNet: 0,
-                    workingDays: 0,
-                    firstWorkDate: null
-                };
-            }
-
-            driverStats[driverName].totalCredit += d.weeklyTotal;
-            driverStats[driverName].totalTrips += d.weeklyTrips;
-            driverStats[driverName].driverNet += d.weeklyNet;
-            driverStats[driverName].totalCash += d.weeklyCash;
-
-            w.dateColumns.forEach(dc => {
-                const cred = d.dailyCredits[dc.date.getTime()] || 0;
-                if (cred > 0) {
-                    driverStats[driverName].workingDays++;
-                    if (!driverStats[driverName].firstWorkDate) {
-                        driverStats[driverName].firstWorkDate = dc.date;
-                    }
-                }
-            });
-        });
-    });
-
-    // Deduct No Show and calculate hourly/daily averages
-    for (let driverName in driverStats) {
-        const s = driverStats[driverName];
-        let totalNoShowCashForDriver = 0;
-        let totalNoShowCountForDriver = 0;
-        if (noShowMap[driverName]) {
-            Object.values(noShowMap[driverName]).forEach(val => {
-                totalNoShowCashForDriver += val.cash;
-                totalNoShowCountForDriver += val.count;
-            });
-        }
-        s.totalCredit = roundToTwo(s.totalCredit - totalNoShowCashForDriver);
-        s.totalCash = roundToTwo(s.totalCash - totalNoShowCashForDriver);
-        s.totalNoShow = totalNoShowCountForDriver;
-        s.driverNet = roundToTwo(s.driverNet);
-
-        const driverHours = driverTotalHours[driverName] || 0;
-        s.totalHours = driverHours;
-        s.avgPerHour = driverHours > 0 ? roundToTwo(s.totalCredit / driverHours) : 0;
-        s.avgPerDay = s.workingDays > 0 ? roundToTwo(s.totalCredit / s.workingDays) : 0;
-    }
-
-    // =================================================================
-    // --- AUTO-SYNC "SETTINGS" SHEET (Driver + Fare %) ---
-    // =================================================================
-    // (settingsSheet and existingFares already read above for balance calc)
-
-    // --- Aggregated stats table (column I, one gap after the 7-col main table) ---
-    const aggHeader = ["Driver", "Total Credit", "Total Trips", "Total Cash", "No Show", "Total Hours", "Avg Per Hour", "Driver NET", "Avg Per Day"];
-    const aggRows = [aggHeader];
-
+    // Auto-sync Settings sheet (keep existing fare %, default 90% for new drivers)
+    const uniqueDrivers = Array.from(new Set(rowsToWrite.map(r => r[1]).filter(Boolean))).sort();
     const newSettingsRows = [["Driver", "Fare %"]];
-
-    for (let driver in driverStats) {
-        const s = driverStats[driver];
-        aggRows.push([driver, s.totalCredit, s.totalTrips, s.totalCash, s.totalNoShow, s.totalHours, s.avgPerHour, s.driverNet, s.avgPerDay]);
-
-        let fare = existingFares[driver];
-        if (fare === undefined || fare === null || fare === "") {
-            fare = "90%";
-        }
-        newSettingsRows.push([driver, fare]);
-    }
-
-    // --- Keep inactive drivers in Settings ---
+    uniqueDrivers.forEach(d => {
+        let fare = existingFares[d];
+        if (fare === undefined || fare === null || fare === "") fare = "90%";
+        newSettingsRows.push([d, fare]);
+    });
     for (let oldDriver in existingFares) {
-        if (!driverStats[oldDriver]) {
+        if (!uniqueDrivers.includes(oldDriver)) {
             newSettingsRows.push([oldDriver, existingFares[oldDriver]]);
         }
     }
-
     settingsSheet.clear();
     settingsSheet.getRange(1, 1, newSettingsRows.length, 2).setValues(newSettingsRows);
     settingsSheet.getRange("A1:B1").setFontWeight("bold").setBackground("#d0e0e3");
     settingsSheet.autoResizeColumns(1, 2);
 
     // =================================================================
-    // --- Write aggregated stats to Summary (column L = one gap after 10-col main table) ---
+    // DRIVER STATS TABLE (Formula-First, Col M = 13 to Col V = 22)
     // =================================================================
-    const startRow = 3, startCol = 12; // Column L (A-J = 10-col main table, K = 1-col gap)
-    // Clear old aggregate area
-    try { summarySheet.getRange(startRow, 11, 60, 12).clearContent(); } catch (e) { }
+    const statsStartCol = 13; // Column M (Cols 1-11 = A-K, Col 12 = L gap)
+    const statsHeaders = ["Driver", "Total Credit", "Total Tolls", "Total Trips", "Total Cash", "No Show", "Total Hours", "Avg Per Hour", "Driver NET", "Avg Per Day"];
+    const statsRows = [statsHeaders];
 
-    const aggRange = summarySheet.getRange(startRow, startCol, aggRows.length, aggRows[0].length);
-    aggRange.setValues(aggRows);
-
-    // Decrease cell size / font size of aggregated table so chart can fully cover it
-    aggRange.setFontSize(7);
-    summarySheet.getRange(startRow, startCol, 1, aggRows[0].length).setFontWeight("bold");
-
-    // Compact column widths for columns L to T (cols 12 to 20)
-    summarySheet.setColumnWidth(startCol, 75); // Col L (Driver name)
-    for (let c = startCol + 1; c < startCol + aggRows[0].length; c++) {
-        summarySheet.setColumnWidth(c, 55); // Cols M to T (Stats)
-    }
-
-    // --- Daily stats for chart (aggregate all drivers per day) ---
-    let dailyStats = {};
-    outputRows.forEach(r => {
-        const dateVal = r[0];
-        if (!dateVal) return;
-        const dateKey = dateVal.getTime();
-        if (!dailyStats[dateKey]) {
-            dailyStats[dateKey] = { date: dateVal, credit: 0, trips: 0, cash: 0, noShow: 0, hours: 0 };
-        }
-        dailyStats[dateKey].credit += (r[2] || 0);
-        dailyStats[dateKey].trips += (r[4] || 0);
-        dailyStats[dateKey].cash += (r[3] || 0);
-        dailyStats[dateKey].noShow += (r[7] || 0); // r[7] is No Show
-        dailyStats[dateKey].hours += (dailyTotalHours[dateKey] || 0);
+    uniqueDrivers.forEach((driver, idx) => {
+        const r = 4 + idx; // Data row starts at 4 (header at 3)
+        statsRows.push([
+            driver,
+            `=SUMIF($B$3:$B, M${r}, $C$3:$C)`,
+            `=SUMIF($B$3:$B, M${r}, $I$3:$I)`,
+            `=SUMIF($B$3:$B, M${r}, $G$3:$G)`,
+            `=SUMIF($B$3:$B, M${r}, $H$3:$H)`,
+            `=SUMIF($B$3:$B, M${r}, $J$3:$J)`,
+            `=SUMIF($B$3:$B, M${r}, $D$3:$D)`,
+            `=IF(S${r}>0, ROUND(N${r}/S${r}, 2), 0)`,
+            `=ROUND(N${r}-Q${r}, 2)`,
+            `=IF(COUNTIFS($B$3:$B, M${r}, $C$3:$C, ">0")>0, ROUND(N${r}/COUNTIFS($B$3:$B, M${r}, $C$3:$C, ">0"), 2), 0)`
+        ]);
     });
 
-    const dailyRows = Object.values(dailyStats)
-        .sort((a, b) => a.date - b.date)
-        .map(d => [d.date, roundToTwo(d.credit), d.trips, roundToTwo(d.cash), d.noShow, roundToTwo(d.hours)]);
+    try { summarySheet.getRange(3, statsStartCol, 100, statsHeaders.length).clearContent(); } catch (e) { }
+    const statsRange = summarySheet.getRange(3, statsStartCol, statsRows.length, statsHeaders.length);
+    statsRange.setValues(statsRows);
+    statsRange.setFontSize(7);
+    summarySheet.getRange(3, statsStartCol, 1, statsHeaders.length).setFontWeight("bold");
 
-    const dailyHeader = ["Date", "Total Credit", "Trips", "Cash", "No Show", "Total Hours"];
-    const dailyStartCol = 23; // Column W (Daily total summary table starts at Column W)
+    // Format stats table columns
+    summarySheet.getRange(4, statsStartCol + 1, uniqueDrivers.length, 2).setNumberFormat("$#,##0.00"); // Credit, Tolls
+    summarySheet.getRange(4, statsStartCol + 3, uniqueDrivers.length, 1).setNumberFormat("0");         // Trips
+    summarySheet.getRange(4, statsStartCol + 4, uniqueDrivers.length, 1).setNumberFormat("$#,##0.00"); // Cash
+    summarySheet.getRange(4, statsStartCol + 5, uniqueDrivers.length, 1).setNumberFormat("0");         // No Show
+    summarySheet.getRange(4, statsStartCol + 6, uniqueDrivers.length, 1).setNumberFormat("0.0");       // Total Hours
+    summarySheet.getRange(4, statsStartCol + 7, uniqueDrivers.length, 3).setNumberFormat("$#,##0.00"); // Avg Per Hour, NET, Avg Per Day
 
-    // Clear old daily table and chart area starting from Column T (col 20)
-    summarySheet.getRange(2, 20, 100, 25).clearContent();
-    summarySheet.getRange(2, dailyStartCol, 1, dailyHeader.length).setValues([dailyHeader]).setFontWeight("bold");
-
-    if (dailyRows.length > 0) {
-        summarySheet.getRange(3, dailyStartCol, dailyRows.length, dailyRows[0].length).setValues(dailyRows);
-        summarySheet.getRange(3, dailyStartCol, dailyRows.length, 1).setNumberFormat("dddd, dd");
+    summarySheet.setColumnWidth(statsStartCol, 75); // Col M (Driver)
+    for (let c = statsStartCol + 1; c < statsStartCol + statsHeaders.length; c++) {
+        summarySheet.setColumnWidth(c, 55);
     }
 
-    // --- Charts ---
+    // =================================================================
+    // DAILY SUMMARY TABLE (Formula-First, Col X = 24 to Col AD = 30)
+    // =================================================================
+    const dailyStartCol = 24; // Column X (Col 23 = W gap)
+    const dailyHeaders = ["Date", "Total Credit", "Tolls", "Trips", "Cash", "No Show", "Total Hours"];
+    const dailyTableRows = [];
+
+    dayBlocks.forEach(block => {
+        const startR = block.row;
+        const endR = block.row + block.count - 1;
+        dailyTableRows.push([
+            block.date,
+            `=SUM(C${startR}:C${endR})`,
+            `=SUM(I${startR}:I${endR})`,
+            `=SUM(G${startR}:G${endR})`,
+            `=SUM(H${startR}:H${endR})`,
+            `=SUM(J${startR}:J${endR})`,
+            `=SUM(D${startR}:D${endR})`
+        ]);
+    });
+
+    try { summarySheet.getRange(2, dailyStartCol, 100, dailyHeaders.length).clearContent(); } catch (e) { }
+    summarySheet.getRange(2, dailyStartCol, 1, dailyHeaders.length).setValues([dailyHeaders]).setFontWeight("bold");
+
+    if (dailyTableRows.length > 0) {
+        summarySheet.getRange(3, dailyStartCol, dailyTableRows.length, dailyHeaders.length).setValues(dailyTableRows);
+        summarySheet.getRange(3, dailyStartCol, dailyTableRows.length, 1).setNumberFormat("dddd, dd");
+        summarySheet.getRange(3, dailyStartCol + 1, dailyTableRows.length, 2).setNumberFormat("$#,##0.00"); // Credit, Tolls
+        summarySheet.getRange(3, dailyStartCol + 3, dailyTableRows.length, 1).setNumberFormat("0");         // Trips
+        summarySheet.getRange(3, dailyStartCol + 4, dailyTableRows.length, 1).setNumberFormat("$#,##0.00"); // Cash
+        summarySheet.getRange(3, dailyStartCol + 5, dailyTableRows.length, 1).setNumberFormat("0");         // No Show
+        summarySheet.getRange(3, dailyStartCol + 6, dailyTableRows.length, 1).setNumberFormat("0.0");       // Hours
+    }
+
+    // =================================================================
+    // CHARTS
+    // =================================================================
     const allCharts = summarySheet.getCharts();
     allCharts.forEach(c => summarySheet.removeChart(c));
 
-    // Chart 1: Daily Total Credit Trend (line) — positioned NEXT TO the daily credit table (Col AD = 30)
-    if (dailyRows.length > 0) {
-        const dailyChartCol = dailyStartCol + 7; // Col 30 (AD)
-        let dailyChart = summarySheet.newChart()
+    // Chart 1: Daily Total Credit Trend (line) — Col 32 (AF, gap at Col 31 = AE)
+    if (dailyTableRows.length > 0) {
+        const dailyChartCol = dailyStartCol + 8; // Col 32 (AF)
+        const dailyChart = summarySheet.newChart()
             .setChartType(Charts.ChartType.LINE)
-            .addRange(summarySheet.getRange(3, dailyStartCol, dailyRows.length, 1))
-            .addRange(summarySheet.getRange(3, dailyStartCol + 1, dailyRows.length, 1))
+            .addRange(summarySheet.getRange(3, dailyStartCol, dailyTableRows.length, 1))
+            .addRange(summarySheet.getRange(3, dailyStartCol + 1, dailyTableRows.length, 1))
             .setOption("title", "Daily Total Credit Trend")
             .setOption("titleTextStyle", { bold: true, fontSize: 24 })
             .setOption("vAxis", { title: "Total Credit" })
@@ -2367,80 +2487,82 @@ function updateSummaryAndCharts(ss) {
         summarySheet.insertChart(dailyChart);
     }
 
-    const lastRow = startRow + aggRows.length - 1;
-    const dataStart = startRow + 1;
-    // Build column letters from startCol (11 = K) for chart ranges
-    const colF = getColumnLetter(startCol);         // K (Driver)
-    const colG = getColumnLetter(startCol + 1);     // L (Total Credit)
-    const colH = getColumnLetter(startCol + 2);     // M (Total Trips)
-    const colNoShow = getColumnLetter(startCol + 4); // O (No Show)
-    const colHours = getColumnLetter(startCol + 5);  // P (Total Hours)
-    const colK = getColumnLetter(startCol + 8);     // S (Avg Per Day)
+    // Driver stats charts (stacked over Driver Stats table at startCol = 13 = Col M)
+    const statsDataStart = 4;
+    const statsLastRow = 3 + uniqueDrivers.length;
+    const colDriver = "M";
+    const colCredit = "N";
+    const colTrips = "P";
+    const colNoShow = "R";
+    const colHours = "S";
+    const colAvgPerDay = "V";
 
-    // Chart 2: Total Credit by Driver (bar) — POSITIONED AT ROW 3, COL J TO FULLY COVER AGGREGATED STATS TABLE
-    let chart1 = summarySheet.newChart().setChartType(Charts.ChartType.COLUMN)
-        .addRange(summarySheet.getRange(colF + dataStart + ":" + colF + lastRow))
-        .addRange(summarySheet.getRange(colG + dataStart + ":" + colG + lastRow))
-        .setOption("title", "Total Credit by Driver")
-        .setOption("titleTextStyle", { bold: true, fontSize: 24 })
-        .setOption("colors", ["#1f77b4"]).setOption("legend", { position: "none" })
-        .setOption("vAxis", { title: "Credit" })
-        .setOption("width", 740)
-        .setOption("height", 450)
-        .setPosition(3, startCol, 0, 0).build();
-    summarySheet.insertChart(chart1);
+    if (uniqueDrivers.length > 0) {
+        // Chart 2: Total Credit by Driver (Column)
+        const chartCredit = summarySheet.newChart().setChartType(Charts.ChartType.COLUMN)
+            .addRange(summarySheet.getRange(`${colDriver}${statsDataStart}:${colDriver}${statsLastRow}`))
+            .addRange(summarySheet.getRange(`${colCredit}${statsDataStart}:${colCredit}${statsLastRow}`))
+            .setOption("title", "Total Credit by Driver")
+            .setOption("titleTextStyle", { bold: true, fontSize: 24 })
+            .setOption("colors", ["#1f77b4"]).setOption("legend", { position: "none" })
+            .setOption("vAxis", { title: "Credit" })
+            .setOption("width", 740)
+            .setOption("height", 450)
+            .setPosition(3, statsStartCol, 0, 0).build();
+        summarySheet.insertChart(chartCredit);
 
-    // Chart 3: Total Trips by Driver (bar) — Stacked below Chart 1
-    let chart2 = summarySheet.newChart().setChartType(Charts.ChartType.COLUMN)
-        .addRange(summarySheet.getRange(colF + dataStart + ":" + colF + lastRow))
-        .addRange(summarySheet.getRange(colH + dataStart + ":" + colH + lastRow))
-        .setOption("title", "Total Trips by Driver")
-        .setOption("titleTextStyle", { bold: true, fontSize: 24 })
-        .setOption("colors", ["#8c564b"]).setOption("legend", { position: "none" })
-        .setOption("vAxis", { title: "Trips" })
-        .setOption("width", 740)
-        .setOption("height", 450)
-        .setPosition(26, startCol, 0, 0).build();
-    summarySheet.insertChart(chart2);
+        // Chart 3: Total Trips by Driver
+        const chartTrips = summarySheet.newChart().setChartType(Charts.ChartType.COLUMN)
+            .addRange(summarySheet.getRange(`${colDriver}${statsDataStart}:${colDriver}${statsLastRow}`))
+            .addRange(summarySheet.getRange(`${colTrips}${statsDataStart}:${colTrips}${statsLastRow}`))
+            .setOption("title", "Total Trips by Driver")
+            .setOption("titleTextStyle", { bold: true, fontSize: 24 })
+            .setOption("colors", ["#8c564b"]).setOption("legend", { position: "none" })
+            .setOption("vAxis", { title: "Trips" })
+            .setOption("width", 740)
+            .setOption("height", 450)
+            .setPosition(26, statsStartCol, 0, 0).build();
+        summarySheet.insertChart(chartTrips);
 
-    // Chart 4: No Show by Driver (bar) — Stacked below Chart 2
-    let chartNoShow = summarySheet.newChart().setChartType(Charts.ChartType.COLUMN)
-        .addRange(summarySheet.getRange(colF + dataStart + ":" + colF + lastRow))
-        .addRange(summarySheet.getRange(colNoShow + dataStart + ":" + colNoShow + lastRow))
-        .setOption("title", "No Show Trips by Driver")
-        .setOption("titleTextStyle", { bold: true, fontSize: 24 })
-        .setOption("colors", ["#2ca02c"]).setOption("legend", { position: "none" })
-        .setOption("vAxis", { title: "No Show Trips" })
-        .setOption("width", 740)
-        .setOption("height", 450)
-        .setPosition(49, startCol, 0, 0).build();
-    summarySheet.insertChart(chartNoShow);
+        // Chart 4: No Show by Driver
+        const chartNoShow = summarySheet.newChart().setChartType(Charts.ChartType.COLUMN)
+            .addRange(summarySheet.getRange(`${colDriver}${statsDataStart}:${colDriver}${statsLastRow}`))
+            .addRange(summarySheet.getRange(`${colNoShow}${statsDataStart}:${colNoShow}${statsLastRow}`))
+            .setOption("title", "No Show Trips by Driver")
+            .setOption("titleTextStyle", { bold: true, fontSize: 24 })
+            .setOption("colors", ["#2ca02c"]).setOption("legend", { position: "none" })
+            .setOption("vAxis", { title: "No Show Trips" })
+            .setOption("width", 740)
+            .setOption("height", 450)
+            .setPosition(49, statsStartCol, 0, 0).build();
+        summarySheet.insertChart(chartNoShow);
 
-    // Chart 5: Total Working Hours by Driver (bar) — Stacked below Chart 3
-    let chartHours = summarySheet.newChart().setChartType(Charts.ChartType.COLUMN)
-        .addRange(summarySheet.getRange(colF + dataStart + ":" + colF + lastRow))
-        .addRange(summarySheet.getRange(colHours + dataStart + ":" + colHours + lastRow))
-        .setOption("title", "Total Working Hours by Driver")
-        .setOption("titleTextStyle", { bold: true, fontSize: 24 })
-        .setOption("colors", ["#ff7f0e"]).setOption("legend", { position: "none" })
-        .setOption("vAxis", { title: "Hours" })
-        .setOption("width", 740)
-        .setOption("height", 450)
-        .setPosition(72, startCol, 0, 0).build();
-    summarySheet.insertChart(chartHours);
+        // Chart 5: Total Working Hours by Driver
+        const chartHours = summarySheet.newChart().setChartType(Charts.ChartType.COLUMN)
+            .addRange(summarySheet.getRange(`${colDriver}${statsDataStart}:${colDriver}${statsLastRow}`))
+            .addRange(summarySheet.getRange(`${colHours}${statsDataStart}:${colHours}${statsLastRow}`))
+            .setOption("title", "Total Working Hours by Driver")
+            .setOption("titleTextStyle", { bold: true, fontSize: 24 })
+            .setOption("colors", ["#ff7f0e"]).setOption("legend", { position: "none" })
+            .setOption("vAxis", { title: "Hours" })
+            .setOption("width", 740)
+            .setOption("height", 450)
+            .setPosition(72, statsStartCol, 0, 0).build();
+        summarySheet.insertChart(chartHours);
 
-    // Chart 6: Average Per Day by Driver (bar) — Stacked below Chart 4
-    let chart3 = summarySheet.newChart().setChartType(Charts.ChartType.COLUMN)
-        .addRange(summarySheet.getRange(colF + dataStart + ":" + colF + lastRow))
-        .addRange(summarySheet.getRange(colK + dataStart + ":" + colK + lastRow))
-        .setOption("title", "Average Credit Per Day")
-        .setOption("titleTextStyle", { bold: true, fontSize: 24 })
-        .setOption("colors", ["#d62728"]).setOption("legend", { position: "none" })
-        .setOption("vAxis", { title: "Daily Credit" })
-        .setOption("width", 740)
-        .setOption("height", 450)
-        .setPosition(95, startCol, 0, 0).build();
-    summarySheet.insertChart(chart3);
+        // Chart 6: Average Per Day by Driver
+        const chartAvgDay = summarySheet.newChart().setChartType(Charts.ChartType.COLUMN)
+            .addRange(summarySheet.getRange(`${colDriver}${statsDataStart}:${colDriver}${statsLastRow}`))
+            .addRange(summarySheet.getRange(`${colAvgPerDay}${statsDataStart}:${colAvgPerDay}${statsLastRow}`))
+            .setOption("title", "Average Credit Per Day")
+            .setOption("titleTextStyle", { bold: true, fontSize: 24 })
+            .setOption("colors", ["#d62728"]).setOption("legend", { position: "none" })
+            .setOption("vAxis", { title: "Daily Credit" })
+            .setOption("width", 740)
+            .setOption("height", 450)
+            .setPosition(95, statsStartCol, 0, 0).build();
+        summarySheet.insertChart(chartAvgDay);
+    }
 }
 
 
@@ -2599,7 +2721,7 @@ function getSpreadsheetMonthAndYear(ss, allRows) {
 // =================================================================
 // WEEKLY SUMMARY — Generates weekly performance breakdown
 // =================================================================
-function generateWeeklySummary(ss) {
+function generateWeeklySummary(ss, dailyData) {
     const summarySheet = ss.getSheetByName("Summary");
     if (!summarySheet) {
         Logger.log("generateWeeklySummary: Summary sheet not found.");
@@ -2642,11 +2764,12 @@ function generateWeeklySummary(ss) {
     const lastRowCurrent = summarySheet.getLastRow();
     let allRows = [];
     if (lastRowCurrent >= 3) {
-        const summaryHeaders = summarySheet.getRange(2, 1, 1, Math.min(summarySheet.getLastColumn(), 10)).getDisplayValues()[0];
+        const summaryHeaders = summarySheet.getRange(2, 1, 1, Math.min(summarySheet.getLastColumn(), 12)).getDisplayValues()[0];
         const curCreditCol = findMainSummaryCol(summaryHeaders, ['credit'], 2);
         const curTripsCol = findMainSummaryCol(summaryHeaders, ['trips', 'trip'], 6);
         const curCashCol = findMainSummaryCol(summaryHeaders, ['cash'], 7);
-        const maxCol = Math.max(curCreditCol, curTripsCol, curCashCol) + 1;
+        const curTollsCol = findMainSummaryCol(summaryHeaders, ['tolls', 'toll'], 8);
+        const maxCol = Math.max(curCreditCol, curTripsCol, curCashCol, curTollsCol) + 1;
 
         const rawRows = summarySheet.getRange(3, 1, lastRowCurrent - 2, maxCol).getValues();
         let lastSeenDate = null;
@@ -2657,6 +2780,7 @@ function generateWeeklySummary(ss) {
                 r[0],
                 r[1],
                 parseNumber(r[curCreditCol]) || 0,
+                parseNumber(r[curTollsCol]) || 0,
                 parseNumber(r[curTripsCol]) || 0,
                 parseNumber(r[curCashCol]) || 0
             ];
@@ -2692,11 +2816,12 @@ function generateWeeklySummary(ss) {
                 const prevSpreadsheet = SpreadsheetApp.openById(prevFile.getId());
                 const prevSummarySheet = prevSpreadsheet.getSheetByName("Summary");
                 if (prevSummarySheet && prevSummarySheet.getLastRow() >= 3) {
-                    const prevHeaders = prevSummarySheet.getRange(2, 1, 1, Math.min(prevSummarySheet.getLastColumn(), 10)).getDisplayValues()[0];
+                    const prevHeaders = prevSummarySheet.getRange(2, 1, 1, Math.min(prevSummarySheet.getLastColumn(), 12)).getDisplayValues()[0];
                     const prevCreditCol = findMainSummaryCol(prevHeaders, ['credit'], 2);
                     const prevTripsCol = findMainSummaryCol(prevHeaders, ['trips', 'trip'], 6);
                     const prevCashCol = findMainSummaryCol(prevHeaders, ['cash'], 7);
-                    const prevMaxCol = Math.max(prevCreditCol, prevTripsCol, prevCashCol) + 1;
+                    const prevTollsCol = findMainSummaryCol(prevHeaders, ['tolls', 'toll'], -1);
+                    const prevMaxCol = Math.max(prevCreditCol, prevTripsCol, prevCashCol, prevTollsCol >= 0 ? prevTollsCol : 0) + 1;
                     const prevAllData = prevSummarySheet.getRange(3, 1, prevSummarySheet.getLastRow() - 2, prevMaxCol).getValues();
 
                     const currentDrivers = Array.from(new Set(allRows.map(r => r[1]).filter(n => n)));
@@ -2713,6 +2838,7 @@ function generateWeeklySummary(ss) {
                             row[0],
                             mappedDriver,
                             parseNumber(row[prevCreditCol]) || 0,
+                            prevTollsCol >= 0 ? (parseNumber(row[prevTollsCol]) || 0) : 0,
                             parseNumber(row[prevTripsCol]) || 0,
                             parseNumber(row[prevCashCol]) || 0
                         ];
@@ -2746,7 +2872,7 @@ function generateWeeklySummary(ss) {
 
     // --- Process Data ---
     const weeklyData = {};
-    const dateIdx = 0, driverIdx = 1, creditIdx = 2, tripsIdx = 3, cashIdx = 4;
+    const dateIdx = 0, driverIdx = 1, creditIdx = 2, tollsIdx = 3, tripsIdx = 4, cashIdx = 5;
 
     allRows.forEach((row) => {
         if (!Array.isArray(row) || !row[dateIdx] || !row[driverIdx]) return;
@@ -2755,6 +2881,7 @@ function generateWeeklySummary(ss) {
 
         const driver = row[driverIdx];
         const credit = parseNumber(row[creditIdx]) || 0;
+        const tolls = parseNumber(row[tollsIdx]) || 0;
         const trips = parseNumber(row[tripsIdx]) || 0;
         const cash = parseNumber(row[cashIdx]) || 0;
 
@@ -2774,10 +2901,11 @@ function generateWeeklySummary(ss) {
             };
         }
         if (!weeklyData[weekKey].drivers[driver]) {
-            weeklyData[weekKey].drivers[driver] = { credit: 0, trips: 0, cash: 0, hours: 0 };
+            weeklyData[weekKey].drivers[driver] = { credit: 0, tolls: 0, trips: 0, cash: 0, hours: 0 };
         }
 
         weeklyData[weekKey].drivers[driver].credit += credit;
+        weeklyData[weekKey].drivers[driver].tolls += tolls;
         weeklyData[weekKey].drivers[driver].trips += trips;
         weeklyData[weekKey].drivers[driver].cash += cash;
         weeklyData[weekKey].drivers[driver].hours += dayHours;
@@ -2803,7 +2931,7 @@ function generateWeeklySummary(ss) {
             displayedWeekCounter++;
             const startRow = currentRow;
 
-            const titleRange = weeklySheet.getRange(currentRow, 1, 1, 7).merge();
+            const titleRange = weeklySheet.getRange(currentRow, 1, 1, 8).merge();
             titleRange.setValue(`WEEK ${displayedWeekCounter} (${weekKey})`)
                 .setFontWeight("bold")
                 .setFontSize(11)
@@ -2811,8 +2939,8 @@ function generateWeeklySummary(ss) {
 
             currentRow++;
 
-            const headerRange = weeklySheet.getRange(currentRow, 1, 1, 7);
-            headerRange.setValues([["Driver", "Total Credit", "Trips", "Total Cash", "Total Hours", "Avg Per Hour", "Balance"]])
+            const headerRange = weeklySheet.getRange(currentRow, 1, 1, 8);
+            headerRange.setValues([["Driver", "Total Credit", "Tolls", "Trips", "Total Cash", "Total Hours", "Avg Per Hour", "Balance"]])
                 .setFontWeight("bold")
                 .setBackground("#3c78d8")
                 .setFontColor("white")
@@ -2820,76 +2948,79 @@ function generateWeeklySummary(ss) {
 
             currentRow++;
 
-            const drivers = Object.keys(weekBlock.drivers);
+            const drivers = Object.keys(weekBlock.drivers).sort();
             const tableData = [];
 
-            drivers.forEach(d => {
+            drivers.forEach((d, dIdx) => {
                 const info = weekBlock.drivers[d];
-                const cash = info.cash;
+                const r = currentRow + dIdx;
                 const fare = driverFareMap[d] !== undefined ? driverFareMap[d] : 0.9;
 
-                let grossPayout = 0;
+                const formulaAvgPerHour = `=IF(F${r}>0, ROUND(B${r}/F${r}, 2), 0)`;
+                let formulaBalance = "";
                 if (fare === "80%-90%") {
-                    if (info.credit <= 1000) {
-                        grossPayout = info.credit * 0.80;
-                    } else {
-                        grossPayout = (1000 * 0.80) + ((info.credit - 1000) * 0.90);
-                    }
+                    formulaBalance = `=ROUND(IF((B${r}-C${r})<=1000, (B${r}-C${r})*0.8, 800 + (B${r}-C${r}-1000)*0.9) + C${r} - E${r}, 2)`;
                 } else {
-                    const numericFare = Number(fare) || 0.9;
-                    grossPayout = info.credit * numericFare;
+                    formulaBalance = `=ROUND((B${r}-C${r})*IFERROR(VLOOKUP(A${r}, Settings!$A:$B, 2, FALSE), 0.9) + C${r} - E${r}, 2)`;
                 }
 
-                const balance = roundToTwo(grossPayout - cash);
-                const avgPerHour = info.hours > 0 ? roundToTwo(info.credit / info.hours) : 0;
-                tableData.push([d, info.credit, info.trips, cash, roundToTwo(info.hours), avgPerHour, balance]);
+                tableData.push([
+                    d,
+                    roundToTwo(info.credit),
+                    roundToTwo(info.tolls),
+                    info.trips,
+                    roundToTwo(info.cash),
+                    roundToTwo(info.hours),
+                    formulaAvgPerHour,
+                    formulaBalance
+                ]);
             });
 
             if (tableData.length > 0) {
                 // Write Main Table
-                const dataRange = weeklySheet.getRange(currentRow, 1, tableData.length, 7);
+                const dataRange = weeklySheet.getRange(currentRow, 1, tableData.length, 8);
                 dataRange.setValues(tableData);
                 dataRange.setBorder(true, true, true, true, true, true, "black", SpreadsheetApp.BorderStyle.SOLID);
 
-                weeklySheet.getRange(currentRow, 2, tableData.length, 1).setNumberFormat("$#,##0.00");
-                weeklySheet.getRange(currentRow, 4, tableData.length, 1).setNumberFormat("$#,##0.00");
-                weeklySheet.getRange(currentRow, 5, tableData.length, 1).setNumberFormat("0.0");
-                weeklySheet.getRange(currentRow, 6, tableData.length, 2).setNumberFormat("$#,##0.00");
+                weeklySheet.getRange(currentRow, 2, tableData.length, 2).setNumberFormat("$#,##0.00"); // Credit, Tolls
+                weeklySheet.getRange(currentRow, 4, tableData.length, 1).setNumberFormat("0");         // Trips
+                weeklySheet.getRange(currentRow, 5, tableData.length, 1).setNumberFormat("$#,##0.00"); // Cash
+                weeklySheet.getRange(currentRow, 6, tableData.length, 1).setNumberFormat("0.0");       // Hours
+                weeklySheet.getRange(currentRow, 7, tableData.length, 2).setNumberFormat("$#,##0.00"); // Avg Per Hour, Balance
 
-                const totalCredit = tableData.reduce((a, b) => a + b[1], 0);
-                const totalTrips = tableData.reduce((a, b) => a + b[2], 0);
-                const totalCash = tableData.reduce((a, b) => a + b[3], 0);
-                const totalHours = tableData.reduce((a, b) => a + b[4], 0);
-                const totalAvgPerHour = totalHours > 0 ? roundToTwo(totalCredit / totalHours) : 0;
-                const totalBalance = tableData.reduce((a, b) => a + b[6], 0);
+                const startR = currentRow;
+                const endR = currentRow + tableData.length - 1;
+                const totR = endR + 1;
 
                 const totalRow = [
                     "Total",
-                    roundToTwo(totalCredit),
-                    totalTrips,
-                    roundToTwo(totalCash),
-                    roundToTwo(totalHours),
-                    totalAvgPerHour,
-                    roundToTwo(totalBalance)
+                    `=SUM(B${startR}:B${endR})`,
+                    `=SUM(C${startR}:C${endR})`,
+                    `=SUM(D${startR}:D${endR})`,
+                    `=SUM(E${startR}:E${endR})`,
+                    `=SUM(F${startR}:F${endR})`,
+                    `=IF(F${totR}>0, ROUND(B${totR}/F${totR}, 2), 0)`,
+                    `=SUM(H${startR}:H${endR})`
                 ];
 
-                const totalRange = weeklySheet.getRange(currentRow + tableData.length, 1, 1, 7);
+                const totalRange = weeklySheet.getRange(totR, 1, 1, 8);
                 totalRange.setValues([totalRow])
                     .setFontWeight("bold")
                     .setBackground("#eeeeee")
                     .setBorder(true, true, true, true, true, true);
 
-                weeklySheet.getRange(currentRow + tableData.length, 2, 1, 1).setNumberFormat("$#,##0.00");
-                weeklySheet.getRange(currentRow + tableData.length, 4, 1, 1).setNumberFormat("$#,##0.00");
-                weeklySheet.getRange(currentRow + tableData.length, 5, 1, 1).setNumberFormat("0.0");
-                weeklySheet.getRange(currentRow + tableData.length, 6, 1, 2).setNumberFormat("$#,##0.00");
+                weeklySheet.getRange(totR, 2, 1, 2).setNumberFormat("$#,##0.00");
+                weeklySheet.getRange(totR, 4, 1, 1).setNumberFormat("0");
+                weeklySheet.getRange(totR, 5, 1, 1).setNumberFormat("$#,##0.00");
+                weeklySheet.getRange(totR, 6, 1, 1).setNumberFormat("0.0");
+                weeklySheet.getRange(totR, 7, 1, 2).setNumberFormat("$#,##0.00");
 
-                const tableEnd = currentRow + tableData.length;
+                const tableEnd = totR;
 
-                // Chart 1: Total Credit by Driver (Col I = col 9, width 480px, height 310px)
+                // Chart 1: Total Credit by Driver (Col J = col 10, width 480px, height 310px)
                 try {
                     const chart1 = weeklySheet.newChart().asColumnChart()
-                        .setPosition(startRow - 1, 9, 0, 0)
+                        .setPosition(startRow - 1, 10, 0, 0)
                         .addRange(weeklySheet.getRange(currentRow - 1, 1, tableData.length + 1, 2))
                         .setNumHeaders(1)
                         .setOption("title", `WEEK ${displayedWeekCounter} - Total Credit`)
@@ -2905,15 +3036,15 @@ function generateWeeklySummary(ss) {
                     Logger.log("Error inserting Chart 1 for week " + displayedWeekCounter + ": " + eChart1);
                 }
 
-                // Chart 2: Trips by Driver (Col N = col 14, width 480px, height 310px)
+                // Chart 2: Trips by Driver (Col O = col 15, width 480px, height 310px)
                 try {
                     const chart2 = weeklySheet.newChart().asColumnChart()
-                        .setPosition(startRow - 1, 14, 0, 0)
+                        .setPosition(startRow - 1, 15, 0, 0)
                         .addRange(weeklySheet.getRange(currentRow - 1, 1, tableData.length + 1, 1)) // Driver Names
-                        .addRange(weeklySheet.getRange(currentRow - 1, 3, tableData.length + 1, 1)) // Trips
+                        .addRange(weeklySheet.getRange(currentRow - 1, 4, tableData.length + 1, 1)) // Trips
                         .setNumHeaders(1)
                         .setOption("title", `WEEK ${displayedWeekCounter} - Trips`)
-                        .setOption("colors", ["#8c564b"]) // Distinct brown color
+                        .setOption("colors", ["#8c564b"])
                         .setOption("legend", { position: "none" })
                         .setOption("hAxis", { title: "Driver" })
                         .setOption("vAxis", { title: "Trips" })
@@ -2931,14 +3062,14 @@ function generateWeeklySummary(ss) {
     });
 
     if (displayedWeekCounter === 0) {
-        weeklySheet.getRange("A3:G3").merge()
+        weeklySheet.getRange("A3:H3").merge()
             .setValue("No weekly data available yet for this month.")
             .setFontStyle("italic")
             .setHorizontalAlignment("center")
             .setBackground("#f9f9f9");
     } else {
-        weeklySheet.autoResizeColumns(1, 7);
-        for (let col = 1; col <= 7; col++) {
+        weeklySheet.autoResizeColumns(1, 8);
+        for (let col = 1; col <= 8; col++) {
             weeklySheet.setColumnWidth(col, Math.max(weeklySheet.getColumnWidth(col) + 15, 110));
         }
     }
@@ -2952,7 +3083,7 @@ function generateWeeklySummary(ss) {
  * Creates the "Bonus" sheet with professional styling.
  * Uses Summary sheet data (which is now built from Raw Data).
  */
-function generateBonusReport(ss) {
+function generateBonusReport(ss, dailyData) {
     Logger.log("--- Starting generateBonusReport (Styled) ---");
 
     const summarySheet = ss.getSheetByName("Summary");
@@ -3147,21 +3278,22 @@ function generateBonusReport(ss) {
 
         bonusSheet.getRange(2, 2, allQualifiedDrivers.length, 1).setNumberFormat("$#,##0");
 
-        const totalBonusCredit = allQualifiedDrivers.reduce((sum, row) => sum + row[1], 0);
-        const halfPercentBonus = totalBonusCredit * 0.005;
         const totalRow = bonusSheet.getLastRow() + 2;
-
+        const lastDataRow = totalRow - 2;
         const totalsBlock = bonusSheet.getRange(totalRow, 1, 2, 2);
 
         bonusSheet.getRange(totalRow, 1, 2, 1).setValues([["Grand Total"], ["0.5% Bonus"]]);
-        bonusSheet.getRange(totalRow, 2, 2, 1).setValues([[totalBonusCredit], [halfPercentBonus]]);
+        bonusSheet.getRange(totalRow, 2, 2, 1).setValues([
+            [`=SUM(B2:B${lastDataRow})`],
+            [`=ROUND(B${totalRow}*0.005, 2)`]
+        ]);
 
         totalsBlock.setFontWeight("bold")
             .setBackground("#cfe2f3")
             .setBorder(true, true, true, true, true, true, "black", SpreadsheetApp.BorderStyle.SOLID_MEDIUM)
             .setHorizontalAlignment("center");
 
-        bonusSheet.getRange(totalRow, 2, 2, 1).setNumberFormat("$#,##0");
+        bonusSheet.getRange(totalRow, 2, 2, 1).setNumberFormat("$#,##0.00");
 
     } else {
         bonusSheet.getRange("A2:C2").merge()
@@ -3268,7 +3400,7 @@ function parseDDMMYY(value, activeMonthNum) {
 // =================================================================
 // ANGEL'S PROGRESSIVE REPORT
 // =================================================================
-function generateAngelReport(ss) {
+function generateAngelReport(ss, dailyData) {
     if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
     const summarySheet = ss.getSheetByName("Summary");
     const targetDriver = "Angel";
@@ -3297,11 +3429,13 @@ function generateAngelReport(ss) {
         if (driverName.toLowerCase().includes(targetDriver.toLowerCase()) && d) {
             let dateKey = d.toDateString();
             const cIdx = colIndices ? colIndices.credit : 2;
-            const tIdx = colIndices ? colIndices.trips : 5;
-            const caIdx = colIndices ? colIndices.cash : 6;
-            const nsIdx = colIndices ? colIndices.noShow : 7;
+            const tollsIdx = colIndices ? colIndices.tolls : 8;
+            const tIdx = colIndices ? colIndices.trips : 6;
+            const caIdx = colIndices ? colIndices.cash : 7;
+            const nsIdx = colIndices ? colIndices.noShow : 9;
             angelDataMap[dateKey] = {
                 credit: parseNumber(row[cIdx]) || 0,
+                tolls: (tollsIdx >= 0) ? (parseNumber(row[tollsIdx]) || 0) : 0,
                 trips: parseNumber(row[tIdx]) || 0,
                 cash: parseNumber(row[caIdx]) || 0,
                 noShow: parseNumber(row[nsIdx]) || 0
@@ -3330,14 +3464,15 @@ function generateAngelReport(ss) {
                 const prevSummarySheet = prevSpreadsheet.getSheetByName("Summary");
 
                 if (prevSummarySheet && prevSummarySheet.getLastRow() >= 3) {
-                    const prevHeaders = prevSummarySheet.getRange(2, 1, 1, Math.min(prevSummarySheet.getLastColumn(), 10)).getDisplayValues()[0];
+                    const prevHeaders = prevSummarySheet.getRange(2, 1, 1, Math.min(prevSummarySheet.getLastColumn(), 12)).getDisplayValues()[0];
                     const prevIndices = {
                         credit: findMainSummaryCol(prevHeaders, ['credit'], 2),
+                        tolls: findMainSummaryCol(prevHeaders, ['tolls', 'toll'], -1),
                         trips: findMainSummaryCol(prevHeaders, ['trips', 'trip'], 6),
                         cash: findMainSummaryCol(prevHeaders, ['cash'], 7),
                         noShow: findMainSummaryCol(prevHeaders, ['no show', 'noshow'], 8)
                     };
-                    const prevData = prevSummarySheet.getRange(3, 1, prevSummarySheet.getLastRow() - 2, 11).getValues();
+                    const prevData = prevSummarySheet.getRange(3, 1, prevSummarySheet.getLastRow() - 2, 12).getValues();
 
                     let prevLastSeenDate = null;
                     prevData.forEach(row => {
@@ -3357,12 +3492,13 @@ function generateAngelReport(ss) {
 
     // 4. --- Fetch Current Month Data ---
     if (lastRow >= 3) {
-        const curHeaders = summarySheet.getRange(2, 1, 1, Math.min(summarySheet.getLastColumn(), 10)).getDisplayValues()[0];
+        const curHeaders = summarySheet.getRange(2, 1, 1, Math.min(summarySheet.getLastColumn(), 12)).getDisplayValues()[0];
         const curIndices = {
             credit: findMainSummaryCol(curHeaders, ['credit'], 2),
+            tolls: findMainSummaryCol(curHeaders, ['tolls', 'toll'], 8),
             trips: findMainSummaryCol(curHeaders, ['trips', 'trip'], 6),
             cash: findMainSummaryCol(curHeaders, ['cash'], 7),
-            noShow: findMainSummaryCol(curHeaders, ['no show', 'noshow'], 8)
+            noShow: findMainSummaryCol(curHeaders, ['no show', 'noshow'], 9)
         };
         const currentData = summarySheet.getRange(3, 1, lastRow - 2, 11).getValues();
 
@@ -3386,10 +3522,10 @@ function generateAngelReport(ss) {
     let chartDataRows = [];
     let weekCounter = 1;
 
-    let weeklyCredit = 0, weeklyNoShow = 0, weeklyTrips = 0, weeklyCash = 0;
+    let weeklyCredit = 0, weeklyTolls = 0, weeklyFeeBase = 0, weeklyNoShow = 0, weeklyTrips = 0, weeklyCash = 0;
     let weeklyGrossBal = 0, weeklyFee = 0, weeklyNet = 0;
 
-    let grandCredit = 0, grandNoShow = 0, grandTrips = 0, grandCash = 0;
+    let grandCredit = 0, grandTolls = 0, grandFeeBase = 0, grandNoShow = 0, grandTrips = 0, grandCash = 0;
     let grandGrossBal = 0, grandFee = 0, grandNet = 0;
 
     let weekTotalRows = [];
@@ -3401,29 +3537,34 @@ function generateAngelReport(ss) {
 
     for (let d = new Date(reportStartDate); d <= endDate; d.setDate(d.getDate() + 1)) {
         const dateKey = d.toDateString();
-        const dayData = angelDataMap[dateKey] || { credit: 0, cash: 0, noShow: 0, trips: 0 };
+        const dayData = angelDataMap[dateKey] || { credit: 0, tolls: 0, cash: 0, noShow: 0, trips: 0 };
 
         const todayCredit = dayData.credit;
+        const todayTolls = dayData.tolls;
         const todayCash = dayData.cash;
-        let todayGrossPayout = 0;
+        const feeBase = Math.max(0, todayCredit - todayTolls);
+
+        let todayFeeBasePayout = 0;
         let appliedRate = 0;
 
-        if (todayCredit > 0) {
-            if (weeklyCredit >= threshold) {
-                todayGrossPayout = todayCredit * topRate;
+        if (feeBase > 0) {
+            if (weeklyFeeBase >= threshold) {
+                todayFeeBasePayout = feeBase * topRate;
+            } else if ((weeklyFeeBase + feeBase) <= threshold) {
+                todayFeeBasePayout = feeBase * baseRate;
+            } else {
+                const creditAtBaseRate = threshold - weeklyFeeBase;
+                const creditAtTopRate = feeBase - creditAtBaseRate;
+                todayFeeBasePayout = (creditAtBaseRate * baseRate) + (creditAtTopRate * topRate);
             }
-            else if ((weeklyCredit + todayCredit) <= threshold) {
-                todayGrossPayout = todayCredit * baseRate;
-            }
-            else {
-                const creditAtBaseRate = threshold - weeklyCredit;
-                const creditAtTopRate = todayCredit - creditAtBaseRate;
-                todayGrossPayout = (creditAtBaseRate * baseRate) + (creditAtTopRate * topRate);
-            }
-            appliedRate = todayGrossPayout / todayCredit;
+            appliedRate = todayFeeBasePayout / feeBase;
         }
 
+        weeklyFeeBase += feeBase;
         weeklyCredit += todayCredit;
+        weeklyTolls += todayTolls;
+
+        const todayGrossPayout = todayFeeBasePayout + todayTolls;
         const grossBalance = todayGrossPayout - todayCash;
         const fee = grossBalance > 0 ? (grossBalance * transferFeeRate) : 0;
         const netPayout = grossBalance - fee;
@@ -3431,7 +3572,8 @@ function generateAngelReport(ss) {
         reportRows.push([
             new Date(d),
             todayCredit,
-            weeklyCredit,
+            todayTolls,
+            weeklyFeeBase,
             appliedRate,
             dayData.noShow,
             dayData.trips,
@@ -3455,6 +3597,8 @@ function generateAngelReport(ss) {
 
         if (isSunday || isLastDayOfReport) {
             grandCredit += weeklyCredit;
+            grandTolls += weeklyTolls;
+            grandFeeBase += weeklyFeeBase;
             grandNoShow += weeklyNoShow;
             grandTrips += weeklyTrips;
             grandCash += weeklyCash;
@@ -3464,13 +3608,14 @@ function generateAngelReport(ss) {
 
             let weekLabel = `Week ${weekCounter} Total`;
             let rowColor = "#e6f4ea";
-            if (weeklyCredit > threshold) rowColor = "#fff2cc";
+            if (weeklyFeeBase > threshold) rowColor = "#fff2cc";
 
-            let weeklyEffectiveRate = weeklyCredit > 0 ? ((weeklyGrossBal + weeklyCash) / weeklyCredit) : 0;;
+            let weeklyEffectiveRate = weeklyCredit > 0 ? ((weeklyGrossBal + weeklyCash) / weeklyCredit) : 0;
 
             reportRows.push([
                 weekLabel,
                 weeklyCredit,
+                weeklyTolls,
                 "",
                 weeklyEffectiveRate,
                 weeklyNoShow,
@@ -3486,20 +3631,20 @@ function generateAngelReport(ss) {
                 color: rowColor
             });
 
-            weeklyCredit = 0; weeklyNoShow = 0; weeklyTrips = 0; weeklyCash = 0;
+            weeklyCredit = 0; weeklyTolls = 0; weeklyFeeBase = 0; weeklyNoShow = 0; weeklyTrips = 0; weeklyCash = 0;
             weeklyGrossBal = 0; weeklyFee = 0; weeklyNet = 0;
 
             if (!isLastDayOfReport) {
                 weekCounter++;
-                reportRows.push(["", "", "", "", "", "", "", "", "", ""]);
+                reportRows.push(["", "", "", "", "", "", "", "", "", "", ""]);
             }
         }
     }
 
-    reportRows.push(["", "", "", "", "", "", "", "", "", ""]);
+    reportRows.push(["", "", "", "", "", "", "", "", "", "", ""]);
     const grandRate = grandCredit > 0 ? ((grandGrossBal + grandCash) / grandCredit) : 0;
     reportRows.push([
-        "GRAND TOTAL", grandCredit, "", grandRate, grandNoShow, grandTrips, grandCash, grandGrossBal, grandFee, grandNet
+        "GRAND TOTAL", grandCredit, grandTolls, "", grandRate, grandNoShow, grandTrips, grandCash, grandGrossBal, grandFee, grandNet
     ]);
     const grandTotalRowIndex = reportRows.length + 1;
 
@@ -3513,9 +3658,9 @@ function generateAngelReport(ss) {
         try { reportSheet.showColumns(1, 20); } catch (e) { }
     }
 
-    const headers = [["Date", "Daily Credit", "Weekly Cum.", "Applied Rate", "No Show", "Trips", "Cash", "Gross Bal.", "Fee (3%)", "Net Payout"]];
+    const headers = [["Date", "Daily Credit", "Tolls", "Weekly Cum.", "Applied Rate", "No Show", "Trips", "Cash", "Gross Bal.", "Fee (3%)", "Net Payout"]];
 
-    reportSheet.getRange("A1:J1").setValues(headers)
+    reportSheet.getRange("A1:K1").setValues(headers)
         .setFontWeight("bold")
         .setFontSize(11)
         .setHorizontalAlignment("center")
@@ -3523,52 +3668,51 @@ function generateAngelReport(ss) {
         .setBorder(true, true, true, true, true, true, "black", SpreadsheetApp.BorderStyle.SOLID);
 
     if (reportRows.length > 0) {
-        const range = reportSheet.getRange(2, 1, reportRows.length, 10);
+        const range = reportSheet.getRange(2, 1, reportRows.length, 11);
         range.setValues(reportRows);
 
         reportSheet.getRange(2, 1, reportRows.length, 1).setNumberFormat("dddd, dd");
-        reportSheet.getRange(2, 2, reportRows.length, 2).setNumberFormat("$#,##0.00");
-        reportSheet.getRange(2, 4, reportRows.length, 1).setNumberFormat("0.0%");
-        reportSheet.getRange(2, 5, reportRows.length, 1).setNumberFormat("0");
-        reportSheet.getRange(2, 6, reportRows.length, 1).setNumberFormat("0");
-        reportSheet.getRange(2, 7, reportRows.length, 4).setNumberFormat("$#,##0.00");
+        reportSheet.getRange(2, 2, reportRows.length, 3).setNumberFormat("$#,##0.00"); // Credit, Tolls, Weekly Cum.
+        reportSheet.getRange(2, 5, reportRows.length, 1).setNumberFormat("0.0%");       // Applied Rate
+        reportSheet.getRange(2, 6, reportRows.length, 2).setNumberFormat("0");           // No Show, Trips
+        reportSheet.getRange(2, 8, reportRows.length, 4).setNumberFormat("$#,##0.00"); // Cash, Gross Bal, Fee, Net Payout
 
         range.setHorizontalAlignment("center");
 
         weekTotalRows.forEach(item => {
-            const rowRange = reportSheet.getRange(item.index, 1, 1, 10);
+            const rowRange = reportSheet.getRange(item.index, 1, 1, 11);
             rowRange.setFontWeight("bold");
             rowRange.setBackground(item.color);
             rowRange.setBorder(true, true, true, true, true, true, "black", SpreadsheetApp.BorderStyle.SOLID);
             reportSheet.getRange(item.index, 1).setHorizontalAlignment("center");
         });
 
-        const grandRowRange = reportSheet.getRange(grandTotalRowIndex, 1, 1, 10);
+        const grandRowRange = reportSheet.getRange(grandTotalRowIndex, 1, 1, 11);
         grandRowRange.setFontWeight("bold");
         grandRowRange.setFontSize(12);
         grandRowRange.setBackground("#d9d2e9");
         grandRowRange.setBorder(true, true, true, true, true, true, "black", SpreadsheetApp.BorderStyle.SOLID);
 
-        reportSheet.autoResizeColumns(1, 10);
-        for (let i = 1; i <= 10; i++) {
+        reportSheet.autoResizeColumns(1, 11);
+        for (let i = 1; i <= 11; i++) {
             let currentWidth = reportSheet.getColumnWidth(i);
             reportSheet.setColumnWidth(i, currentWidth + 15);
         }
         if (reportSheet.getColumnWidth(1) < 120) reportSheet.setColumnWidth(1, 120);
 
         if (chartDataRows.length > 0) {
-            const chartDataRange = reportSheet.getRange(2, 12, chartDataRows.length, 2);
+            const chartDataRange = reportSheet.getRange(2, 13, chartDataRows.length, 2);
             chartDataRange.setValues(chartDataRows);
-            reportSheet.getRange(2, 12, chartDataRows.length, 1).setNumberFormat("dddd, dd");
-            reportSheet.getRange(2, 13, chartDataRows.length, 1).setNumberFormat("$#,##0");
-            reportSheet.hideColumns(12, 2);
+            reportSheet.getRange(2, 13, chartDataRows.length, 1).setNumberFormat("dddd, dd");
+            reportSheet.getRange(2, 14, chartDataRows.length, 1).setNumberFormat("$#,##0");
+            reportSheet.hideColumns(13, 2);
         }
 
         let angelChart = reportSheet.newChart()
             .setChartType(Charts.ChartType.LINE)
-            .addRange(reportSheet.getRange(2, 12, chartDataRows.length, 1))
             .addRange(reportSheet.getRange(2, 13, chartDataRows.length, 1))
-            .setPosition(2, 12, 0, 0)
+            .addRange(reportSheet.getRange(2, 14, chartDataRows.length, 1))
+            .setPosition(2, 13, 0, 0)
             .setOption("title", "Angel's Daily Credit Progress")
             .setOption("titleTextStyle", { bold: true, fontSize: 18 })
             .setOption("vAxis", { title: "Daily Credit Earned", format: '$#,##0' })
