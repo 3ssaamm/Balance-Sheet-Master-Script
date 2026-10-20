@@ -153,6 +153,7 @@ function onOpen() {
         ui.createMenu('⚙️ Balance Sheet')
             .addItem('▶ Run Balance Report', 'runDailyBalance')
             .addSeparator()
+            .addItem('⚡ Sync Hours to Summary (In-Place)', 'syncWorkingHoursInPlaceFromMenu')
             .addItem('☕ Sync Breaks Table', 'syncBreaksTableFromMenu')
             .addItem('🕒 Sync Working Hours Sheet', 'generateWorkingHoursSheetFromMenu')
             .addToUi();
@@ -160,6 +161,130 @@ function onOpen() {
         // onOpen() cannot be run from the Apps Script editor.
         // It runs automatically when the spreadsheet is opened in a browser.
         Logger.log("ℹ️ onOpen() skipped: " + e.message);
+    }
+}
+
+/**
+ * Built-in simple onEdit trigger: runs automatically whenever a cell is edited.
+ * If the edit was made in "Working hours", it surgically updates the Hours
+ * column in "Summary" and "Weekly Summary" IN PLACE.
+ * It does NOT clear any sheets, does NOT wipe formatting, and does NOT touch charts!
+ */
+function onEdit(e) {
+    if (!e || !e.range) return;
+    try {
+        const sheet = e.range.getSheet();
+        const sheetName = sheet.getName();
+
+        if (sheetName === "Working hours") {
+            syncWorkingHoursInPlace(sheet.getParent());
+        }
+    } catch (err) {
+        Logger.log("onEdit error: " + err);
+    }
+}
+
+function syncWorkingHoursInPlaceFromMenu() {
+    const ss = getSafeSpreadsheet();
+    if (!ss) return;
+    try {
+        ss.toast("🔄 Updating working hours in Summary...", "Working Hours", 3);
+    } catch (e) { }
+    syncWorkingHoursInPlace(ss);
+    try {
+        ss.toast("✅ Working hours updated in place!", "Working Hours", 5);
+    } catch (e) { }
+}
+
+/**
+ * Non-destructive in-place sync of working hours into Summary and Weekly Summary.
+ * - Does NOT call clear() or clearContent() on any sheet.
+ * - Does NOT remove or recreate charts.
+ * - Does NOT touch cell formatting or borders.
+ * - Only writes the updated numbers into Column D of Summary and Column G of Weekly Summary.
+ * All dependent columns (CPH, DEPH, Stats totals, Weekly totals) recalculate automatically via native formulas!
+ */
+function syncWorkingHoursInPlace(ss) {
+    if (!ss) ss = getSafeSpreadsheet();
+    const summarySheet = ss.getSheetByName("Summary");
+    if (!summarySheet) return;
+
+    const lastRow = summarySheet.getLastRow();
+    if (lastRow < 3) return;
+
+    const { map: workingHoursMap } = loadWorkingHoursMap(ss);
+    const dateDriverData = summarySheet.getRange(3, 1, lastRow - 2, 2).getValues();
+
+    let lastSeenDate = null;
+    const hoursColData = [];
+
+    for (let i = 0; i < dateDriverData.length; i++) {
+        const rawDate = dateDriverData[i][0];
+        if (rawDate && rawDate !== "") {
+            lastSeenDate = parseDate(rawDate);
+        }
+        const driver = (dateDriverData[i][1] || "").toString().trim();
+        const dateKey = lastSeenDate ? new Date(lastSeenDate.getFullYear(), lastSeenDate.getMonth(), lastSeenDate.getDate()).getTime() : 0;
+
+        const h = (workingHoursMap[driver] && workingHoursMap[driver][dateKey]) ? workingHoursMap[driver][dateKey] : 0;
+        hoursColData.push([roundToTwo(h) || 0]);
+    }
+
+    // Update Column D (Hours) in Summary in place
+    summarySheet.getRange(3, 4, hoursColData.length, 1).setValues(hoursColData);
+
+    // Also update Weekly Summary in place if it exists
+    const weeklySheet = ss.getSheetByName("Weekly Summary");
+    if (weeklySheet && weeklySheet.getLastRow() >= 3) {
+        syncWeeklyHoursInPlace(weeklySheet, workingHoursMap);
+    }
+}
+
+/**
+ * Surgically updates Column G (Total Hours) in Weekly Summary for each driver row in place.
+ */
+function syncWeeklyHoursInPlace(weeklySheet, workingHoursMap) {
+    if (!weeklySheet || !workingHoursMap) return;
+    const lastRow = weeklySheet.getLastRow();
+    if (lastRow < 3) return;
+
+    const data = weeklySheet.getRange(3, 1, lastRow - 2, 9).getValues();
+    let currentWeekStart = null;
+    let currentWeekEnd = null;
+
+    for (let i = 0; i < data.length; i++) {
+        const rowNum = 3 + i;
+        const cellA = (data[i][0] || "").toString().trim();
+
+        if (cellA.toUpperCase().startsWith("WEEK ")) {
+            const match = cellA.match(/\((.*?)\)/);
+            if (match) {
+                const parts = match[1].split("-").map(s => s.trim());
+                if (parts.length === 2) {
+                    currentWeekStart = parseDate(parts[0]);
+                    currentWeekEnd = parseDate(parts[1]);
+                }
+            }
+            continue;
+        }
+
+        if (cellA === "Driver" || cellA.toLowerCase().startsWith("total") || !cellA) {
+            continue;
+        }
+
+        // Driver row
+        if (currentWeekStart && currentWeekEnd) {
+            const driverName = cellA;
+            let sumHours = 0;
+            if (workingHoursMap[driverName]) {
+                for (let d = new Date(currentWeekStart); d <= currentWeekEnd; d.setDate(d.getDate() + 1)) {
+                    const dateKey = new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+                    sumHours += (workingHoursMap[driverName][dateKey] || 0);
+                }
+            }
+            // Column 7 is Total Hours (Col G)
+            weeklySheet.getRange(rowNum, 7).setValue(roundToTwo(sumHours) || 0);
+        }
     }
 }
 
