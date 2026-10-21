@@ -155,6 +155,7 @@ function onOpen() {
             .addSeparator()
             .addItem('⚡ Sync Hours to Summary (In-Place)', 'syncWorkingHoursInPlaceFromMenu')
             .addItem('☕ Sync Breaks Table', 'syncBreaksTableFromMenu')
+            .addItem('🏷️ Sync Settings in Place', 'syncSettingsInPlaceFromMenu')
             .addItem('🕒 Sync Working Hours Sheet', 'generateWorkingHoursSheetFromMenu')
             .addToUi();
     } catch (e) {
@@ -165,19 +166,29 @@ function onOpen() {
 }
 
 /**
- * Built-in simple onEdit trigger: runs automatically whenever a cell is edited.
- * If the edit was made in "Working hours", it surgically updates the Hours
- * column in "Summary" and "Weekly Summary" IN PLACE.
- * It does NOT clear any sheets, does NOT wipe formatting, and does NOT touch charts!
+ * Built-in simple onEdit trigger: runs automatically whenever any cell is edited.
+ * Actively listens to:
+ * - "Working hours": surgically updates Column D (Hours) in Summary & Column G in Weekly Summary.
+ * - "Breaks": updates the "☕ BREAKS HOURS (Reference Only)" table in Working hours and syncs downstream.
+ * - "Settings": updates driver fare tiers and balance formulas/values in Summary & Weekly Summary.
+ *
+ * All operations are strictly NON-DESTRUCTIVE and IN-PLACE:
+ * - Under NO circumstances does it clear any sheet (no clear() or clearContent()).
+ * - Does NOT alter cell formatting, fonts, or borders.
+ * - Does NOT delete or recreate any charts!
  */
 function onEdit(e) {
     if (!e || !e.range) return;
     try {
         const sheet = e.range.getSheet();
-        const sheetName = sheet.getName();
+        const sheetName = (sheet.getName() || "").toLowerCase().replace(/\s+/g, ' ').trim();
 
-        if (sheetName === "Working hours") {
+        if (sheetName.includes("working hour")) {
             syncWorkingHoursInPlace(sheet.getParent());
+        } else if (sheetName.includes("break")) {
+            syncBreaksInPlace(sheet.getParent());
+        } else if (sheetName.includes("setting")) {
+            syncSettingsInPlace(sheet.getParent());
         }
     } catch (err) {
         Logger.log("onEdit error: " + err);
@@ -196,6 +207,223 @@ function syncWorkingHoursInPlaceFromMenu() {
     } catch (e) { }
 }
 
+function syncBreaksInPlaceFromMenu() {
+    const ss = getSafeSpreadsheet();
+    if (!ss) return;
+    try {
+        ss.toast("☕ Syncing breaks table...", "Breaks", 3);
+    } catch (e) { }
+    syncBreaksInPlace(ss);
+    try {
+        ss.toast("✅ Breaks table synced in place!", "Breaks", 5);
+    } catch (e) { }
+}
+
+function syncSettingsInPlaceFromMenu() {
+    const ss = getSafeSpreadsheet();
+    if (!ss) return;
+    try {
+        ss.toast("🔄 Updating driver settings in place...", "Settings", 3);
+    } catch (e) { }
+    syncSettingsInPlace(ss);
+    try {
+        ss.toast("✅ Settings synced in place!", "Settings", 5);
+    } catch (e) { }
+}
+
+/**
+ * Non-destructive in-place sync when Breaks sheet is edited.
+ * 1. Re-renders the "☕ BREAKS HOURS (Reference Only)" table at bottom of "Working hours".
+ * 2. Propagates working hours to Summary & Weekly Summary in place.
+ */
+function syncBreaksInPlace(ss) {
+    if (!ss) ss = getSafeSpreadsheet();
+    if (!ss) return;
+
+    try {
+        syncBreaksTable(ss);
+    } catch (e) {
+        Logger.log("syncBreaksTable error in syncBreaksInPlace: " + e.message);
+    }
+
+    try {
+        syncWorkingHoursInPlace(ss);
+    } catch (e) {
+        Logger.log("syncWorkingHoursInPlace error in syncBreaksInPlace: " + e.message);
+    }
+}
+
+/**
+ * Non-destructive in-place sync when Settings sheet is edited.
+ * - Reads updated fare rates / tiers from "Settings".
+ * - Standard drivers keep/receive live native VLOOKUP formula in Summary (Col K) & Weekly Summary (Col I).
+ * - Progressive drivers ("80%-90%") receive live calculated progressive payout in Summary (Col K)
+ *   and progressive tier formula in Weekly Summary (Col I).
+ * - Does NOT clear any sheet, does NOT wipe formatting, and does NOT touch charts!
+ */
+function syncSettingsInPlace(ss) {
+    if (!ss) ss = getSafeSpreadsheet();
+    if (!ss) return;
+
+    const settingsSheet = findSheetCaseInsensitive(ss, "Settings");
+    if (!settingsSheet) return;
+
+    const lastRowSettings = settingsSheet.getLastRow();
+    if (lastRowSettings < 2) return;
+
+    const settingsData = settingsSheet.getRange(2, 1, lastRowSettings - 1, 2).getValues();
+    const driverFareMap = {};
+    const canonicalDrivers = [];
+
+    for (let i = 0; i < settingsData.length; i++) {
+        const dName = (settingsData[i][0] || "").toString().trim();
+        if (dName) {
+            const rawFare = settingsData[i][1];
+            driverFareMap[dName] = rawFare;
+            if (!canonicalDrivers.includes(dName)) {
+                canonicalDrivers.push(dName);
+            }
+        }
+    }
+
+    // 1. Sync Summary Sheet In-Place (Column K: Balance)
+    const summarySheet = findSheetCaseInsensitive(ss, "Summary");
+    if (summarySheet && summarySheet.getLastRow() >= 3) {
+        const sumLastRow = summarySheet.getLastRow();
+        const numRows = sumLastRow - 2;
+
+        const sumRange = summarySheet.getRange(3, 1, numRows, 11);
+        const sumValues = sumRange.getValues();
+        const colKFormulas = summarySheet.getRange(3, 11, numRows, 1).getFormulas();
+
+        const progressiveTrackers = {};
+        let lastSeenDate = null;
+        let summaryUpdated = false;
+        const newColK = [];
+
+        for (let i = 0; i < sumValues.length; i++) {
+            const sheetRow = 3 + i;
+            const row = sumValues[i];
+            const rawDate = row[0];
+            if (rawDate && rawDate !== "") {
+                lastSeenDate = parseDate(rawDate);
+            }
+
+            const driverName = (row[1] || "").toString().trim();
+            const canonDriver = getCanonicalDriverName(driverName, canonicalDrivers) || driverName;
+            const fare = driverFareMap[canonDriver] !== undefined ? driverFareMap[canonDriver] : driverFareMap[driverName];
+            const isProgressive = String(fare || "").trim() === "80%-90%";
+
+            const grossFare = parseNumber(row[2]) || 0;
+            const cash = parseNumber(row[7]) || 0;
+            const tolls = parseNumber(row[8]) || 0;
+            const creditDebit = parseNumber(row[9]) || 0;
+
+            let targetValOrFormula = "";
+            if (isProgressive) {
+                const rowDate = lastSeenDate || new Date();
+                const weekStart = getMonday(rowDate).getTime();
+                if (!progressiveTrackers[canonDriver]) {
+                    progressiveTrackers[canonDriver] = { weekStart: 0, weeklyFeeBase: 0 };
+                }
+                if (progressiveTrackers[canonDriver].weekStart !== weekStart) {
+                    progressiveTrackers[canonDriver] = { weekStart: weekStart, weeklyFeeBase: 0 };
+                }
+
+                const feeBase = Math.max(0, grossFare - tolls);
+                let todayGrossPayout = 0;
+                if (feeBase > 0) {
+                    const currentWeekFeeBase = progressiveTrackers[canonDriver].weeklyFeeBase;
+                    if (currentWeekFeeBase >= 1000) {
+                        todayGrossPayout = feeBase * 0.90;
+                    } else if ((currentWeekFeeBase + feeBase) <= 1000) {
+                        todayGrossPayout = feeBase * 0.80;
+                    } else {
+                        const basePortion = 1000 - currentWeekFeeBase;
+                        const topPortion = feeBase - basePortion;
+                        todayGrossPayout = (basePortion * 0.80) + (topPortion * 0.90);
+                    }
+                }
+                progressiveTrackers[canonDriver].weeklyFeeBase += feeBase;
+                targetValOrFormula = roundToTwo(todayGrossPayout + tolls - cash + creditDebit);
+            } else {
+                targetValOrFormula = `=ROUND((C${sheetRow}-I${sheetRow})*IFERROR(VLOOKUP(B${sheetRow}, Settings!$A:$B, 2, FALSE), 0.9) + I${sheetRow} - H${sheetRow} + J${sheetRow}, 2)`;
+            }
+
+            // Compare against current cell state
+            const currentFormula = colKFormulas[i][0];
+            const currentValue = row[10];
+
+            if (isProgressive) {
+                if (currentFormula !== "" || roundToTwo(currentValue) !== targetValOrFormula) {
+                    summaryUpdated = true;
+                }
+            } else {
+                if (currentFormula.toUpperCase() !== targetValOrFormula.toUpperCase()) {
+                    summaryUpdated = true;
+                }
+            }
+
+            newColK.push([targetValOrFormula]);
+        }
+
+        if (summaryUpdated) {
+            summarySheet.getRange(3, 11, newColK.length, 1).setValues(newColK);
+        }
+    }
+
+    // 2. Sync Weekly Summary Sheet In-Place (Column I: Balance)
+    const weeklySheet = findSheetCaseInsensitive(ss, "Weekly Summary");
+    if (weeklySheet && weeklySheet.getLastRow() >= 3) {
+        const weeklyLastRow = weeklySheet.getLastRow();
+        const weeklyNumRows = weeklyLastRow - 2;
+        const colAValues = weeklySheet.getRange(3, 1, weeklyNumRows, 1).getValues();
+        const colIFormulas = weeklySheet.getRange(3, 9, weeklyNumRows, 1).getFormulas();
+
+        let weeklyUpdated = false;
+        const newColI = [];
+
+        for (let i = 0; i < colAValues.length; i++) {
+            const r = 3 + i;
+            const cellA = (colAValues[i][0] || "").toString().trim();
+            const currentFormula = colIFormulas[i][0];
+
+            if (cellA.toUpperCase().startsWith("WEEK ") || cellA === "Driver" || cellA.toLowerCase().startsWith("total") || !cellA) {
+                newColI.push([currentFormula || ""]);
+                continue;
+            }
+
+            // Driver row
+            const canonDriver = getCanonicalDriverName(cellA, canonicalDrivers) || cellA;
+            const fare = driverFareMap[canonDriver] !== undefined ? driverFareMap[canonDriver] : driverFareMap[cellA];
+            const isProgressive = String(fare || "").trim() === "80%-90%";
+
+            let expectedFormula = "";
+            if (isProgressive) {
+                expectedFormula = `=ROUND(IF((B${r}-C${r})<=1000, (B${r}-C${r})*0.8, 800 + (B${r}-C${r}-1000)*0.9) + C${r} - E${r} + F${r}, 2)`;
+            } else {
+                expectedFormula = `=ROUND((B${r}-C${r})*IFERROR(VLOOKUP(A${r}, Settings!$A:$B, 2, FALSE), 0.9) + C${r} - E${r} + F${r}, 2)`;
+            }
+
+            if (currentFormula.toUpperCase() !== expectedFormula.toUpperCase()) {
+                weeklyUpdated = true;
+            }
+            newColI.push([expectedFormula]);
+        }
+
+        if (weeklyUpdated) {
+            weeklySheet.getRange(3, 9, newColI.length, 1).setValues(newColI);
+        }
+    }
+
+    // 3. Keep Breaks Table synced with any updated driver canonical names
+    try {
+        syncBreaksTable(ss);
+    } catch (e) {
+        Logger.log("syncBreaksTable error during syncSettingsInPlace: " + e.message);
+    }
+}
+
 /**
  * Non-destructive in-place sync of working hours into Summary and Weekly Summary.
  * - Does NOT call clear() or clearContent() on any sheet.
@@ -206,7 +434,8 @@ function syncWorkingHoursInPlaceFromMenu() {
  */
 function syncWorkingHoursInPlace(ss) {
     if (!ss) ss = getSafeSpreadsheet();
-    const summarySheet = ss.getSheetByName("Summary");
+    if (!ss) return;
+    const summarySheet = findSheetCaseInsensitive(ss, "Summary");
     if (!summarySheet) return;
 
     const lastRow = summarySheet.getLastRow();
@@ -214,6 +443,17 @@ function syncWorkingHoursInPlace(ss) {
 
     const { map: workingHoursMap } = loadWorkingHoursMap(ss);
     const dateDriverData = summarySheet.getRange(3, 1, lastRow - 2, 2).getValues();
+
+    // Canonical drivers from Settings
+    const settingsSheet = findSheetCaseInsensitive(ss, "Settings");
+    const canonicalDrivers = [];
+    if (settingsSheet) {
+        const sData = settingsSheet.getDataRange().getValues();
+        for (let i = 1; i < sData.length; i++) {
+            const dName = (sData[i][0] || "").toString().trim();
+            if (dName && !canonicalDrivers.includes(dName)) canonicalDrivers.push(dName);
+        }
+    }
 
     let lastSeenDate = null;
     const hoursColData = [];
@@ -224,9 +464,12 @@ function syncWorkingHoursInPlace(ss) {
             lastSeenDate = parseDate(rawDate);
         }
         const driver = (dateDriverData[i][1] || "").toString().trim();
+        const canonDriver = getCanonicalDriverName(driver, canonicalDrivers) || driver;
         const dateKey = lastSeenDate ? new Date(lastSeenDate.getFullYear(), lastSeenDate.getMonth(), lastSeenDate.getDate()).getTime() : 0;
 
-        const h = (workingHoursMap[driver] && workingHoursMap[driver][dateKey]) ? workingHoursMap[driver][dateKey] : 0;
+        const h = (workingHoursMap[canonDriver] && workingHoursMap[canonDriver][dateKey])
+            ? workingHoursMap[canonDriver][dateKey]
+            : ((workingHoursMap[driver] && workingHoursMap[driver][dateKey]) ? workingHoursMap[driver][dateKey] : 0);
         hoursColData.push([roundToTwo(h) || 0]);
     }
 
@@ -234,16 +477,16 @@ function syncWorkingHoursInPlace(ss) {
     summarySheet.getRange(3, 4, hoursColData.length, 1).setValues(hoursColData);
 
     // Also update Weekly Summary in place if it exists
-    const weeklySheet = ss.getSheetByName("Weekly Summary");
+    const weeklySheet = findSheetCaseInsensitive(ss, "Weekly Summary");
     if (weeklySheet && weeklySheet.getLastRow() >= 3) {
-        syncWeeklyHoursInPlace(weeklySheet, workingHoursMap);
+        syncWeeklyHoursInPlace(weeklySheet, workingHoursMap, canonicalDrivers);
     }
 }
 
 /**
  * Surgically updates Column G (Total Hours) in Weekly Summary for each driver row in place.
  */
-function syncWeeklyHoursInPlace(weeklySheet, workingHoursMap) {
+function syncWeeklyHoursInPlace(weeklySheet, workingHoursMap, canonicalDrivers) {
     if (!weeklySheet || !workingHoursMap) return;
     const lastRow = weeklySheet.getLastRow();
     if (lastRow < 3) return;
@@ -275,11 +518,13 @@ function syncWeeklyHoursInPlace(weeklySheet, workingHoursMap) {
         // Driver row
         if (currentWeekStart && currentWeekEnd) {
             const driverName = cellA;
+            const canonDriver = (canonicalDrivers && getCanonicalDriverName(driverName, canonicalDrivers)) || driverName;
             let sumHours = 0;
-            if (workingHoursMap[driverName]) {
+            const driverHours = workingHoursMap[canonDriver] || workingHoursMap[driverName];
+            if (driverHours) {
                 for (let d = new Date(currentWeekStart); d <= currentWeekEnd; d.setDate(d.getDate() + 1)) {
                     const dateKey = new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
-                    sumHours += (workingHoursMap[driverName][dateKey] || 0);
+                    sumHours += (driverHours[dateKey] || 0);
                 }
             }
             // Column 7 is Total Hours (Col G)
@@ -1193,7 +1438,8 @@ function syncBreaksTableFromMenu() {
     let ss = getSafeSpreadsheet();
     if (!ss) return;
     try {
-        runSyncBreaksTable();
+        syncBreaksInPlace(ss);
+        SpreadsheetApp.flush();
         try {
             ss.toast("Breaks table synced successfully!", "Balance Sheet", 3);
         } catch (tErr) { }
