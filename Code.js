@@ -6,7 +6,7 @@
 const TARGET_SHEET_ID = "1XmzqDfalrqADK-O7g1SsTOersaRBNzACa-KNcEJVrP9v7w9BQ_hkC5Uu";
 const DAILY_EXTRACTS_FOLDER_ID = "1wTRKJMQ07vGT4ZzzoXWFz92hLoWRkVvw";
 
-var _ACTIVE_MONTH_NUM = 10; // Default: October (10)
+var _ACTIVE_MONTH_NUM = 11; // Default: November (11)
 
 /**
  * Safely resolves the active spreadsheet without throwing if TARGET_SHEET_ID is invalid.
@@ -25,7 +25,7 @@ function getSafeSpreadsheet(ss) {
         if (active) return active;
     } catch (e) { }
     try {
-        if (TARGET_SHEET_ID && TARGET_SHEET_ID.length === 44) {
+        if (TARGET_SHEET_ID && TARGET_SHEET_ID.length >= 25) {
             return SpreadsheetApp.openById(TARGET_SHEET_ID);
         }
     } catch (e) { }
