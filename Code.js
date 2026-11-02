@@ -3,8 +3,8 @@
 // =================================================================
 // Change this ID each time you switch to a new monthly balance file.
 // This is the ONLY line you need to update.
-const TARGET_SHEET_ID = "1XmzqDfalrqADK-O7g1SsTOersaRBNzACa-KNcEJVrP9v7w9BQ_hkC5Uu";
-const DAILY_EXTRACTS_FOLDER_ID = "1wTRKJMQ07vGT4ZzzoXWFz92hLoWRkVvw";
+const TARGET_SHEET_ID = "1OD4bTRRf8JFZ9lsBDZXADUpU3Iu1r0EfTDGw4znlgqk";
+const DAILY_EXTRACTS_FOLDER_ID = "1frEJuEq_8FVgTdhqW22_LS0XrbHBOhlK";
 
 var _ACTIVE_MONTH_NUM = 11; // Default: November (11)
 
