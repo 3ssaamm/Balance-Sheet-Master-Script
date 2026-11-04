@@ -3722,8 +3722,10 @@ function generateBonusReport(ss, dailyData) {
         const weekStartDate = weekBlock.startDate;
         const weekEndDate = weekBlock.endDate;
 
-        const isCurrentMonthWeek = (weekEndDate && weekEndDate.getMonth() === currentMonthIndex && weekEndDate.getFullYear() === currentYear) ||
-            (weekStartDate && weekStartDate.getMonth() === currentMonthIndex && weekStartDate.getFullYear() === currentYear);
+        // A week's bonus strictly belongs to the month where the week ENDS (Sunday).
+        // If a week ends in the next month (e.g. 10/26 - 11/01 ends in Nov), it is calculated in that next month, not both.
+        const isCurrentMonthWeek = weekEndDate && weekEndDate.getMonth() === currentMonthIndex && weekEndDate.getFullYear() === currentYear;
+
 
         if (isCurrentMonthWeek) {
             for (const driver in weekBlock.drivers) {
